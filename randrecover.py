@@ -133,16 +133,23 @@ def generate_with_watermark(
         bit_index += 1
 
     generated_text_wm = tokenizer.decode(input_ids_wm[0], skip_special_tokens=True)
-    generated_text_base = tokenizer.decode(input_ids_base[0], skip_special_tokens=True)
+
+    if generate_baseline:
+        generated_text_base = tokenizer.decode(input_ids_base[0], skip_special_tokens=True)
+        input_ids_base_out = input_ids_base
+    else:
+        generated_text_base = None
+        input_ids_base_out = None
 
     return {
         "generated_text_wm": generated_text_wm,
         "input_ids_wm": input_ids_wm,
         "generated_text_base": generated_text_base,
-        "input_ids_base": input_ids_base,
+        "input_ids_base": input_ids_base_out,
         "secret_bitstream": secret_bitstream,
         "running_mean_p": running_mean_p,
         "p_count": p_count,
+        "baseline_generated": generate_baseline,
     }
 
 
@@ -258,27 +265,27 @@ def log_generation_result(out: Dict) -> None:
     print("-- Watermarked Generation --")
     print(f"Generated Text (watermark): {out['generated_text_wm']}")
     print(f"Average p over {out['p_count']} steps: {out['running_mean_p']:.6f}")
-    print("-- Baseline Generation (no tampering) --")
-    print(f"Generated Text (baseline): {out['generated_text_base']}")
+    if out.get("baseline_generated", False):
+        print("-- Baseline Generation (no tampering) --")
+        print(f"Generated Text (baseline): {out['generated_text_base']}")
+    else:
+        print("-- Baseline Generation (no tampering) --")
+        print("Baseline not generated")
 
 
-def log_recovery_evaluation(secret_bitstream: List[int], extracted_from_text: List[int], extracted_from_context: List[int]) -> None:
-    """Print recovery results and BERs for both extraction methods."""
-    print("\n--- Recovery Evaluation ---")
+def log_recovery_evaluation(secret_bitstream: List[int], extracted: List[int], label: str = "extraction") -> None:
+    """Print recovery results and BER for a single extraction result.
 
-    # Calculate BERs
+    Args:
+        secret_bitstream: The original secret bitstream (list of 0/1).
+        extracted: The recovered bitstream to evaluate against the secret.
+        label: Human-readable label for this extraction method (printed).
+    """
     if len(secret_bitstream) > 0:
-        errors_text = sum(1 for orig, ext in zip(secret_bitstream, extracted_from_text) if orig != ext)
-        ber_text = errors_text / len(secret_bitstream)
+        errors = sum(1 for orig, ext in zip(secret_bitstream, extracted) if orig != ext)
+        ber = errors / len(secret_bitstream)
 
-        errors_context = sum(1 for orig, ext in zip(secret_bitstream, extracted_from_context) if orig != ext)
-        ber_context = errors_context / len(secret_bitstream)
-
-        print(f"\nBit Error Rate (BER) retoken:  {ber_text * 100:.2f}%")
-        print(f"Bit Error Rate (BER) context:  {ber_context * 100:.2f}%")
-
-        # compare the two extraction results
-        print(f"\nExtracted-bitstreams lengths: retoken={len(extracted_from_text)}, context={len(extracted_from_context)}")
+        print(f"Bit Error Rate (BER) {label}:  {ber * 100:.2f}%")
     else:
         print("Secret bitstream is empty; cannot compute BER.")
 

@@ -11,6 +11,7 @@
 pub(crate) mod matrix;
 
 use std::io::{Cursor, Read};
+use std::sync::RwLock;
 
 use crate::matrix::{Matrix, Row};
 
@@ -26,33 +27,41 @@ mod py {
     use pyo3::exceptions::PyValueError;
 
     lazy_static! {
-        /// Code to use for the Python API.
-        static ref CODE: LdpcCode = LdpcCode::new(300, 1, 0.05, 0.75);
+        /// Code to use for the Python API. Wrapped in an RwLock so it can be reconfigured at runtime.
+        static ref CODE: RwLock<LdpcCode> = RwLock::new(LdpcCode::new(16_384, 1, 0.05, 0.75));
     }
 
     #[pyfunction]
     fn key_gen() -> LdpcKey {
-        CODE.key_gen()
+        CODE.read().unwrap().key_gen()
     }
 
     #[pyfunction]
     pub fn encode(key: &LdpcKey) -> Vec<bool> {
-        CODE.encode(key)
+        CODE.read().unwrap().encode(key)
     }
 
     #[pyfunction]
     pub fn detect(key: &LdpcKey, word: Vec<bool>) -> bool {
-        CODE.detect(key, &word)
+        CODE.read().unwrap().detect(key, &word)
     }
 
     #[pyfunction]
     pub fn key_from_pem(pem: &str) -> PyResult<LdpcKey> {
-        CODE.pem_to_key(pem).map_err(PyValueError::new_err)
+        CODE.read().unwrap().pem_to_key(pem).map_err(PyValueError::new_err)
     }
 
     #[pyfunction]
     pub fn key_to_pem(key: &LdpcKey) -> String {
-        CODE.key_to_pem(key)
+        CODE.read().unwrap().key_to_pem(key)
+    }
+
+    #[pyfunction]
+    /// Replace the global code instance with a new `LdpcCode` that has the given codeword length `n`.
+    /// Other parameters use the same defaults as the original binding.
+    pub fn set_code_length(n: usize) {
+        let mut guard = CODE.write().unwrap();
+        *guard = LdpcCode::new(n, 1, 0.05, 0.75);
     }
 
     #[pymodule]
@@ -62,6 +71,7 @@ mod py {
         m.add_function(wrap_pyfunction!(detect, m)?)?;
         m.add_function(wrap_pyfunction!(key_from_pem, m)?)?;
         m.add_function(wrap_pyfunction!(key_to_pem, m)?)?;
+        m.add_function(wrap_pyfunction!(set_code_length, m)?)?;
         Ok(())
     }
 
@@ -73,8 +83,8 @@ mod py {
         fn large_key() {
             // Generated with `python key_gen.py`.
             let pem_str = include_str!("../../test_key.pem");
-            let key = py::CODE.pem_to_key(pem_str).unwrap();
-            assert_eq!(CODE.key_to_pem(&key), pem_str);
+            let key = py::CODE.read().unwrap().pem_to_key(pem_str).unwrap();
+            assert_eq!(py::CODE.read().unwrap().key_to_pem(&key), pem_str);
         }
     }
 }
