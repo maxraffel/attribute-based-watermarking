@@ -11,6 +11,7 @@ from randrecover import (
     log_tokenization_comparison,
 )
 import random
+from prc import key_gen, encode, detect
 
 
 def main():
@@ -39,8 +40,13 @@ def main():
 
     # run generation
     # Create secret bitstream here and pass into generation/recovery
-    secret_bitstream = [random.randint(0, 1) for _ in range(300)]
-    secret_key = "secret"
+    # Use the PRC system to generate a key and encode it into a codeword
+    key = key_gen()
+    codeword = encode(key)
+    # convert boolean codeword into 0/1 ints for the watermarking code
+    secret_bitstream = [1 if b else 0 for b in codeword]
+    print(f"Initial secret bitstream length: {len(secret_bitstream)}")
+    secret_key = key
 
     gen_start = time.perf_counter()
     out = generate_with_watermark(
@@ -50,7 +56,7 @@ def main():
         secret_bitstream=secret_bitstream,
         secret_key=secret_key,
         device=device,
-        generate_baseline=False,
+        generate_baseline=True,
     )
     _maybe_sync()
     gen_time = time.perf_counter() - gen_start
@@ -117,6 +123,24 @@ def main():
     # logging/evaluation for watermarked generation
     print("\n=== Watermarked generation recovery ===")
     log_recovery_evaluation(secret_bitstream, extracted_from_text, extracted_from_context)
+
+    # Attempt detection on the recovered bitstreams
+    # convert recovered int bitstreams back to boolean codewords for PRC detection
+    try:
+        recovered_codeword_context = [bool(b) for b in extracted_from_context]
+        detected_context = detect(secret_key, recovered_codeword_context)
+    except Exception:
+        detected_context = False
+
+    try:
+        recovered_codeword_text = [bool(b) for b in extracted_from_text]
+        detected_text = detect(secret_key, recovered_codeword_text)
+    except Exception:
+        detected_text = False
+
+    print("\n--- PRC Detection Results ---")
+    print(f"Detected from context extraction: {detected_context}")
+    print(f"Detected from retokenized-text extraction: {detected_text}")
 
     # tokenization comparison diagnostics
     tok_cmp = compare_tokenizations(input_ids_tensor=input_ids, generated_text=generated_text, tokenizer=tokenizer)
