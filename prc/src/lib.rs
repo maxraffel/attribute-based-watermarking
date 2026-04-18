@@ -37,6 +37,15 @@ mod py {
     }
 
     #[pyfunction]
+    fn key_gen_from_seed(seed: u64) -> LdpcKey {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        CODE.read().unwrap().key_gen_with_rng(&mut rng)
+    }
+
+    #[pyfunction]
     pub fn encode(key: &LdpcKey) -> Vec<bool> {
         CODE.read().unwrap().encode(key)
     }
@@ -71,6 +80,7 @@ mod py {
         m.add_function(wrap_pyfunction!(detect, m)?)?;
         m.add_function(wrap_pyfunction!(key_from_pem, m)?)?;
         m.add_function(wrap_pyfunction!(key_to_pem, m)?)?;
+        m.add_function(wrap_pyfunction!(key_gen_from_seed, m)?)?;
         m.add_function(wrap_pyfunction!(set_code_length, m)?)?;
         Ok(())
     }
@@ -171,6 +181,20 @@ impl LdpcCode {
         pem::encode(&pem::Pem::new(Self::PEM_TAG_KEY, bytes))
     }
 
+    /// Deterministic key generation using an externally provided RNG.
+    pub fn key_gen_with_rng<R: Rng + ?Sized>(&self, rng: &mut R) -> LdpcKey {
+        let (generator, parity_check) =
+            generator_matrix_with_trapdoor(rng, self.n, self.t, self.g, self.r);
+
+        let otp = rand_bit_vec(rng, self.n);
+
+        LdpcKey {
+            generator,
+            parity_check,
+            otp,
+        }
+    }
+
     /// Decode a key from a PEM block.
     pub fn pem_to_key(&self, pem_str: &str) -> Result<LdpcKey, String> {
         let pem = pem::parse(pem_str).map_err(|e| e.to_string())?;
@@ -215,17 +239,7 @@ impl ZeroBitCode for LdpcCode {
 
     fn key_gen(&self) -> LdpcKey {
         let mut rng = thread_rng();
-
-        let (generator, parity_check) =
-            generator_matrix_with_trapdoor(&mut rng, self.n, self.t, self.g, self.r);
-
-        let otp = rand_bit_vec(&mut rng, self.n);
-
-        LdpcKey {
-            generator,
-            parity_check,
-            otp,
-        }
+        self.key_gen_with_rng(&mut rng)
     }
 
     fn encode(&self, key: &LdpcKey) -> Vec<bool> {

@@ -41,12 +41,14 @@ def main():
     # run generation
     # Use the PRC system to generate a key and encode it into a codeword for use as the recovered bitstream
     prc.set_code_length(300)
-    key = prc.key_gen()
-    codeword = prc.encode(key)
+    # Use a deterministic seed to generate the key so it can be reproduced later.
+    seed = random.getrandbits(64)
+    print(f"Using deterministic seed for key_gen: {seed}")
+    secret_key = prc.key_gen_from_seed(seed)
+    codeword = prc.encode(secret_key)
     # convert boolean codeword into 0/1 ints for the watermarking code
     secret_bitstream = [1 if b else 0 for b in codeword]
     print(f"Initial secret bitstream length: {len(secret_bitstream)}")
-    secret_key = key
 
     gen_start = time.perf_counter()
     out = generate_with_watermark(
@@ -108,26 +110,46 @@ def main():
     log_recovery_evaluation(secret_bitstream, extracted_from_context, label="context")
     log_recovery_evaluation(rand_secret, extracted_from_context, label="randomized_control")
 
+    replicated_secret_key = prc.key_gen_from_seed(seed)
+    # Compare PEM serializations to verify keys are identical.
+    pem_orig = prc.key_to_pem(secret_key)
+    pem_rep = prc.key_to_pem(replicated_secret_key)
+    assert pem_orig == pem_rep, "Reproduced key does not match original key (PEM mismatch)"
+
 
     # Attempt detection on the recovered bitstreams
     # convert recovered int bitstreams back to boolean codewords for PRC detection
-    try:
-        recovered_codeword_context = [bool(b) for b in extracted_from_context]
-        detected_context = prc.detect(secret_key, recovered_codeword_context)
-    except Exception:
+    # Ensure recovered bitstreams match the codeword length before calling into Rust detect
+    codeword_len = len(secret_bitstream)
+    if len(extracted_from_context) != codeword_len:
+        print(f"Warning: extracted_from_context length {len(extracted_from_context)} != codeword length {codeword_len}; skipping detection")
         detected_context = False
+    else:
+        try:
+            recovered_codeword_context = [bool(b) for b in extracted_from_context]
+            detected_context = prc.detect(replicated_secret_key, recovered_codeword_context)
+        except Exception:
+            detected_context = False
 
-    try:
-        recovered_codeword_text = [bool(b) for b in extracted_from_text]
-        detected_text = prc.detect(secret_key, recovered_codeword_text)
-    except Exception:
+    if len(extracted_from_text) != codeword_len:
+        print(f"Warning: extracted_from_text length {len(extracted_from_text)} != codeword length {codeword_len}; skipping detection")
         detected_text = False
+    else:
+        try:
+            recovered_codeword_text = [bool(b) for b in extracted_from_text]
+            detected_text = prc.detect(replicated_secret_key, recovered_codeword_text)
+        except Exception:
+            detected_text = False
 
-    try:
-        rand_codeword_bool = [bool(b) for b in rand_secret]
-        rand_detected = prc.detect(secret_key, rand_codeword_bool)
-    except Exception:
+    if len(rand_secret) != codeword_len:
+        print(f"Warning: rand_secret length {len(rand_secret)} != codeword length {codeword_len}; skipping detection")
         rand_detected = False
+    else:
+        try:
+            rand_codeword_bool = [bool(b) for b in rand_secret]
+            rand_detected = prc.detect(replicated_secret_key, rand_codeword_bool)
+        except Exception:
+            rand_detected = False
 
     print("\n--- PRC Detection Results ---")
     print(f"Detected from context extraction (should be true): {detected_context}")
