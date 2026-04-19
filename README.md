@@ -19,8 +19,9 @@ python prc/example.py  # make sure we can run the code
 Currently model and size of generation/randomness to recover is hardcoded
 
 Uses PRC from here https://github.com/cloudflareresearch/poc-watermark/tree/main/prc
+Uses CPRF from here https://github.com/sachaservan/cprf.git
 
 ## TODO/Issues:
-- proper citations/references
+- proper citations/references, maybe correctly fork/branch from utilized repos
 - Add CPRF
 - PRC package does not encode on a key and value, just a key, so it just detects, not decodes, this runs into further issues because it means the key length must match the length of the randomness recovered from the input
