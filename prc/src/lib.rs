@@ -37,12 +37,16 @@ mod py {
     }
 
     #[pyfunction]
-    fn key_gen_from_seed(seed: u64) -> LdpcKey {
+    fn key_gen_from_seed(seed: &[u8]) -> PyResult<LdpcKey> {
         use rand::rngs::StdRng;
         use rand::SeedableRng;
+        
+        let seed_array = <[u8; 32]>::try_from(seed).map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err("seed must be exactly 32 bytes")
+        })?;
 
-        let mut rng = StdRng::seed_from_u64(seed);
-        CODE.read().unwrap().key_gen_with_rng(&mut rng)
+        let mut rng = StdRng::from_seed(seed_array);
+        Ok(CODE.read().unwrap().key_gen_with_rng(&mut rng))
     }
 
     #[pyfunction]

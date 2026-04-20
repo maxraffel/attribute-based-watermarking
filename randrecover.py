@@ -4,9 +4,9 @@ import hashlib
 import random
 from typing import Dict, List, Tuple
 
-def get_vectorized_partition(vocab_size: int, key: str, device: str, seed_index: int) -> torch.BoolTensor:
+def get_vectorized_partition(vocab_size: int, device: str, seed_index: int) -> torch.BoolTensor:
     """Generates a boolean mask for the entire vocabulary using a deterministic seed."""
-    seed_string = f"{key}:{seed_index}"
+    seed_string = f"{seed_index}"
     seed = int(hashlib.md5(seed_string.encode()).hexdigest()[:16], 16)
     g = torch.Generator(device=device)
     g.manual_seed(seed)
@@ -17,7 +17,6 @@ def generate_with_watermark(
     tokenizer: AutoTokenizer,
     prompt: str,
     secret_bitstream: List[int],
-    secret_key: str = "secret",
     device: str = "cpu",
 ) -> Dict:
     special_ids = set(getattr(tokenizer, "all_special_ids", []))
@@ -44,7 +43,7 @@ def generate_with_watermark(
             logits_wm = model(input_ids_wm).logits[0, -1, :]
             probs_wm = torch.softmax(logits_wm, dim=-1)
 
-        mask_A = get_vectorized_partition(probs_wm.shape[-1], secret_key, device, bit_index)
+        mask_A = get_vectorized_partition(probs_wm.shape[-1], device, bit_index)
         p = probs_wm[mask_A].sum().item()
         p_count += 1
         running_mean_p += (p - running_mean_p) / p_count
@@ -62,13 +61,22 @@ def generate_with_watermark(
             if len(gen_ids_ns) != (len(retok_ids_ns) + _retok_offset):
                 if len(gen_ids_ns) > (len(retok_ids_ns) + _retok_offset):
                     if tid not in special_ids: bit_index_to_token_id[bit_index] = tid
-                    _retok_offset += 1 
+                    prev_off = _retok_offset
+                    _retok_offset += 1
+                    last_retok = retok_ids_ns[-1] if len(retok_ids_ns) > 0 else None
+                    last_gen = gen_ids_ns[-1] if len(gen_ids_ns) > 0 else None
+                    print(f"Retok offset increased: {prev_off} -> {_retok_offset} | last_retok={last_retok} last_gen={last_gen} tid={tid} bit_index={bit_index}")
                 else:
                     if tid not in special_ids:
                         for i in range(bit_index, min(bit_index + 2, len(bit_index_to_token_id))):
                             if i < len(bit_index_to_token_id):
                                 bit_index_to_token_id[i] = tid
-                    bit_index += 2; _retok_offset -= 1 
+                    prev_off = _retok_offset
+                    _retok_offset -= 1
+                    last_retok = retok_ids_ns[-1] if len(retok_ids_ns) > 0 else None
+                    last_gen = gen_ids_ns[-1] if len(gen_ids_ns) > 0 else None
+                    print(f"Retok offset decreased: {prev_off} -> {_retok_offset} | last_retok={last_retok} last_gen={last_gen} tid={tid} bit_index={bit_index}")
+                    bit_index += 2
             else:
                 if tid not in special_ids: bit_index_to_token_id[bit_index] = tid
                 bit_index += 1
@@ -88,7 +96,6 @@ def generate_with_watermark(
 def recover_bitstream(
     full_sequence_ids: List[int],
     vocab_size: int,
-    key: str,
     device: str,
     special_ids: set,
     ground_truth_tokens: List[int] = None,
@@ -107,7 +114,7 @@ def recover_bitstream(
     for bit_idx, actual_token_id in enumerate(filtered_ids):
         if ground_truth_tokens and bit_idx >= len(ground_truth_tokens): break
 
-        mask_A = get_vectorized_partition(vocab_size, key, device, bit_idx)
+        mask_A = get_vectorized_partition(vocab_size, device, bit_idx)
         # Guard against any remaining out-of-bounds access just in case.
         if actual_token_id >= mask_A.shape[0]:
             # If token id is outside, treat it as belonging to the B set (bit=1)
