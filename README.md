@@ -28,3 +28,4 @@ Uses CPRF from here https://github.com/sachaservan/cprf.git
 - Make the length of output be separate from the length of string encoded
 - Extensive test suite
 - Instead of decoding entire output for each token generated, just decode a window of tokens, but to avoid causing more retokenization issues from cutting off the window arbitrarily, find a matching token to sync up.
+- look into more operations replacing lists with bitwise etc

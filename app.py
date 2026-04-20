@@ -3,6 +3,7 @@ import torch
 import random
 import prc
 import cprf
+import secrets
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from randrecover import (
     generate_with_watermark, recover_bitstream, recover_bitstream_from_text,
@@ -69,6 +70,18 @@ def main():
     print(f"CEval on x matches r_reject: {recovered_r_reject == r}")
     print(f"CEval on x matches r_alt_accept: {recovered_r_alt_accept == r}")
 
+    def s_similarity(s1, s2):
+        pem1 = prc.key_to_pem(s1)
+        pem2 = prc.key_to_pem(s2)
+        if not pem1 or not pem2: return 0.0
+        matches = sum(1 for a, b in zip(pem1, pem2) if a == b)
+        return matches / max(len(pem1), len(pem2))
+
+    print("\n--- S Similarity ---")
+    print(f"Similarity s vs recovered_s_accept_all: {s_similarity(s, recovered_s_accept_all):.2%}")
+    print(f"Similarity s vs recovered_s_reject: {s_similarity(s, recovered_s_reject):.2%}")
+    print(f"Similarity s vs recovered_s_alt_accept: {s_similarity(s, recovered_s_alt_accept):.2%}")
+
     print("\n--- Evaluation ---")
     extracted_ctx, _ = recover_bitstream(
         out["input_ids_wm"][0].tolist(), tokenizer.vocab_size, device, special_ids
@@ -98,6 +111,28 @@ def main():
     safe_detect(extracted_txt, recovered_s_alt_accept, "Text Alt Accept")
     safe_detect(extracted_txt, recovered_s_reject, "Text Reject")
     safe_detect(random_control, recovered_s_accept_all, "Random Control")
+
+    print("\n--- Testing Many Random Strings ---")
+    TEST_CODE_LEN = 1000
+    prc.set_code_length(TEST_CODE_LEN)
+    random_testing_s = prc.key_gen_from_seed(sha256(secrets.token_bytes(TEST_CODE_LEN)).digest())
+    num_random_tests = 10000
+    false_positives = 0
+    total_ber = 0.0
+    for _ in range(num_random_tests):
+        rand_str = [random.randint(0, 1) for _ in range(TEST_CODE_LEN)]
+        ber = sum(1 for a, b in zip(secret_bitstream, rand_str) if a != b) / TEST_CODE_LEN
+        total_ber += ber
+        
+        # Enforce exact length for PRC module
+        bits = (rand_str + [0] * TEST_CODE_LEN)[:TEST_CODE_LEN]
+        if prc.detect(random_testing_s, [bool(b) for b in bits]):
+            false_positives += 1
+            
+    avg_ber = total_ber / num_random_tests
+    print(f"Tested {num_random_tests} random strings.")
+    print(f"Average BER: {avg_ber:.2%}")
+    print(f"False Positives (Watermark Detected): {false_positives} / {num_random_tests} ({false_positives/num_random_tests:.2%})")
 
 if __name__ == "__main__":
     main()
