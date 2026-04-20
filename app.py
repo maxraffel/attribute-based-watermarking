@@ -65,7 +65,7 @@ def main():
     recovered_r_alt_accept = dk_alt_accept.c_eval(x)
     recovered_s_alt_accept = prc.key_gen_from_seed(sha256(recovered_r_alt_accept).digest())
 
-    print(f"CEval on x matches r: {recovered_r_accept_all == r}")
+    print(f"CEval on x matches r_accept_all: {recovered_r_accept_all == r}")
     print(f"CEval on x matches r_reject: {recovered_r_reject == r}")
     print(f"CEval on x matches r_alt_accept: {recovered_r_alt_accept == r}")
 
