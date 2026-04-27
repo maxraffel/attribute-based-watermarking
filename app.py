@@ -10,37 +10,7 @@ from randrecover import (
 import watermarking as wm
 from watermarking import issue, setup
 
-# ANSI (Windows 10+ conhost / Windows Terminal)
-_GREEN = "\033[92m"
-_RED = "\033[91m"
-_DIM = "\033[2m"
-_RESET = "\033[0m"
-
-
-def _dot_mod(f: list[int], x: list[int], modulus: int) -> int:
-    return sum(f[i] * x[i] for i in range(len(x))) % modulus
-
-
-def _expect_ceval_matches_r(f: list[int], x: list[int], modulus: int) -> bool:
-    """CPRF c_eval recovers master eval iff f·x ≡ 0 (mod modulus) for this construction."""
-    return _dot_mod(f, x, modulus) == 0
-
-
-def _print_check(name: str, got: bool, expected: bool) -> bool:
-    ok = got == expected
-    tag = f"{_GREEN}PASS{_RESET}" if ok else f"{_RED}FAIL{_RESET}"
-    exp_c = _GREEN if expected else _RED
-    print(f"  {tag}  {name}  (got {got}, {exp_c}expected {expected}{_RESET})")
-    return ok
-
-
-def _print_metric_check(name: str, value: float, expected_high: bool) -> bool:
-    high = value >= 0.99
-    ok = high == expected_high
-    tag = f"{_GREEN}PASS{_RESET}" if ok else f"{_RED}FAIL{_RESET}"
-    want = "high (≥99%)" if expected_high else "low (<99%)"
-    print(f"  {tag}  {name}: {value:.2%}  ({_DIM}expected {want}{_RESET})")
-    return ok
+from check_report import CheckReporter, expect_cprf_ceval_ok
 
 
 def f_alt_constrained_to_x(x: list[int], code_len: int, modulus: int) -> list[int]:
@@ -122,35 +92,28 @@ def main():
     match_reject = recovered_r_reject == r
     match_alt = recovered_r_alt_accept == r
 
-    checks: list[bool] = []
-
-    print(f"\n{_DIM}--- CPRF c_eval vs master (expected = inner product f·x ≡ 0 mod modulus) ---{_RESET}")
-    checks.append(
-        _print_check(
-            "CEval vs r (accept_all)",
-            match_accept,
-            _expect_ceval_matches_r(f_accept_all, x, sk.modulus),
-        )
+    rep = CheckReporter()
+    rep.section("CPRF c_eval vs master (expected = inner product f·x ≡ 0 mod modulus)")
+    rep.add_boolean(
+        "CEval vs r (accept_all)",
+        match_accept,
+        expect_cprf_ceval_ok(f_accept_all, x, sk.modulus),
     )
-    checks.append(
-        _print_check(
-            "CEval vs r (reject)",
-            match_reject,
-            _expect_ceval_matches_r(f_reject, x, sk.modulus),
-        )
+    rep.add_boolean(
+        "CEval vs r (reject)",
+        match_reject,
+        expect_cprf_ceval_ok(f_reject, x, sk.modulus),
     )
-    checks.append(
-        _print_check(
-            "CEval vs r (alt_accept)",
-            match_alt,
-            _expect_ceval_matches_r(f_alt_accept, x, sk.modulus),
-        )
+    rep.add_boolean(
+        "CEval vs r (alt_accept)",
+        match_alt,
+        expect_cprf_ceval_ok(f_alt_accept, x, sk.modulus),
     )
 
-    print(f"\n{_DIM}--- PRC key PEM similarity (high iff c_eval recovered r) ---{_RESET}")
-    checks.append(_print_metric_check("Similarity s vs recovered_s_accept_all", sim_accept, match_accept))
-    checks.append(_print_metric_check("Similarity s vs recovered_s_reject", sim_reject, match_reject))
-    checks.append(_print_metric_check("Similarity s vs recovered_s_alt_accept", sim_alt, match_alt))
+    rep.section("PRC key PEM similarity (high iff c_eval recovered r)")
+    rep.add_metric("Similarity s vs recovered_s_accept_all", sim_accept, match_accept)
+    rep.add_metric("Similarity s vs recovered_s_reject", sim_reject, match_reject)
+    rep.add_metric("Similarity s vs recovered_s_alt_accept", sim_alt, match_alt)
 
     print("\n--- Evaluation ---")
     extracted_ctx, _ = recover_bitstream(
@@ -177,47 +140,34 @@ def main():
         b = (bits + [0] * CODE_LEN)[:CODE_LEN]
         return prc.detect(s_key, [bool(t) for t in b])
 
-    print(f"\n{_DIM}--- PRC detection (expected True only for valid key + plausible bitstream) ---{_RESET}")
-    checks.append(
-        _print_check(
-            "PRC Context + accept_all key",
-            prc_detect_bits(extracted_ctx, recovered_s_accept_all),
-            True,
-        )
+    rep.section("PRC detection (expected True only for valid key + plausible bitstream)")
+    rep.add_boolean(
+        "PRC Context + accept_all key",
+        prc_detect_bits(extracted_ctx, recovered_s_accept_all),
+        True,
     )
-    checks.append(
-        _print_check(
-            "PRC Text + accept_all key",
-            prc_detect_bits(extracted_txt, recovered_s_accept_all),
-            True,
-        )
+    rep.add_boolean(
+        "PRC Text + accept_all key",
+        prc_detect_bits(extracted_txt, recovered_s_accept_all),
+        True,
     )
-    checks.append(
-        _print_check(
-            "PRC Text + alt_accept key",
-            prc_detect_bits(extracted_txt, recovered_s_alt_accept),
-            True,
-        )
+    rep.add_boolean(
+        "PRC Text + alt_accept key",
+        prc_detect_bits(extracted_txt, recovered_s_alt_accept),
+        True,
     )
-    checks.append(
-        _print_check(
-            "PRC Text + reject key",
-            prc_detect_bits(extracted_txt, recovered_s_reject),
-            False,
-        )
+    rep.add_boolean(
+        "PRC Text + reject key",
+        prc_detect_bits(extracted_txt, recovered_s_reject),
+        False,
     )
-    checks.append(
-        _print_check(
-            "PRC Random + accept_all key",
-            prc_detect_bits(random_control, recovered_s_accept_all),
-            False,
-        )
+    rep.add_boolean(
+        "PRC Random + accept_all key",
+        prc_detect_bits(random_control, recovered_s_accept_all),
+        False,
     )
 
-    passed = sum(checks)
-    total = len(checks)
-    banner = f"{_GREEN}All checks passed ({passed}/{total}){_RESET}" if passed == total else f"{_RED}Some checks failed ({passed}/{total} passed){_RESET}"
-    print(f"\n{banner}")
+    rep.summary()
 
 
 if __name__ == "__main__":
