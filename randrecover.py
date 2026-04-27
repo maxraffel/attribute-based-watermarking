@@ -93,6 +93,32 @@ def generate_with_watermark(
         "p_count": p_count,
     }
 
+def generate_baseline(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    max_new_tokens: int,
+    device: str = "cpu",
+) -> str:
+    """
+    Greedy unwatermarked generation (deterministic for fixed model+prompt) used to derive
+    the attribute vector x. Match this to what verifiers will reproduce.
+    """
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    prompt_len = inputs["input_ids"].shape[1]
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", None)
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=pad_id,
+        )
+    gen_ids = out[0, prompt_len:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True)
+
 def recover_bitstream(
     full_sequence_ids: List[int],
     vocab_size: int,
@@ -134,9 +160,21 @@ def recover_bitstream(
 
     return recovered_bits, recovered_tokens
 
-def recover_bitstream_from_text(full_text: str, tokenizer: AutoTokenizer, **kwargs) -> Tuple[List[int], List[int]]:
+def recover_bitstream_from_text(
+    full_text: str,
+    tokenizer: AutoTokenizer,
+    device: str,
+    ground_truth_tokens: List[int] | None = None,
+) -> Tuple[List[int], List[int]]:
     enc = tokenizer(full_text, return_tensors="pt")
-    return recover_bitstream(full_sequence_ids=enc["input_ids"][0].tolist(), **kwargs)
+    special_ids = set(getattr(tokenizer, "all_special_ids", []))
+    return recover_bitstream(
+        full_sequence_ids=enc["input_ids"][0].tolist(),
+        vocab_size=tokenizer.vocab_size,
+        device=device,
+        special_ids=special_ids,
+        ground_truth_tokens=ground_truth_tokens,
+    )
 
 def log_generation_result(out: Dict) -> None:
     print(f"\n--- Generation Result ---\nPrompt: {out['prompt_text']}\nOutput: {out['generated_text_wm']}")
@@ -152,6 +190,7 @@ def log_recovery_evaluation(secret, extracted, label=""):
 __all__ = [
     "get_vectorized_partition",
     "generate_with_watermark",
+    "generate_baseline",
     "recover_bitstream",
     "recover_bitstream_from_text",
     "log_generation_result",

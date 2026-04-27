@@ -63,34 +63,14 @@ Let's try tweaking 819 bits of a bunch of codewords ...
 
 ## Python wrapper
 
-A wrapper for Python via maturin/PyO3 is provided:
+A wrapper for Python via maturin/PyO3 is provided.
 
-```
-➜  prc git:(main) ✗ python3 -m venv .venv
-➜  prc git:(main) ✗ source .venv/bin/activate
-(.venv) ➜  prc git:(main) ✗ pip install maturin
-Collecting maturin
-  Using cached maturin-1.7.8-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl.metadata (18 kB)
-Using cached maturin-1.7.8-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl (14.4 MB)
-Installing collected packages: maturin
-Successfully installed maturin-1.7.8
+From the **repository root** of this project (recommended):
 
-[notice] A new release of pip is available: 24.2 -> 24.3.1
-[notice] To update, run: pip install --upgrade pip
-(.venv) ➜  prc git:(main) ✗ cd prc
-(.venv) ➜  prc git:(main) ✗ maturin develop --release
-🔗 Found pyo3 bindings
-🐍 Found CPython 3.13 at /Users/chris/bitbucket.cfdata.org/cpatton/prc/.venv/bin/python
-📡 Using build options features from pyproject.toml
-   Compiling prc v0.1.0 (/Users/chris/bitbucket.cfdata.org/cpatton/prc/prc)
-    Finished `release` profile [optimized] target(s) in 0.57s
-📦 Built wheel for CPython 3.13 to /var/folders/r7/y6vzmxvx65n7tbsdl10s6cn40000gn/T/.tmpSYCcwO/prc-0.1.0-cp313-cp313-macosx_11_0_arm64.whl
-✏️  Setting installed package as editable
-🛠 Installed prc-0.1.0
-(.venv) ➜  prc git:(main) ✗ python example.py
-generating keys...
-detect: success
-detect with a few flipped bits: success
-detect with 1/3 bits flipped: success
-detect with 1/2 bits flipped: failed as expected
+```sh
+uv sync --extra dev
+uv run maturin develop --release -m prc/Cargo.toml
+uv run python prc/example.py
 ```
+
+Alternatively, create a virtual environment, install `maturin`, run `maturin develop --release` from this `prc` directory, then `python example.py`.

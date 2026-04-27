@@ -3,18 +3,31 @@ This repository is an implementation for ............ by .............
 
 Currently the entire base construction is implemented, apart from adverserially robust classification for attribute generation
 
-Building PRC (make sure to run this at the start each time in case of update):
+## Setup
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/). Python 3.11 or newer is required.
+
+Install dependencies (including `maturin` for building PRC):
+
 ```sh
-maturin develop --release -m prc/Cargo.toml
+uv sync --extra dev
 ```
 
-Run with
+The first `uv sync` downloads a full PyTorch CUDA 12.6 wheel set, which is large and can take several minutes.
+
+Building PRC (run after cloning or whenever `prc/` changes):
+
 ```sh
-python -m venv .venv  # requirements are tested for Python 3.11
-source .venv/bin/activate
-pip install -r requirements.txt
-python app.py
+uv run maturin develop --release -m prc/Cargo.toml
 ```
+
+## Run
+
+```sh
+uv run python app.py
+```
+
+You can also activate the project virtual environment (`.venv` after `uv sync`) and run `python app.py` normally.
 
 Currently model and size of generation/randomness to recover is hardcoded
 
