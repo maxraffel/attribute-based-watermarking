@@ -135,6 +135,7 @@ def derive_x(
     keybert: Optional[KeyBERT] = None,
 ) -> Tuple[List[int], XDerivationInfo]:
     kws = extract_keyphrases(unwatermarked_text, keybert=keybert)
+    # print(f"Keyphrases: {kws}")
     ikm = build_ikm(unwatermarked_text, kws, _optional_app_salt())
     fp = hashlib.sha256(ikm).hexdigest()[:16]
     return ikm_to_x(ikm, code_len, modulus), XDerivationInfo(keyphrases=kws, ikm_fp16=fp)
