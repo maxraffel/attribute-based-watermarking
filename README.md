@@ -1,7 +1,29 @@
-# Attribute-based Watermarking for LLMs
-This repository is an implementation for ............ by .............
+# Attribute-based watermarking for LLMs
 
-Currently the entire base construction is implemented, apart from adverserially robust classification for attribute generation
+This repository ties a **CPRF** (constrained pseudorandom function) attribute vector `x` to a **PRC** (pseudorandom code) watermark on text from a causal LM. The attribute is derived from the **greedy baseline continuation** of the prompt (same string used at generation and verification), so anyone who can reproduce that baseline can recompute `x` and run detection.
+
+## How it works
+
+1. **Baseline text** — For a fixed prompt, the code runs **greedy** generation (temperature 0) for a fixed horizon (`SECURITY_PARAM` in `watermarking.py`) to obtain a reference string.
+2. **Attribute `x`** — `derive_x` in `attr_x_nli.py` maps that string to an integer vector of length `CPRF_ATTR_DIM` (see `closed_vocab.py`):
+   - **Prefix** (`len(VOCABULARY)` entries): each closed-vocab label gets a score from a Hugging Face **`zero-shot-classification`** pipeline (`multi_label=True`). The pipeline uses the model’s **default** hypothesis behavior (no custom template). Coordinate `i` is **0** if the score for `VOCABULARY[i]` is at least **`NLI_LABEL_ACTIVE_MIN_SCORE`** in `attr_x_nli.py`, otherwise **1** (label treated as inactive for CPRF).
+   - **Tail** (`ATTR_TAIL_DIM` entries): values from **SHAKE256** over a fixed-domain input that includes the baseline UTF-8 bytes and the prefix bit pattern, reduced mod the CPRF modulus. Keyword constraints **do not** depend on the tail (`f` is padded with zeros on the tail).
+3. **CPRF** — A master key is generated with dimension `CPRF_ATTR_DIM`. The inner product **⟨f, x⟩ ≡ 0 (mod modulus)** is what makes a constrained key’s `c_eval(x)` agree with `eval(x)` for a given policy vector `f`. Unconstrained keys use **f = 0**. Keyword policies set **f** only on indices of known required labels in `VOCABULARY`.
+4. **PRC** — `r = sk.eval(x)` (or `dk.c_eval(x)` under a policy). The PRC secret is keyed from **SHA256(r)**; bits are embedded with `randrecover` during generation and recovered for detection.
+
+Verification recomputes the baseline from the **same prompt** and thus the same `x` (up to model and library determinism). Wrong prompts or edited baselines generally break `master_detect`.
+
+## Layout
+
+| Piece | Role |
+|--------|------|
+| `watermarking.py` | Llama load, `setup` / `generate` / `detect` / `master_detect`, `issue_*` helpers |
+| `closed_vocab.py` | `VOCABULARY`, `ATTR_TAIL_DIM`, `CPRF_ATTR_DIM`, `f_for_required_keywords` |
+| `attr_x_nli.py` | Zero-shot scores → prefix bits; hash tail; one INFO log line with final scores per label |
+| `randrecover.py` | Baseline gen, watermark injection, bit recovery |
+| `cprf/` | CPRF shared library (ctypes) |
+| `prc/` | PRC Rust extension (maturin) |
+| `x_derivation.py` | Optional KeyBERT-based experiment (not used by `watermarking.py`) |
 
 ## Setup
 
@@ -13,32 +35,53 @@ Install dependencies (including `maturin` for building PRC):
 uv sync --extra dev
 ```
 
-The first `uv sync` downloads a full PyTorch CUDA 12.6 wheel set, which is large and can take several minutes.
+The first `uv sync` pulls a full PyTorch CUDA 12.6 wheel set from the configured index, which is large and can take several minutes.
 
-Building PRC (run after cloning or whenever `prc/` changes):
+Build PRC after cloning or whenever `prc/` changes:
 
 ```sh
 uv run maturin develop --release -m prc/Cargo.toml
 ```
 
+**Models** — At runtime the project downloads from Hugging Face:
+
+- **Causal LM:** `meta-llama/Llama-3.2-1B-Instruct` (see `watermarking.py`).
+- **Zero-shot NLI:** `MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli` (see `attr_x_nli.py`).
+
+You need enough disk space and (for GPU) VRAM for both; the DeBERTa checkpoint is large relative to the 1B instruct model.
+
 ## Run
+
+Demo checks (Rich pass/fail):
 
 ```sh
 uv run python app.py
 ```
 
-You can also activate the project virtual environment (`.venv` after `uv sync`) and run `python app.py` normally.
+Attribute + CPRF consistency checks (includes the same watermark checks plus explicit `x` and **f·x** reporting):
 
-Currently model and size of generation/randomness to recover is hardcoded
+```sh
+uv run python test_attr_classification.py
+```
 
-Uses PRC from here https://github.com/cloudflareresearch/poc-watermark/tree/main/prc
-- Modified to enable deterministic key generation
-Uses CPRF from here https://github.com/sachaservan/cprf.git
-- Linked using ctypes
+You can also activate `.venv` and run `python app.py` as usual.
 
-## TODO/Issues:
-- Proper citations/references, maybe correctly fork/branch from utilized repos
-- Make the length of output be separate from the length of string encoded
-- Extensive test suite
-- Instead of decoding entire output for each token generated, just decode a window of tokens, but to avoid causing more retokenization issues from cutting off the window arbitrarily, find a matching token to sync up.
-- look into more operations replacing lists with bitwise etc
+## Tuning
+
+- **Label sensitivity** — Edit **`NLI_LABEL_ACTIVE_MIN_SCORE`** in `attr_x_nli.py` (higher → fewer labels marked active; more strict).
+- **Vocabulary and CPRF size** — Edit **`VOCABULARY`** and **`ATTR_TAIL_DIM`** in `closed_vocab.py` (changing them changes `CPRF_ATTR_DIM` and invalidates old keys relative to new `x`).
+
+Generation horizon and PRC length are still fixed in code (`SECURITY_PARAM`).
+
+## Upstream components
+
+- **PRC** — Based on [cloudflare/poc-watermark `prc`](https://github.com/cloudflareresearch/poc-watermark/tree/main/prc), with deterministic key generation as in this tree.
+- **CPRF** — From [sachaservan/cprf](https://github.com/sachaservan/cprf), loaded via ctypes (`cprf/cprf.so`).
+
+## TODO / issues
+
+- Proper citations and forks for upstream repos.
+- Decouple output length from encode horizon where possible.
+- Broader automated tests (beyond `test_attr_classification.py` and `cprf/test_cprf.py`).
+- Windowed decoding in `randrecover` instead of full-sequence decode per step.
+- Optional: drop unused `keybert` dependency if `x_derivation.py` is removed or moved behind extras.
