@@ -1,19 +1,25 @@
+import logging
+
 import watermarking as wm
 
 from check_report import CheckReporter
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
     sk = wm.setup(1024)
     prompt = (
-        "In a few short sentences, explain the meaning of life and why humans ask this question."
+        "Explain the benefits of penicillin during the 19th and 20th centuries."
     )
     out = wm.generate(sk, prompt)
     text = out["generated_text_wm"]
 
     dk_open = wm.issue_unconstrained(sk)
-    dk_match = wm.issue_keyword_policy(sk, ["meaning", "life", "nosuchtoken"])
-    dk_wrong = wm.issue_keyword_policy(sk, ["python", "water"])
+    dk_match = wm.issue_keyword_policy(sk, ["medicine"])
+    dk_wrong = wm.issue_keyword_policy(sk, ["finance"])
 
     rep = CheckReporter()
     rep.section("Black-box (watermarking API only)")
