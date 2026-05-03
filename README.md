@@ -58,6 +58,8 @@ Demo checks (Rich pass/fail):
 uv run python app.py
 ```
 
+**Google Colab:** open [`colab.ipynb`](colab.ipynb) in Colab (or upload it with the repo). It uses `%pip`, `notebook_login()`, and `runpy` instead of a shell-only workflow.
+
 Attribute + CPRF consistency checks (includes the same watermark checks plus explicit `x` and **f·x** reporting):
 
 ```sh
