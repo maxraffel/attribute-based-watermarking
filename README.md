@@ -1,17 +1,17 @@
 # Attribute-based watermarking for LLMs
 
-This repository ties a **CPRF** (constrained pseudorandom function) attribute vector `x` to a **PRC** (pseudorandom code) watermark on text from a causal LM. The attribute is derived from the **greedy baseline continuation** of the prompt (same string used at generation and verification), so anyone who can reproduce that baseline can recompute `x` and run detection.
+This repository ties a **CPRF** (constrained pseudorandom function) attribute vector `x` to a **PRC** (pseudorandom code) watermark on text from a causal LM. **Encoding** still sets `x = derive_x(baseline)` where the baseline is the greedy continuation of the prompt. **`detect` / `master_detect` only take `watermarked_text`**: they set `x = derive_x(watermarked_text)` (same zero-shot prefix + fixed tail as in `attr_x_nli.derive_x`). Verification succeeds only when that reconstructed `x` matches the `x` used at encode time (the watermarked output usually needs to preserve the same label-level scores as the baseline). **`generate` still returns `attr_x`** (the encode-time `x`) for debugging or auditing.
 
 ## How it works
 
 1. **Baseline text** — For a fixed prompt, the code runs **greedy** generation (temperature 0) for a fixed horizon (`SECURITY_PARAM` in `watermarking.py`) to obtain a reference string.
 2. **Attribute `x`** — `derive_x` in `attr_x_nli.py` maps that string to an integer vector of length `CPRF_ATTR_DIM` (see `closed_vocab.py`):
    - **Prefix** (`len(VOCABULARY)` entries): each closed-vocab label gets a score from a Hugging Face **`zero-shot-classification`** pipeline (`multi_label=True`). The pipeline uses the model’s **default** hypothesis behavior (no custom template). Coordinate `i` is **0** if the score for `VOCABULARY[i]` is at least **`NLI_LABEL_ACTIVE_MIN_SCORE`** in `attr_x_nli.py`, otherwise **1** (label treated as inactive for CPRF).
-   - **Tail** (`ATTR_TAIL_DIM` entries): values from **SHAKE256** over a fixed-domain input that includes the baseline UTF-8 bytes and the prefix bit pattern, reduced mod the CPRF modulus. Keyword constraints **do not** depend on the tail (`f` is padded with zeros on the tail).
+   - **Tail** (`ATTR_TAIL_DIM` entries): a **fixed**, predetermined sequence (expanded from a project constant with SHAKE256, then reduced mod the CPRF modulus)—the same for every baseline, independent of text or prefix. Keyword constraints **do not** depend on the tail (`f` is padded with zeros on the tail).
 3. **CPRF** — A master key is generated with dimension `CPRF_ATTR_DIM`. The inner product **⟨f, x⟩ ≡ 0 (mod modulus)** is what makes a constrained key’s `c_eval(x)` agree with `eval(x)` for a given policy vector `f`. Unconstrained keys use **f = 0**. Keyword policies set **f** only on indices of known required labels in `VOCABULARY`.
 4. **PRC** — `r = sk.eval(x)` (or `dk.c_eval(x)` under a policy). The PRC secret is keyed from **SHA256(r)**; bits are embedded with `randrecover` during generation and recovered for detection.
 
-Verification recomputes the baseline from the **same prompt** and thus the same `x` (up to model and library determinism). Wrong prompts or edited baselines generally break `master_detect`.
+Because the **prefix** of `x` comes from zero-shot scores on whichever string is passed to `derive_x`, encode-time `x` (baseline) and verify-time `x` (watermarked transcript) can differ; only the **tail** is shared and fixed. If they differ, `master_detect` fails even for a valid watermark string.
 
 ## Layout
 
@@ -19,7 +19,7 @@ Verification recomputes the baseline from the **same prompt** and thus the same 
 |--------|------|
 | `watermarking.py` | Llama load, `setup` / `generate` / `detect` / `master_detect`, `issue_*` helpers |
 | `closed_vocab.py` | `VOCABULARY`, `ATTR_TAIL_DIM`, `CPRF_ATTR_DIM`, `f_for_required_keywords` |
-| `attr_x_nli.py` | Zero-shot scores → prefix bits; hash tail; one INFO log line with final scores per label |
+| `attr_x_nli.py` | Zero-shot scores → prefix bits; fixed tail; one INFO log line with final scores per label |
 | `randrecover.py` | Baseline gen, watermark injection, bit recovery |
 | `cprf/` | CPRF shared library (ctypes) |
 | `prc/` | PRC Rust extension (maturin) |

@@ -6,10 +6,10 @@ from typing import List, Sequence
 
 # Single project-wide label list (CPRF inner-product prefix length).
 VOCABULARY: List[str] = [
-    "medicine", "law", "technology", "finance", "art", "sports", "cooking", "environment", "philosophy"
+    "medicine", "law", "software", "finance", "art", "sports", "cooking", "environment", "philosophy"
 ]
 
-# Hash-derived coordinates appended after NLI label bits (ignored by keyword constraints).
+# Fixed random coordinates appended after label bits (ignored by keyword constraints).
 ATTR_TAIL_DIM = 32
 
 CPRF_ATTR_DIM = len(VOCABULARY) + ATTR_TAIL_DIM

@@ -1,4 +1,4 @@
-"""CPRF attribute x: zero-shot label scores over ``closed_vocab.VOCABULARY`` + hash-derived tail."""
+"""CPRF attribute x: zero-shot label scores over ``closed_vocab.VOCABULARY`` + fixed random tail."""
 
 from __future__ import annotations
 
@@ -12,7 +12,8 @@ from transformers import pipeline
 from closed_vocab import ATTR_TAIL_DIM, VOCABULARY
 
 NLI_MODEL_ID = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
-_IKM_PREFIX = b"watermarking-for-llm/attr-x/nli-tail/v1\x00"
+# Deterministic tail bytes (independent of text/prefix); same for every ``derive_x`` call.
+_FIXED_TAIL_SEED = b"watermarking-for-llm/attr-x/fixed-tail/v1\x00"
 
 # With ``multi_label=True``, each label gets a score in [0, 1]. Label is active (absence_bit 0)
 # iff score >= this bar. Raise → stricter; lower → more labels active.
@@ -63,11 +64,8 @@ def _nli_label_absence_bits(text: str) -> List[int]:
     return out
 
 
-def _shake_tail(text: str, prefix_absence: List[int], n: int, modulus: int) -> List[int]:
-    text_b = text.encode("utf-8", errors="strict")
-    pref_b = bytes(prefix_absence)
-    ikm = _IKM_PREFIX + len(text_b).to_bytes(8, "big") + text_b + b"\x00pref:\x00" + pref_b
-    raw = hashlib.shake_256(ikm).digest(2 * n)
+def _fixed_tail(n: int, modulus: int) -> List[int]:
+    raw = hashlib.shake_256(_FIXED_TAIL_SEED).digest(2 * n)
     return [
         int.from_bytes(raw[i * 2 : (i + 1) * 2], "big", signed=False) % modulus
         for i in range(n)
@@ -76,6 +74,6 @@ def _shake_tail(text: str, prefix_absence: List[int], n: int, modulus: int) -> L
 
 def derive_x(text: str, modulus: int) -> List[int]:
     prefix = _nli_label_absence_bits(text)
-    tail = _shake_tail(text, prefix, ATTR_TAIL_DIM, modulus)
+    tail = _fixed_tail(ATTR_TAIL_DIM, modulus)
     combined = prefix + tail
     return [v % modulus for v in combined]

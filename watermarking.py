@@ -42,9 +42,9 @@ def issue_unconstrained(sk: cprf.MasterKey) -> cprf.ConstrainedKey:
 
 def issue_keyword_policy(sk: cprf.MasterKey, required: List[str]) -> cprf.ConstrainedKey:
     """
-    Constrained key: inner product uses only the label prefix of x.
-    Detection agrees with the master key when every known required label has an NLI
-    ``match'' (x[i]=0) on the greedy baseline for those indices.
+    Constrained key: inner product uses only the label prefix of ``x``.
+    ``detect`` / ``master_detect`` rebuild ``x`` from the watermarked transcript (zero-shot
+    prefix on that text + fixed tail), so policies apply to that reconstructed attribute.
     """
     return issue_constrained_key_for_keywords(sk, required)
 
@@ -60,12 +60,17 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     prc.set_code_length(SECURITY_PARAM)
     c = prc.encode(prc.key_gen_from_seed(sha256(r).digest()))
     bits = [1 if b else 0 for b in c]
-    return randrecover.generate_with_watermark(MODEL, TOKENIZER, prompt, bits, DEVICE)
+    out = randrecover.generate_with_watermark(MODEL, TOKENIZER, prompt, bits, DEVICE)
+    out["attr_x"] = x
+    return out
 
 
-def detect(dk: cprf.ConstrainedKey, prompt: str, watermarked_text: str) -> bool:
-    """Recover PRC bits; x is derived from the greedy ``prompt`` baseline (NLI label bits + tail)."""
-    x = derive_x(_baseline(prompt), dk.modulus)
+def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> bool:
+    """
+    Recover PRC bits. Rebuilds ``x`` from ``watermarked_text`` via ``derive_x`` (zero-shot prefix + fixed tail).
+    This must match the ``x`` used in ``generate`` (from the greedy baseline) for detection to succeed.
+    """
+    x = derive_x(watermarked_text, dk.modulus)
     prc.set_code_length(SECURITY_PARAM)
     recovered_s = prc.key_gen_from_seed(sha256(dk.c_eval(x)).digest())
     bits, _ = randrecover.recover_bitstream_from_text(watermarked_text, TOKENIZER, DEVICE)
@@ -73,9 +78,9 @@ def detect(dk: cprf.ConstrainedKey, prompt: str, watermarked_text: str) -> bool:
     return prc.detect(recovered_s, [bool(b) for b in bits])
 
 
-def master_detect(sk: cprf.MasterKey, prompt: str, watermarked_text: str) -> bool:
+def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> bool:
     """Same as ``detect`` but using the master key (oracle verifier)."""
-    x = derive_x(_baseline(prompt), sk.modulus)
+    x = derive_x(watermarked_text, sk.modulus)
     prc.set_code_length(SECURITY_PARAM)
     s = prc.key_gen_from_seed(sha256(sk.eval(x)).digest())
     bits, _ = randrecover.recover_bitstream_from_text(watermarked_text, TOKENIZER, DEVICE)

@@ -23,13 +23,13 @@ def main():
 
     rep = CheckReporter()
     rep.section("Black-box (watermarking API only)")
-    rep.add_boolean("master_detect(good)", wm.master_detect(sk, prompt, text), True)
-    rep.add_boolean("detect(unconstrained)", wm.detect(dk_open, prompt, text), True)
-    rep.add_boolean("detect(matching policy)", wm.detect(dk_match, prompt, text), True)
-    rep.add_boolean("detect(wrong policy)", wm.detect(dk_wrong, prompt, text), False)
+    rep.add_boolean("master_detect(good)", wm.master_detect(sk, text), True)
+    rep.add_boolean("detect(unconstrained)", wm.detect(dk_open, text), True)
+    rep.add_boolean("detect(matching policy)", wm.detect(dk_match, text), True)
+    rep.add_boolean("detect(wrong policy)", wm.detect(dk_wrong, text), False)
     rep.add_boolean(
-        "master_detect(wrong prompt)",
-        wm.master_detect(sk, "Say only the word: hello.", text),
+        "master_detect(wrong transcript)",
+        wm.master_detect(sk, "This is unrelated text used only as a negative control."),
         False,
     )
     rep.summary()

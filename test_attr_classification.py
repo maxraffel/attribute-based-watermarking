@@ -1,5 +1,6 @@
 """
-End-to-end attribute + CPRF checks: watermarked generation, explicit x, PRC detect, and f·x mod m.
+End-to-end checks: watermarked generation, ``x`` from watermarked text (same as ``detect``),
+PRC + CPRF inner products.
 
 Run: uv run python test_attr_classification.py
 """
@@ -14,6 +15,7 @@ for _name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
 import watermarking as wm
+from attr_x_nli import derive_x
 from check_report import CheckReporter, expect_cprf_ceval_ok
 from closed_vocab import CPRF_ATTR_DIM, VOCABULARY, f_for_required_keywords
 
@@ -41,14 +43,20 @@ def main() -> int:
         "Explain the benefits of penicillin during the 19th and 20th centuries."
     )
 
-    rep.section("Generate (watermarked) and recover attribute x")
+    rep.section("Generate (watermarked) and attribute x from transcript")
     out = wm.generate(sk, prompt)
     text = out["generated_text_wm"]
-    x = wm.attr_x_for_prompt(sk, prompt)
+    x = derive_x(text, sk.modulus)
     rep.console.print(f"  [dim]len(x)={len(x)} (expect {CPRF_ATTR_DIM}), CPRF modulus={sk.modulus}[/]")
     n = len(VOCABULARY)
-    rep.console.print(f"  [dim]NLI prefix (absence bits, len {n}):[/] {x[:n]}")
+    rep.console.print(f"  [dim]prefix from watermarked text (len {n}):[/] {x[:n]}")
     rep.console.print(f"  [dim]tail (first 8 of {len(x) - n}):[/] {x[n : n + 8]}...")
+    x_enc = out["attr_x"]
+    if x_enc != x:
+        rep.console.print(
+            "  [yellow]Note: encode-time x (from greedy baseline) differs from verify-time x "
+            "(from watermarked text); detect uses the latter.[/]"
+        )
 
     dk_open = wm.issue_unconstrained(sk)
     dk_match = wm.issue_keyword_policy(sk, ["medicine"])
@@ -59,14 +67,14 @@ def main() -> int:
     f_wrong = f_for_required_keywords(["finance"])
 
     rep.section("PRC + constrained keys (same expectations as app.py)")
-    master_ok = wm.master_detect(sk, prompt, text)
+    master_ok = wm.master_detect(sk, text)
     rep.add_boolean("master_detect(good)", master_ok, True)
-    rep.add_boolean("detect(unconstrained)", wm.detect(dk_open, prompt, text), True)
-    rep.add_boolean("detect(matching policy)", wm.detect(dk_match, prompt, text), True)
-    rep.add_boolean("detect(wrong policy)", wm.detect(dk_wrong, prompt, text), False)
+    rep.add_boolean("detect(unconstrained)", wm.detect(dk_open, text), True)
+    rep.add_boolean("detect(matching policy)", wm.detect(dk_match, text), True)
+    rep.add_boolean("detect(wrong policy)", wm.detect(dk_wrong, text), False)
     rep.add_boolean(
-        "master_detect(wrong prompt)",
-        wm.master_detect(sk, "Say only the word: hello.", text),
+        "master_detect(wrong transcript)",
+        wm.master_detect(sk, "This is unrelated text used only as a negative control."),
         False,
     )
 
@@ -93,22 +101,21 @@ def main() -> int:
     if master_ok:
         rep.add_boolean(
             "cprf: matching policy ⟺ detect(dk_match)",
-            expect_cprf_ceval_ok(f_match, x, sk.modulus) == wm.detect(dk_match, prompt, text),
+            expect_cprf_ceval_ok(f_match, x, sk.modulus) == wm.detect(dk_match, text),
             True,
         )
         rep.add_boolean(
             "cprf: wrong policy ⟺ detect(dk_wrong)",
-            expect_cprf_ceval_ok(f_wrong, x, sk.modulus) == wm.detect(dk_wrong, prompt, text),
+            expect_cprf_ceval_ok(f_wrong, x, sk.modulus) == wm.detect(dk_wrong, text),
             True,
         )
 
-    wrong_prompt = "Say only the word: hello."
-    x_wrong = wm.attr_x_for_prompt(sk, wrong_prompt)
-    rep.section("Wrong baseline x (different prompt) vs same watermark text")
-    rep.console.print(f"  [dim]⟨f_zero,x_wrong⟩ mod m =[/] {_f_dot_x_mod(f_zero, x_wrong, sk.modulus)}")
+    rep.section("Alternate transcript → different x (CPRF sanity)")
+    x_other = derive_x("Say only the word: hello.", sk.modulus)
+    rep.console.print(f"  [dim]⟨f_zero,x_other⟩ mod m =[/] {_f_dot_x_mod(f_zero, x_other, sk.modulus)}")
     rep.add_boolean(
-        "cprf: wrong-prompt x still satisfies unconstrained f",
-        expect_cprf_ceval_ok(f_zero, x_wrong, sk.modulus),
+        "cprf: unconstrained still agrees on unrelated short text",
+        expect_cprf_ceval_ok(f_zero, x_other, sk.modulus),
         True,
     )
 
