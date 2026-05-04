@@ -20,7 +20,7 @@ _FIXED_TAIL_SEED = b"watermarking-for-llm/attr-x/fixed-tail/v1\x00"
 NLI_LABEL_ACTIVE_MIN_SCORE: float = 0.9
 
 # Hugging Face ``hypothesis_template`` for zero-shot labels; ``{}`` is replaced by each candidate.
-NLI_HYPOTHESIS_TEMPLATE = "{} is the main subject of this text."
+NLI_HYPOTHESIS_TEMPLATE = "{} is the primary topic of this text."
 
 logger = logging.getLogger(__name__)
 

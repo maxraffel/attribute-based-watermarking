@@ -4,16 +4,22 @@ Watermarking benchmark: multiple prompts, repeated runs, one summary table per p
 For each prompt and run: ``generate`` → issue unconstrained, matching-policy, and unrelated
 keys → ``master_detect`` plus three ``detect`` calls. Records success counts, BER (recovered vs
 embedded PRC bits from ``generate``), timings (baseline vs watermarked generation from
-``watermarking.generate``), and agreement of encode-time ``attr_x`` prefix vs verify-time
-``derive_x`` on the watermarked text.
+``watermarking.generate``), and whether encode-time ``attr_x`` exactly equals verify-time
+``derive_x`` on the watermarked text (count of perfect matches per prompt over runs).
 
 CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, and repeatable
 ``--prompt-case id:prompt`` (split on first ``:`` only). If no cases are given, two defaults are used.
+Non-TTY / captured stdout (e.g. Colab ``subprocess.run(..., capture_output=True)``) prints a
+**plain-text** results table automatically; set ``BENCHMARK_PLAIN_TABLE=0`` to force the Rich
+table anyway, or ``=1`` to force plain text even on a TTY. ``BENCHMARK_CONSOLE_WIDTH`` /
+``BENCHMARK_CONSOLE_HEIGHT`` tune the Rich console when stdout is not a TTY.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -22,11 +28,43 @@ from typing import Sequence
 from rich.console import Console
 from rich.table import Table
 
+
+def make_benchmark_console() -> Console:
+    """
+    When stdout is a **real TTY**, use the terminal's size (do not force a wide floor — that
+    reflows badly in <168-column terminals). When stdout is **not** a TTY (piped / Colab
+    ``capture_output``), set explicit dimensions so Rich's own ``print`` helpers still measure
+    consistently; the results table itself switches to plain text (see ``_use_plain_table()``).
+    """
+    floor_w = int(os.environ.get("BENCHMARK_CONSOLE_WIDTH", "168"))
+    floor_h = int(os.environ.get("BENCHMARK_CONSOLE_HEIGHT", "120"))
+    try:
+        term = shutil.get_terminal_size()
+        if sys.stdout.isatty():
+            w = min(max(term.columns, 40), 240)
+            h = min(max(term.lines, 10), 200)
+        else:
+            w = floor_w
+            h = floor_h
+    except OSError:
+        w, h = floor_w, floor_h
+    return Console(highlight=False, width=w, height=h)
+
+
+def _use_plain_table() -> bool:
+    """Rich boxed tables ellipsize badly under captured/piped stdout; use fixed-width text."""
+    v = os.environ.get("BENCHMARK_PLAIN_TABLE", "").strip().lower()
+    if v in ("1", "true", "yes", "always"):
+        return True
+    if v in ("0", "false", "no", "never"):
+        return False
+    return not sys.stdout.isatty()
+
+
 DEFAULT_PROMPT_CASES: list[tuple[str, str]] = [
     (
-        "medical_procedure",
-        "In three short paragraphs, describe a common outpatient medical procedure "
-        "and what the patient should expect before and after the visit.",
+        "dcf_finance",
+        "Explain how a DCF works in the context of finance."
     ),
     ("med_school", "Describe the best medical schools and their medical specialties."),
 ]
@@ -53,15 +91,6 @@ def _ber_percent(secret: list[int], recovered: list[int]) -> float:
     return 100.0 * errs / n
 
 
-def _prefix_match_rate(x_enc: Sequence[int], x_ver: Sequence[int], n_prefix: int) -> float:
-    if n_prefix <= 0:
-        return 1.0
-    m = min(len(x_enc), len(x_ver), n_prefix)
-    if m == 0:
-        return 0.0
-    return sum(1 for i in range(m) if int(x_enc[i]) == int(x_ver[i])) / float(n_prefix)
-
-
 @dataclass
 class PromptRollup:
     """Accumulated stats for one prompt id across runs."""
@@ -72,7 +101,7 @@ class PromptRollup:
     accept_ok: int = 0
     reject_correct: int = 0
     ber_sum: float = 0.0
-    x_prefix_match_sum: float = 0.0
+    x_perfect_match: int = 0
     t_baseline_sum: float = 0.0
     t_wm_sum: float = 0.0
     t_issue_sum: float = 0.0
@@ -89,7 +118,7 @@ class PromptRollup:
         accept_ok: bool,
         reject_got_true: bool,
         ber: float,
-        x_prefix_match: float,
+        x_perfect: bool,
         t_baseline: float,
         t_wm: float,
         t_issue: float,
@@ -108,7 +137,8 @@ class PromptRollup:
         if not reject_got_true:
             self.reject_correct += 1
         self.ber_sum += ber
-        self.x_prefix_match_sum += x_prefix_match
+        if x_perfect:
+            self.x_perfect_match += 1
         self.t_baseline_sum += t_baseline
         self.t_wm_sum += t_wm
         self.t_issue_sum += t_issue
@@ -116,6 +146,45 @@ class PromptRollup:
         self.t_open_sum += t_open
         self.t_accept_sum += t_accept
         self.t_reject_sum += t_reject
+
+
+def _print_plain_results_table(
+    *,
+    prompt_cases: Sequence[tuple[str, str]],
+    roll: dict[str, PromptRollup],
+) -> None:
+    w_sid = 26
+    print()
+    print("Per-prompt averages over runs")
+    header = (
+        f"{'prompt_id':<{w_sid}} {'runs':>5} {'master':>7} {'open':>7} {'accept':>7} "
+        f"{'rej_ok':>7} {'BER%':>7} {'x==':>7} {'t_bl':>9} {'t_wm':>9} {'t_key':>9} {'t_det':>9}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    def ratio(k: int, n: int) -> str:
+        return f"{k}/{n}"
+
+    for sid, _ in prompt_cases:
+        r = roll[sid]
+        n = r.runs
+        if n == 0:
+            continue
+        det_avg = (r.t_master_sum + r.t_open_sum + r.t_accept_sum + r.t_reject_sum) / n
+        sid_disp = sid if len(sid) <= w_sid else sid[: w_sid - 3] + "..."
+        print(
+            f"{sid_disp:<{w_sid}} {n:5d} "
+            f"{ratio(r.master_ok, n):>7} {ratio(r.open_ok, n):>7} {ratio(r.accept_ok, n):>7} "
+            f"{ratio(r.reject_correct, n):>7} {r.ber_sum / n:7.2f} {ratio(r.x_perfect_match, n):>7} "
+            f"{r.t_baseline_sum / n:9.3f} {r.t_wm_sum / n:9.3f} {r.t_issue_sum / n:9.4f} {det_avg:9.4f}"
+        )
+    print()
+    print(
+        "Legend: master/open/accept = successes/runs; rej_ok = correct reject (expect reject=False); "
+        "BER% = mean bit error vs embedded PRC (master recovery); x== = runs with full x match; "
+        "t_bl / t_wm / t_key / t_det = mean seconds."
+    )
 
 
 def run_benchmark(
@@ -130,13 +199,11 @@ def run_benchmark(
     import watermarking as wm
     import attr_x_nli
     from closed_vocab import (
-        VOCABULARY,
         active_labels_from_verify_x,
         pick_unrelated_keyword_for_policy,
     )
 
     wm.set_prc_code_length(code_length)
-    n_prefix = len(VOCABULARY)
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     sk_shared: dict[str, object] = {}
 
@@ -163,7 +230,7 @@ def run_benchmark(
 
             x_verify = attr_x_nli.derive_x(text, sk.modulus)
             active = active_labels_from_verify_x(x_verify, sk.modulus)
-            x_match = _prefix_match_rate(x_gen, x_verify, n_prefix)
+            x_perfect = list(x_gen) == list(x_verify)
 
             t0 = time.perf_counter()
             dk_open = wm.issue_unconstrained(sk)
@@ -201,7 +268,7 @@ def run_benchmark(
                 accept_ok=bool(a_ok),
                 reject_got_true=bool(r_ok),
                 ber=ber,
-                x_prefix_match=x_match,
+                x_perfect=x_perfect,
                 t_baseline=t_bl,
                 t_wm=t_wm,
                 t_issue=t_issue,
@@ -211,76 +278,106 @@ def run_benchmark(
                 t_reject=t_r,
             )
 
-    table = Table(title="Per-prompt averages over runs")
-    table.add_column("prompt_id", style="dim")
-    table.add_column("runs", justify="right")
-    table.add_column("master", justify="right")
-    table.add_column("open", justify="right")
-    table.add_column("accept", justify="right")
-    table.add_column("rej_ok", justify="right")
-    table.add_column("BER%", justify="right")
-    table.add_column("x≡%", justify="right")
-    table.add_column("t_bl", justify="right")
-    table.add_column("t_wm", justify="right")
-    table.add_column("t_key", justify="right")
-    table.add_column("t_det", justify="right")
-
     all_ok = True
     for sid, _ in prompt_cases:
         r = roll[sid]
         n = r.runs
         if n == 0:
             continue
-        det_avg = (r.t_master_sum + r.t_open_sum + r.t_accept_sum + r.t_reject_sum) / n
-        table.add_row(
-            sid,
-            str(n),
-            f"{r.master_ok}/{n}",
-            f"{r.open_ok}/{n}",
-            f"{r.accept_ok}/{n}",
-            f"{r.reject_correct}/{n}",
-            f"{r.ber_sum / n:.2f}",
-            f"{100.0 * r.x_prefix_match_sum / n:.1f}",
-            f"{r.t_baseline_sum / n:.3f}",
-            f"{r.t_wm_sum / n:.3f}",
-            f"{r.t_issue_sum / n:.4f}",
-            f"{det_avg:.4f}",
-        )
         all_ok = all_ok and (
             r.master_ok == n and r.open_ok == n and r.accept_ok == n and r.reject_correct == n
         )
 
     console.print()
-    console.print(table)
-    console.print(
-        "[dim]master/open/accept = successes / runs; rej_ok = correct reject (expect False). "
-        "BER% = mean bit error vs embedded PRC stream (master path recovery). "
-        "x≡% = mean fraction of prefix coords where encode-time attr_x matches verify-time derive_x. "
-        "t_bl / t_wm = mean baseline vs watermarked gen seconds from generate(). "
-        "t_key = mean issue time; t_det = mean total of four detection calls.[/]"
-    )
-
-    if not all_ok:
-        console.print(
-            "[bold red]Exiting with code 1:[/] at least one run did not meet all KPI checks "
-            "(master + unconstrained + policy-accept must succeed; policy-reject must fail)."
-        )
+    if _use_plain_table():
+        _print_plain_results_table(prompt_cases=prompt_cases, roll=roll)
+    else:
+        table = Table(title="Per-prompt averages over runs")
+        table.add_column("prompt_id", style="dim")
+        table.add_column("runs", justify="right")
+        table.add_column("master", justify="right")
+        table.add_column("open", justify="right")
+        table.add_column("accept", justify="right")
+        table.add_column("rej_ok", justify="right")
+        table.add_column("BER%", justify="right")
+        table.add_column("x==", justify="right")
+        table.add_column("t_bl", justify="right")
+        table.add_column("t_wm", justify="right")
+        table.add_column("t_key", justify="right")
+        table.add_column("t_det", justify="right")
         for sid, _ in prompt_cases:
             r = roll[sid]
             n = r.runs
             if n == 0:
                 continue
-            bad: list[str] = []
-            if r.master_ok < n:
-                bad.append(f"master {r.master_ok}/{n}")
-            if r.open_ok < n:
-                bad.append(f"open {r.open_ok}/{n}")
-            if r.accept_ok < n:
-                bad.append(f"accept {r.accept_ok}/{n}")
-            if r.reject_correct < n:
-                bad.append(f"reject_false_positive {n - r.reject_correct}/{n}")
-            if bad:
-                console.print(f"  [yellow]{sid}:[/] " + ", ".join(bad))
+            det_avg = (r.t_master_sum + r.t_open_sum + r.t_accept_sum + r.t_reject_sum) / n
+            table.add_row(
+                sid,
+                str(n),
+                f"{r.master_ok}/{n}",
+                f"{r.open_ok}/{n}",
+                f"{r.accept_ok}/{n}",
+                f"{r.reject_correct}/{n}",
+                f"{r.ber_sum / n:.2f}",
+                f"{r.x_perfect_match}/{n}",
+                f"{r.t_baseline_sum / n:.3f}",
+                f"{r.t_wm_sum / n:.3f}",
+                f"{r.t_issue_sum / n:.4f}",
+                f"{det_avg:.4f}",
+            )
+        console.print(table)
+        console.print(
+            "[dim]master/open/accept = successes / runs; rej_ok = correct reject (expect False). "
+            "BER% = mean bit error vs embedded PRC stream (master path recovery). "
+            "x== = runs where encode-time attr_x equals verify-time derive_x (full vector). "
+            "t_bl / t_wm = mean baseline vs watermarked gen seconds from generate(). "
+            "t_key = mean issue time; t_det = mean total of four detection calls.[/]"
+        )
+
+    if not all_ok:
+        if _use_plain_table():
+            print()
+            print(
+                "Exiting with code 1: at least one run did not meet all KPI checks "
+                "(master + unconstrained + policy-accept must succeed; policy-reject must fail)."
+            )
+            for sid, _ in prompt_cases:
+                r = roll[sid]
+                n = r.runs
+                if n == 0:
+                    continue
+                bad: list[str] = []
+                if r.master_ok < n:
+                    bad.append(f"master {r.master_ok}/{n}")
+                if r.open_ok < n:
+                    bad.append(f"open {r.open_ok}/{n}")
+                if r.accept_ok < n:
+                    bad.append(f"accept {r.accept_ok}/{n}")
+                if r.reject_correct < n:
+                    bad.append(f"reject_false_positive {n - r.reject_correct}/{n}")
+                if bad:
+                    print(f"  {sid}: " + ", ".join(bad))
+        else:
+            console.print(
+                "[bold red]Exiting with code 1:[/] at least one run did not meet all KPI checks "
+                "(master + unconstrained + policy-accept must succeed; policy-reject must fail)."
+            )
+            for sid, _ in prompt_cases:
+                r = roll[sid]
+                n = r.runs
+                if n == 0:
+                    continue
+                bad: list[str] = []
+                if r.master_ok < n:
+                    bad.append(f"master {r.master_ok}/{n}")
+                if r.open_ok < n:
+                    bad.append(f"open {r.open_ok}/{n}")
+                if r.accept_ok < n:
+                    bad.append(f"accept {r.accept_ok}/{n}")
+                if r.reject_correct < n:
+                    bad.append(f"reject_false_positive {n - r.reject_correct}/{n}")
+                if bad:
+                    console.print(f"  [yellow]{sid}:[/] " + ", ".join(bad))
 
     return 0 if all_ok else 1
 
@@ -316,7 +413,7 @@ def main() -> int:
     else:
         cases = list(DEFAULT_PROMPT_CASES)
 
-    console = Console(highlight=False)
+    console = make_benchmark_console()
     return run_benchmark(
         prompt_cases=cases,
         runs=args.runs,

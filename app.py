@@ -30,7 +30,7 @@ from closed_vocab import (
 MODULUS = 1024
 CODE_LENGTH = 300
 PROMPT = (
-    "What does a lawyer do on a daily basis."
+    "Explain how a DCF works in the context of finance."
 )
 
 
@@ -42,15 +42,6 @@ def _ber_percent(secret: list[int], recovered: list[int]) -> float:
     errs = sum(1 for i in range(m) if int(secret[i]) != int(recovered[i]))
     errs += abs(n - len(recovered))
     return 100.0 * errs / n
-
-
-def _prefix_match_rate(x_enc: Sequence[int], x_ver: Sequence[int], n_prefix: int) -> float:
-    if n_prefix <= 0:
-        return 1.0
-    m = min(len(x_enc), len(x_ver), n_prefix)
-    if m == 0:
-        return 0.0
-    return sum(1 for i in range(m) if int(x_enc[i]) == int(x_ver[i])) / float(n_prefix)
 
 
 def _bits_preview(bits: List[int], max_len: int = 64) -> str:
@@ -197,9 +188,11 @@ def main() -> int:
     c.print(f"  [bold]NLI-active (baseline text):[/] {active_bl or '(none)'}")
     c.print(f"  [bold]NLI-active (watermarked text):[/] {active_wm or '(none)'}")
     c.print(f"  [dim]derive_x(wm) prefix:[/] {x_verify[:n_prefix]}")
-    x_match = _prefix_match_rate(x_encode, x_verify, n_prefix)
+    x_perfect = list(x_encode) == list(x_verify)
+    # Do not nest style tags (e.g. [cyan][bold]…[/][/]) — Rich parses that poorly and looks broken.
+    _xtag = "[bold green]yes[/]" if x_perfect else "[bold red]no[/]"
     c.print(
-        f"  [dim]encode vs verify prefix coordinate match rate:[/] [cyan]{100.0 * x_match:.1f}%[/]"
+        "  [dim]encode-time attr_x equals verify-time derive_x (full vector):[/] " + _xtag
     )
 
     c.rule("4) Issue keys (unconstrained, accept=all active, reject=unrelated)", style="cyan")
@@ -302,7 +295,7 @@ def main() -> int:
     sum_table.add_column("metric")
     sum_table.add_column("value", justify="right")
     sum_table.add_row("BER% (master path vs embedded)", f"{ber:.3f}")
-    sum_table.add_row("x prefix match encode↔verify %", f"{100.0 * x_match:.2f}")
+    sum_table.add_row("x encode↔verify (full vector match)", "yes" if x_perfect else "no")
     sum_table.add_row("t_baseline_gen (s)", f"{t_bl:.4f}")
     sum_table.add_row("t_watermarked_gen (s)", f"{t_wm:.4f}")
     sum_table.add_row("t_issue_keys (s)", f"{t_keys:.5f}")
