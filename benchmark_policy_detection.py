@@ -28,7 +28,7 @@ DEFAULT_PROMPT_CASES: list[tuple[str, str]] = [
         "In three short paragraphs, describe a common outpatient medical procedure "
         "and what the patient should expect before and after the visit.",
     ),
-    ("med_school", "Describe the intersection of medicine and education."),
+    ("med_school", "Describe the best medical schools and their medical specialties."),
 ]
 
 
@@ -259,6 +259,28 @@ def run_benchmark(
         "t_bl / t_wm = mean baseline vs watermarked gen seconds from generate(). "
         "t_key = mean issue time; t_det = mean total of four detection calls.[/]"
     )
+
+    if not all_ok:
+        console.print(
+            "[bold red]Exiting with code 1:[/] at least one run did not meet all KPI checks "
+            "(master + unconstrained + policy-accept must succeed; policy-reject must fail)."
+        )
+        for sid, _ in prompt_cases:
+            r = roll[sid]
+            n = r.runs
+            if n == 0:
+                continue
+            bad: list[str] = []
+            if r.master_ok < n:
+                bad.append(f"master {r.master_ok}/{n}")
+            if r.open_ok < n:
+                bad.append(f"open {r.open_ok}/{n}")
+            if r.accept_ok < n:
+                bad.append(f"accept {r.accept_ok}/{n}")
+            if r.reject_correct < n:
+                bad.append(f"reject_false_positive {n - r.reject_correct}/{n}")
+            if bad:
+                console.print(f"  [yellow]{sid}:[/] " + ", ".join(bad))
 
     return 0 if all_ok else 1
 

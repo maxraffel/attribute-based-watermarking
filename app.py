@@ -30,8 +30,7 @@ from closed_vocab import (
 MODULUS = 1024
 CODE_LENGTH = 300
 PROMPT = (
-    "In three short paragraphs, describe a common outpatient medical procedure "
-    "and what the patient should expect before and after the visit."
+    "What does a lawyer do on a daily basis."
 )
 
 
