@@ -102,7 +102,7 @@ def _scores_and_absence_bits(text: str) -> tuple[dict[str, float], List[int]]:
         premise,
         list(VOCABULARY),
         multi_label=True,
-        # hypothesis_template=NLI_HYPOTHESIS_TEMPLATE,
+        hypothesis_template=NLI_HYPOTHESIS_TEMPLATE,
     )
     score_by_label = {lab: float(s) for lab, s in zip(raw["labels"], raw["scores"])}
 

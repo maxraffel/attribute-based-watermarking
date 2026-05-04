@@ -33,7 +33,7 @@ CODE_LENGTH = 300
 # Hub id for the watermark causal LM; ``None`` keeps ``watermarking`` default / notebook ``set_llm_model_id``.
 LLM_MODEL_ID: str | None = None
 PROMPT = (
-    "Explain how a DCF works in the context of finance."
+            "Explain why Tom Brady is the GOAT, and why Drake Maye is an upcoming star in football."
 )
 
 
