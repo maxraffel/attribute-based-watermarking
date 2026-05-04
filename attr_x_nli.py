@@ -19,6 +19,9 @@ _FIXED_TAIL_SEED = b"watermarking-for-llm/attr-x/fixed-tail/v1\x00"
 # iff score >= this bar. Raise → stricter; lower → more labels active.
 NLI_LABEL_ACTIVE_MIN_SCORE: float = 0.9
 
+# Hugging Face ``hypothesis_template`` for zero-shot labels; ``{}`` is replaced by each candidate.
+NLI_HYPOTHESIS_TEMPLATE = "{} is the main subject of this text."
+
 logger = logging.getLogger(__name__)
 
 _classifier: Optional[Any] = None
@@ -50,6 +53,7 @@ def _nli_label_absence_bits(text: str) -> List[int]:
         premise,
         list(VOCABULARY),
         multi_label=True,
+        hypothesis_template=NLI_HYPOTHESIS_TEMPLATE,
     )
     score_by_label = {lab: float(s) for lab, s in zip(raw["labels"], raw["scores"])}
 

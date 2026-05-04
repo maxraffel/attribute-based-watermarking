@@ -6,7 +6,7 @@ This repository ties a **CPRF** (constrained pseudorandom function) attribute ve
 
 1. **Baseline text** — For a fixed prompt, the code runs **greedy** generation (temperature 0) for a fixed horizon (``SECURITY_PARAM``, set at import or via ``watermarking.set_prc_code_length``) to obtain a reference string.
 2. **Attribute `x`** — `derive_x` in `attr_x_nli.py` maps that string to an integer vector of length `CPRF_ATTR_DIM` (see `closed_vocab.py`):
-   - **Prefix** (`len(VOCABULARY)` entries): each closed-vocab label gets a score from a Hugging Face **`zero-shot-classification`** pipeline (`multi_label=True`). The pipeline uses the model’s **default** hypothesis behavior (no custom template). Coordinate `i` is **0** if the score for `VOCABULARY[i]` is at least **`NLI_LABEL_ACTIVE_MIN_SCORE`** in `attr_x_nli.py`, otherwise **1** (label treated as inactive for CPRF).
+   - **Prefix** (`len(VOCABULARY)` entries): each closed-vocab label gets a score from a Hugging Face **`zero-shot-classification`** pipeline (`multi_label=True`, `hypothesis_template` from **`NLI_HYPOTHESIS_TEMPLATE`** in `attr_x_nli.py`). Coordinate `i` is **0** if the score for `VOCABULARY[i]` is at least **`NLI_LABEL_ACTIVE_MIN_SCORE`** in `attr_x_nli.py`, otherwise **1** (label treated as inactive for CPRF).
    - **Tail** (`ATTR_TAIL_DIM` entries): a **fixed**, predetermined sequence (expanded from a project constant with SHAKE256, then reduced mod the CPRF modulus)—the same for every baseline, independent of text or prefix. Keyword constraints **do not** depend on the tail (`f` is padded with zeros on the tail).
 3. **CPRF** — A master key is generated with dimension `CPRF_ATTR_DIM`. The inner product **⟨f, x⟩ ≡ 0 (mod modulus)** is what makes a constrained key’s `c_eval(x)` agree with `eval(x)` for a given policy vector `f`. Unconstrained keys use **f = 0**. Keyword policies set **f** only on indices of known required labels in `VOCABULARY`.
 4. **PRC** — `r = sk.eval(x)` (or `dk.c_eval(x)` under a policy). The PRC secret is keyed from **SHA256(r)**; bits are embedded with `randrecover` during generation and recovered for detection.
@@ -66,13 +66,13 @@ Attribute + CPRF consistency checks (includes the same watermark checks plus exp
 uv run python test_attr_classification.py
 ```
 
-Policy + PRC scaling benchmark (Wilson CIs, configurable trials):
+Policy + PRC benchmark (one table per prompt: success counts, BER, timings, prefix ``x`` agreement):
 
 ```sh
 uv run python benchmark_policy_detection.py --runs 50 --code-length 300
 ```
 
-Use `--reuse-key` to fix one CPRF key per scenario across trials (faster; isolates generation/NLI noise). Default is a **new master key every trial**. **`--code-length`** sets the PRC codeword length (via `watermarking.set_prc_code_length`), same knob as baseline / recovery horizon for the whole process.
+Repeatable ``--prompt-case id:prompt`` adds cases (default: two built-ins). Use ``--reuse-key`` to reuse one CPRF key per prompt id across runs. ``generate`` / ``detect`` / ``master_detect`` expose timings and recovered bits for this script (see ``watermarking.py``).
 
 You can also activate `.venv` and run `python app.py` as usual.
 

@@ -1,5 +1,6 @@
+import time
 from hashlib import sha256
-from typing import List
+from typing import List, Tuple
 
 import torch
 import cprf
@@ -66,36 +67,50 @@ def attr_x_for_prompt(sk: cprf.MasterKey, prompt: str) -> List[int]:
 
 
 def generate(sk: cprf.MasterKey, prompt: str) -> dict:
+    t0 = time.perf_counter()
     baseline = _baseline(prompt)
+    t1 = time.perf_counter()
     x = derive_x(baseline, sk.modulus)
     r = sk.eval(x)
     prc.set_code_length(SECURITY_PARAM)
     c = prc.encode(prc.key_gen_from_seed(sha256(r).digest()))
     bits = [1 if b else 0 for b in c]
+    t2 = time.perf_counter()
     out = randrecover.generate_with_watermark(MODEL, TOKENIZER, prompt, bits, DEVICE)
+    t3 = time.perf_counter()
     out["attr_x"] = x
     out["baseline_text"] = baseline
+    out["seconds_baseline_gen"] = t1 - t0
+    out["seconds_watermarked_gen"] = t3 - t2
+    out["prc_secret_bits"] = list(bits)
     return out
 
 
-def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> bool:
+def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[int]]:
     """
     Recover PRC bits. Rebuilds ``x`` from ``watermarked_text`` via ``derive_x`` (zero-shot prefix + fixed tail).
     This must match the ``x`` used in ``generate`` (from the greedy baseline) for detection to succeed.
+
+    Returns ``(prc_ok, recovered_bits)`` where ``recovered_bits`` are ``0``/``1`` integers of length
+    ``SECURITY_PARAM`` (for logging / BER).
     """
     x = derive_x(watermarked_text, dk.modulus)
     prc.set_code_length(SECURITY_PARAM)
     recovered_s = prc.key_gen_from_seed(sha256(dk.c_eval(x)).digest())
     bits, _ = randrecover.recover_bitstream_from_text(watermarked_text, TOKENIZER, DEVICE)
     bits = (bits + [0] * SECURITY_PARAM)[:SECURITY_PARAM]
-    return prc.detect(recovered_s, [bool(b) for b in bits])
+    bits_int = [1 if b else 0 for b in bits]
+    ok = prc.detect(recovered_s, [bool(b) for b in bits])
+    return ok, bits_int
 
 
-def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> bool:
+def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> Tuple[bool, List[int]]:
     """Same as ``detect`` but using the master key (oracle verifier)."""
     x = derive_x(watermarked_text, sk.modulus)
     prc.set_code_length(SECURITY_PARAM)
     s = prc.key_gen_from_seed(sha256(sk.eval(x)).digest())
     bits, _ = randrecover.recover_bitstream_from_text(watermarked_text, TOKENIZER, DEVICE)
     bits = (bits + [0] * SECURITY_PARAM)[:SECURITY_PARAM]
-    return prc.detect(s, [bool(b) for b in bits])
+    bits_int = [1 if b else 0 for b in bits]
+    ok = prc.detect(s, [bool(b) for b in bits])
+    return ok, bits_int

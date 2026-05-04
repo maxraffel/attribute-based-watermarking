@@ -67,16 +67,16 @@ def main() -> int:
     f_wrong = f_for_required_keywords(["finance"])
 
     rep.section("PRC + constrained keys (same expectations as app.py)")
-    master_ok = wm.master_detect(sk, text)
+    master_ok, _ = wm.master_detect(sk, text)
     rep.add_boolean("master_detect(good)", master_ok, True)
-    rep.add_boolean("detect(unconstrained)", wm.detect(dk_open, text), True)
-    rep.add_boolean("detect(matching policy)", wm.detect(dk_match, text), True)
-    rep.add_boolean("detect(wrong policy)", wm.detect(dk_wrong, text), False)
-    rep.add_boolean(
-        "master_detect(wrong transcript)",
-        wm.master_detect(sk, "This is unrelated text used only as a negative control."),
-        False,
-    )
+    d0, _ = wm.detect(dk_open, text)
+    rep.add_boolean("detect(unconstrained)", d0, True)
+    dm, _ = wm.detect(dk_match, text)
+    rep.add_boolean("detect(matching policy)", dm, True)
+    dw, _ = wm.detect(dk_wrong, text)
+    rep.add_boolean("detect(wrong policy)", dw, False)
+    mw, _ = wm.master_detect(sk, "This is unrelated text used only as a negative control.")
+    rep.add_boolean("master_detect(wrong transcript)", mw, False)
 
     rep.section("CPRF inner product f·x mod m on recovered x")
     rep.console.print(
@@ -99,14 +99,16 @@ def main() -> int:
     )
     # When the watermark verifies, constrained detect matches iff f·x ≡ 0.
     if master_ok:
+        dm2, _ = wm.detect(dk_match, text)
         rep.add_boolean(
             "cprf: matching policy ⟺ detect(dk_match)",
-            expect_cprf_ceval_ok(f_match, x, sk.modulus) == wm.detect(dk_match, text),
+            expect_cprf_ceval_ok(f_match, x, sk.modulus) == dm2,
             True,
         )
+        dw2, _ = wm.detect(dk_wrong, text)
         rep.add_boolean(
             "cprf: wrong policy ⟺ detect(dk_wrong)",
-            expect_cprf_ceval_ok(f_wrong, x, sk.modulus) == wm.detect(dk_wrong, text),
+            expect_cprf_ceval_ok(f_wrong, x, sk.modulus) == dw2,
             True,
         )
 
