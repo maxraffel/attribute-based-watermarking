@@ -11,6 +11,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from attr_x_nli import derive_x
 from closed_vocab import CPRF_ATTR_DIM, issue_constrained_key_for_keywords
 
+
+def _derive_x(text: str, modulus: int, **kwargs) -> List[int]:
+    """Call ``derive_x`` with optional kwargs (newer ``attr_x_nli``); fall back for older checkouts."""
+    if not kwargs:
+        return derive_x(text, modulus)
+    try:
+        return derive_x(text, modulus, **kwargs)
+    except TypeError:
+        return derive_x(text, modulus)
+
 MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -71,7 +81,7 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     baseline = _baseline(prompt)
     t1 = time.perf_counter()
     baseline_nli: dict[str, float] = {}
-    x = derive_x(
+    x = _derive_x(
         baseline,
         sk.modulus,
         log_nli_scores=False,
@@ -101,7 +111,7 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
     Returns ``(prc_ok, recovered_bits)`` where ``recovered_bits`` are ``0``/``1`` integers of length
     ``SECURITY_PARAM`` (for logging / BER).
     """
-    x = derive_x(watermarked_text, dk.modulus, log_nli_scores=False)
+    x = _derive_x(watermarked_text, dk.modulus, log_nli_scores=False)
     prc.set_code_length(SECURITY_PARAM)
     # CPRF seed is sha256(commonEval···); constrained vs master outputs match iff Δ·⟨f,x⟩≡0 (mod m),
     # not merely ⟨f,x⟩≡0 on composite modulus — compare dk.c_eval(x) to sk.eval(x) when debugging policies.
@@ -115,7 +125,7 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
 
 def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> Tuple[bool, List[int]]:
     """Same as ``detect`` but using the master key (oracle verifier)."""
-    x = derive_x(watermarked_text, sk.modulus, log_nli_scores=False)
+    x = _derive_x(watermarked_text, sk.modulus, log_nli_scores=False)
     prc.set_code_length(SECURITY_PARAM)
     s = prc.key_gen_from_seed(sha256(sk.eval(x)).digest())
     bits, _ = randrecover.recover_bitstream_from_text(watermarked_text, TOKENIZER, DEVICE)

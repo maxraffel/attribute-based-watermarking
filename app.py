@@ -182,16 +182,26 @@ def main() -> int:
 
     c.rule("3) Verify-time x and NLI-active labels", style="cyan")
     wm_nli: dict[str, float] = {}
-    x_verify = attr_x_nli.derive_x(
-        wm_text,
-        sk.modulus,
-        log_nli_scores=False,
-        nli_scores_out=wm_nli,
-    )
-    attr_x_nli.log_pair_zero_shot_scores(
-        baseline=out.get("nli_label_scores_baseline", {}),
-        watermarked=wm_nli,
-    )
+    try:
+        x_verify = attr_x_nli.derive_x(
+            wm_text,
+            sk.modulus,
+            log_nli_scores=False,
+            nli_scores_out=wm_nli,
+        )
+    except TypeError:
+        # Older ``attr_x_nli`` (positional ``derive_x`` only); skip paired NLI log.
+        x_verify = attr_x_nli.derive_x(wm_text, sk.modulus)
+    bl_scores = out.get("nli_label_scores_baseline") or {}
+    if (
+        hasattr(attr_x_nli, "log_pair_zero_shot_scores")
+        and wm_nli
+        and bl_scores
+    ):
+        attr_x_nli.log_pair_zero_shot_scores(
+            baseline=bl_scores,
+            watermarked=wm_nli,
+        )
     active_wm = active_labels_from_verify_x(x_verify, sk.modulus)
     # Encode-time x is derive_x(baseline); same NLI view as re-running on baseline_text.
     active_bl = active_labels_from_verify_x(x_encode, sk.modulus)
