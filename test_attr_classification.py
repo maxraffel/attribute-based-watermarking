@@ -14,6 +14,7 @@ import sys
 for _name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
+import randrecover
 import watermarking as wm
 from attr_x_nli import derive_x
 from check_report import CheckReporter, expect_cprf_ceval_ok
@@ -75,7 +76,13 @@ def main() -> int:
     rep.add_boolean("detect(matching policy)", dm, True)
     dw, _ = wm.detect(dk_wrong, text)
     rep.add_boolean("detect(wrong policy)", dw, False)
-    mw, _ = wm.master_detect(sk, "This is unrelated text used only as a negative control.")
+    wrong_tx = randrecover.negative_control_transcript_like(
+        text,
+        wm.TOKENIZER,
+        wm.DEVICE,
+        n_bits=wm.SECURITY_PARAM,
+    )
+    mw, _ = wm.master_detect(sk, wrong_tx)
     rep.add_boolean("master_detect(wrong transcript)", mw, False)
 
     rep.section("CPRF inner product f·x mod m on recovered x")

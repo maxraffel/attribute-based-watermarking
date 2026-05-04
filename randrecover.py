@@ -197,6 +197,29 @@ def recover_bitstream_from_text(
         ground_truth_tokens=ground_truth_tokens,
     )
 
+
+def negative_control_transcript_like(
+    reference_text: str,
+    tokenizer: AutoTokenizer,
+    device: str,
+    *,
+    n_bits: int,
+    phrase: str = "Unrelated decoy text used only as a negative control. ",
+) -> str:
+    """
+    Build semantically unrelated text whose tokenized length supports ``n_bits`` of bit recovery
+    (same path as ``master_detect`` / ``detect``) and whose character length is at least that of
+    ``reference_text`` (e.g. the watermarked example) so the negative control matches that horizon.
+    """
+    ref_chars = max(len(reference_text), 1)
+    s = ""
+    while True:
+        s += phrase
+        bits, _ = recover_bitstream_from_text(s, tokenizer, device)
+        if len(bits) >= n_bits and len(s) >= ref_chars:
+            return s
+
+
 def log_generation_result(out: Dict) -> None:
     print(f"\n--- Generation Result ---\nPrompt: {out['prompt_text']}\nOutput: {out['generated_text_wm']}")
 
@@ -214,6 +237,7 @@ __all__ = [
     "generate_baseline",
     "recover_bitstream",
     "recover_bitstream_from_text",
+    "negative_control_transcript_like",
     "log_generation_result",
     "log_recovery_evaluation",
 ]

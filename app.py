@@ -13,6 +13,7 @@ import time
 from typing import List, Sequence
 
 import attr_x_nli
+import randrecover
 import watermarking as wm
 from rich.console import Console
 from rich.panel import Panel
@@ -323,7 +324,16 @@ def main() -> int:
     c.print(sum_table)
 
     c.rule("7) Negative control (wrong transcript)", style="cyan")
-    wrong = "This is unrelated text used only as a negative control."
+    wrong = randrecover.negative_control_transcript_like(
+        wm_text,
+        wm.TOKENIZER,
+        wm.DEVICE,
+        n_bits=wm.SECURITY_PARAM,
+    )
+    c.print(
+        f"  [dim]decoy length: {len(wrong)} chars (watermarked ref: {len(wm_text)}), "
+        f"bit horizon {wm.SECURITY_PARAM}[/]"
+    )
     _log_text(c, "Wrong transcript", wrong, max_chars=400)
     w_ok, w_bits = wm.master_detect(sk, wrong)
     c.print(f"  [dim]master_detect[/] → {bool(w_ok)}  recovered: {_bits_preview(w_bits)}")
