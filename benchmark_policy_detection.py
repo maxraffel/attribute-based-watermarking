@@ -12,8 +12,9 @@ passed; and **total wall time** per operation summed over the whole benchmark (f
 CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, optional ``--llm-model HF_HUB_ID``
 (HF causal LM for ``watermarking``; overrides ``WATERMARK_LLM_ID`` for this process), and repeatable
 ``--prompt-case id:prompt`` (split on first ``:`` only). If no cases are given, two defaults are used.
-Non-TTY / captured stdout (e.g. Colab ``subprocess.run(..., capture_output=True)``) prints a
-**plain-text** results table automatically; set ``BENCHMARK_PLAIN_TABLE=0`` to force the Rich
+While trials run, a **Rich progress bar** shows completion; it clears when the benchmark finishes
+(``transient``). Non-TTY / captured stdout (e.g. Colab ``subprocess.run(..., capture_output=True)``)
+prints a **plain-text** results table automatically; set ``BENCHMARK_PLAIN_TABLE=0`` to force the Rich
 table anyway, or ``=1`` to force plain text even on a TTY. ``BENCHMARK_CONSOLE_WIDTH`` /
 ``BENCHMARK_CONSOLE_HEIGHT`` tune the Rich console when stdout is not a TTY.
 """
@@ -29,6 +30,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from rich.console import Console
+from rich.progress import track
 from rich.table import Table
 
 
@@ -66,10 +68,9 @@ def _use_plain_table() -> bool:
 
 DEFAULT_PROMPT_CASES: list[tuple[str, str]] = [
     (
-        "dcf_finance",
-        "Explain how a DCF works in the context of finance."
+        "patriots_qbs",
+            "Explain why Tom Brady is the GOAT, and why Drake Maye is an upcoming star in football."
     ),
-    ("med_school", "Describe the best medical schools and their medical specialties."),
 ]
 
 
@@ -305,71 +306,76 @@ def run_benchmark(
         f"llm={wm.MODEL_ID!r}"
     )
 
-    for _ in range(runs):
-        for sid, prompt in prompt_cases:
-            if fresh_key_per_trial:
-                sk = wm.setup(modulus)
-            else:
-                if sk_shared.get(sid) is None:
-                    sk_shared[sid] = wm.setup(modulus)
-                sk = sk_shared[sid]
+    trials = [(r, sid, prompt) for r in range(runs) for sid, prompt in prompt_cases]
+    for _, sid, prompt in track(
+        trials,
+        description="Benchmark",
+        console=console,
+        transient=True,
+    ):
+        if fresh_key_per_trial:
+            sk = wm.setup(modulus)
+        else:
+            if sk_shared.get(sid) is None:
+                sk_shared[sid] = wm.setup(modulus)
+            sk = sk_shared[sid]
 
-            out = wm.generate(sk, prompt)
-            text = out["generated_text_wm"]
-            x_gen = out["attr_x"]
-            secret = out["prc_secret_bits"]
-            t_bl = float(out["seconds_baseline_gen"])
-            t_wm = float(out["seconds_watermarked_gen"])
+        out = wm.generate(sk, prompt)
+        text = out["generated_text_wm"]
+        x_gen = out["attr_x"]
+        secret = out["prc_secret_bits"]
+        t_bl = float(out["seconds_baseline_gen"])
+        t_wm = float(out["seconds_watermarked_gen"])
 
-            x_verify = attr_x_nli.derive_x(text, sk.modulus)
-            active = active_labels_from_verify_x(x_verify, sk.modulus)
-            x_perfect = list(x_gen) == list(x_verify)
+        x_verify = attr_x_nli.derive_x(text, sk.modulus)
+        active = active_labels_from_verify_x(x_verify, sk.modulus)
+        x_perfect = list(x_gen) == list(x_verify)
 
-            t0 = time.perf_counter()
-            dk_open = wm.issue_unconstrained(sk)
-            if active:
-                dk_accept = wm.issue_keyword_policy(sk, list(active))
-            else:
-                dk_accept = wm.issue_keyword_policy(sk, [])
-            unrelated = pick_unrelated_keyword_for_policy(
-                x_verify, sk.modulus, set(active)
-            )
-            dk_reject = wm.issue_keyword_policy(sk, [unrelated])
-            t_issue = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        dk_open = wm.issue_unconstrained(sk)
+        if active:
+            dk_accept = wm.issue_keyword_policy(sk, list(active))
+        else:
+            dk_accept = wm.issue_keyword_policy(sk, [])
+        unrelated = pick_unrelated_keyword_for_policy(
+            x_verify, sk.modulus, set(active)
+        )
+        dk_reject = wm.issue_keyword_policy(sk, [unrelated])
+        t_issue = time.perf_counter() - t0
 
-            t0 = time.perf_counter()
-            m_ok, m_bits = wm.master_detect(sk, text)
-            t_m = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        m_ok, m_bits = wm.master_detect(sk, text)
+        t_m = time.perf_counter() - t0
 
-            t0 = time.perf_counter()
-            u_ok, _ = wm.detect(dk_open, text)
-            t_u = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        u_ok, _ = wm.detect(dk_open, text)
+        t_u = time.perf_counter() - t0
 
-            t0 = time.perf_counter()
-            a_ok, _ = wm.detect(dk_accept, text)
-            t_a = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        a_ok, _ = wm.detect(dk_accept, text)
+        t_a = time.perf_counter() - t0
 
-            t0 = time.perf_counter()
-            r_ok, _ = wm.detect(dk_reject, text)
-            t_r = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        r_ok, _ = wm.detect(dk_reject, text)
+        t_r = time.perf_counter() - t0
 
-            ber = _ber_percent(secret, m_bits)
+        ber = _ber_percent(secret, m_bits)
 
-            roll[sid].add_run(
-                master_ok=bool(m_ok),
-                open_ok=bool(u_ok),
-                accept_ok=bool(a_ok),
-                reject_got_true=bool(r_ok),
-                ber=ber,
-                x_perfect=x_perfect,
-                t_baseline=t_bl,
-                t_wm=t_wm,
-                t_issue=t_issue,
-                t_master=t_m,
-                t_open=t_u,
-                t_accept=t_a,
-                t_reject=t_r,
-            )
+        roll[sid].add_run(
+            master_ok=bool(m_ok),
+            open_ok=bool(u_ok),
+            accept_ok=bool(a_ok),
+            reject_got_true=bool(r_ok),
+            ber=ber,
+            x_perfect=x_perfect,
+            t_baseline=t_bl,
+            t_wm=t_wm,
+            t_issue=t_issue,
+            t_master=t_m,
+            t_open=t_u,
+            t_accept=t_a,
+            t_reject=t_r,
+        )
 
     all_ok = True
     for sid, _ in prompt_cases:
