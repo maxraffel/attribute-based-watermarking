@@ -1,12 +1,12 @@
 # Attribute-based watermarking for LLMs
 
-This repository ties a **CPRF** (constrained pseudorandom function) attribute vector `x` to a **PRC** (pseudorandom code) watermark on text from a causal LM. **Encoding** still sets `x = derive_x(baseline)` where the baseline is the greedy continuation of the prompt. **`detect` / `master_detect` only take `watermarked_text`**: they set `x = derive_x(watermarked_text)` (same zero-shot prefix + fixed tail as in `attr_x_nli.derive_x`). Verification succeeds only when that reconstructed `x` matches the `x` used at encode time (the watermarked output usually needs to preserve the same label-level scores as the baseline). **`generate` still returns `attr_x`** (the encode-time `x`) for debugging or auditing.
+This repository ties a **CPRF** (constrained pseudorandom function) attribute vector `x` to a **PRC** (pseudorandom code) watermark on text from a causal LM. **Encoding** still sets `x = derive_x(baseline)` where the baseline is the greedy continuation of the prompt. **`detect` / `master_detect` only take `watermarked_text`**: they set `x = derive_x(watermarked_text)` (same zero-shot prefix + fixed tail as in `attr_x_nli.derive_x`). Verification succeeds only when that reconstructed `x` matches the `x` used at encode time (the watermarked output usually needs to preserve the same **argmax primary label** as the baseline). **`generate` still returns `attr_x`** (the encode-time `x`) for debugging or auditing.
 
 ## How it works
 
 1. **Baseline text** — For a fixed prompt, the code runs **greedy** generation (temperature 0) for a fixed horizon (``SECURITY_PARAM``, set at import or via ``watermarking.set_prc_code_length``) to obtain a reference string.
 2. **Attribute `x`** — `derive_x` in `attr_x_nli.py` maps that string to an integer vector of length `CPRF_ATTR_DIM` (see `closed_vocab.py`):
-   - **Prefix** (`len(VOCABULARY)` entries): each closed-vocab label gets a score from a Hugging Face **`zero-shot-classification`** pipeline (`multi_label=True`, `hypothesis_template` from **`NLI_HYPOTHESIS_TEMPLATE`** in `attr_x_nli.py`). Coordinate `i` is **0** if the score for `VOCABULARY[i]` is at least **`NLI_LABEL_ACTIVE_MIN_SCORE`** in `attr_x_nli.py`, otherwise **1** (label treated as inactive for CPRF).
+   - **Prefix** (`len(VOCABULARY)` entries): each closed-vocab label gets a score from a Hugging Face **`zero-shot-classification`** pipeline (`multi_label=False` so scores are a **softmax** over candidates—comparable for picking one primary subject; `hypothesis_template` from **`NLI_HYPOTHESIS_TEMPLATE`** in `attr_x_nli.py`). Coordinate `i` is **0** for the label with the **highest** score (ties: smallest index in `VOCABULARY`), and **1** for all others.
    - **Tail** (`ATTR_TAIL_DIM` entries): a **fixed**, predetermined sequence (expanded from a project constant with SHAKE256, then reduced mod the CPRF modulus)—the same for every baseline, independent of text or prefix. Keyword constraints **do not** depend on the tail (`f` is padded with zeros on the tail).
 3. **CPRF** — A master key is generated with dimension `CPRF_ATTR_DIM`. The inner product **⟨f, x⟩ ≡ 0 (mod modulus)** is what makes a constrained key’s `c_eval(x)` agree with `eval(x)` for a given policy vector `f`. Unconstrained keys use **f = 0**. Keyword policies set **f** only on indices of known required labels in `VOCABULARY`.
 4. **PRC** — `r = sk.eval(x)` (or `dk.c_eval(x)` under a policy). The PRC secret is keyed from **SHA256(r)**; bits are embedded with `randrecover` during generation and recovered for detection.
@@ -78,7 +78,7 @@ You can also activate `.venv` and run `python app.py` as usual.
 
 ## Tuning
 
-- **Label sensitivity** — Edit **`NLI_LABEL_ACTIVE_MIN_SCORE`** in `attr_x_nli.py` (higher → fewer labels marked active; more strict).
+- **Primary label** — The prefix uses **argmax** over zero-shot scores (see `attr_x_nli.py`). To change what “subject” means for the model, edit **`NLI_HYPOTHESIS_TEMPLATE`** or **`VOCABULARY`**.
 - **Vocabulary and CPRF size** — Edit **`VOCABULARY`** and **`ATTR_TAIL_DIM`** in `closed_vocab.py` (changing them changes `CPRF_ATTR_DIM` and invalidates old keys relative to new `x`).
 
 PRC length / generation horizon: call ``watermarking.set_prc_code_length(n)`` before ``generate`` (default at import is 300), or pass ``--code-length`` to the benchmark script.
