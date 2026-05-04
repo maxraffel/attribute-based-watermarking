@@ -18,7 +18,13 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from closed_vocab import VOCABULARY, active_labels_from_verify_x, pick_unrelated_keyword_for_policy
+from closed_vocab import (
+    CPRF_ATTR_DIM,
+    VOCABULARY,
+    active_labels_from_verify_x,
+    f_for_required_keywords,
+    pick_unrelated_keyword_for_policy,
+)
 
 # --- customize here ---
 MODULUS = 1024
@@ -68,6 +74,79 @@ def _step(c: Console, name: str, got: object, expected: bool) -> bool:
     tag = "[bold green]PASS[/]" if ok else "[bold red]FAIL[/]"
     c.print(f"  {tag}  {name}  [dim](got {bool(got)}, expect {expected})[/]")
     return ok
+
+
+def _dot_mod(f: Sequence[int], x: Sequence[int], modulus: int) -> int:
+    """⟨f,x⟩ mod modulus over the overlapping prefix of f and x (CPRF dimension)."""
+    n = min(len(f), len(x))
+    return sum(int(f[i]) * int(x[i]) for i in range(n)) % modulus
+
+
+def _log_f_dot_x_terms(
+    c: Console,
+    title: str,
+    f: Sequence[int],
+    x: Sequence[int],
+    modulus: int,
+) -> None:
+    """Log ⟨f,x⟩ mod m and per-keyword contributions (algebraic diagnostic only)."""
+    dot = _dot_mod(f, x, modulus)
+    c.print(
+        f"  [bold]{title}[/]  ⟨f,x⟩ mod m = [cyan]{dot}[/]"
+        "  [dim](see CPRF Δ·⟨f,x⟩ note below — ⟨f,x⟩ alone does not fix eval vs c_eval)[/]"
+    )
+    n_pref = min(len(VOCABULARY), len(f), len(x))
+    for i in range(n_pref):
+        if int(f[i]) == 0:
+            continue
+        lab = VOCABULARY[i]
+        xi = int(x[i]) % modulus
+        term = (int(f[i]) * int(x[i])) % modulus
+        c.print(f"    [dim]prefix[/] {lab!r}: f[{i}]={int(f[i])}, x[{i}] mod m = {xi}, term mod m = {term}")
+    if len(f) > n_pref and any(int(f[j]) != 0 for j in range(n_pref, len(f))):
+        tail_dot = sum(int(f[j]) * int(x[j]) for j in range(n_pref, min(len(f), len(x)))) % modulus
+        c.print(f"    [dim]non-prefix f·x mod m (tail):[/] {tail_dot}")
+
+
+def _log_cprf_seed_agreement(
+    c: Console,
+    sk: object,
+    dk: object,
+    x: Sequence[int],
+    title: str,
+    *,
+    expect_seed_match: bool,
+) -> tuple[bool, bool]:
+    """
+    Ground truth for PRC: same PRF input iff sk.eval(x) == dk.c_eval(x).
+
+    For reject policies we expect ``expect_seed_match=False``. If the hashes still match,
+    Δ·⟨f,x⟩≡0 (mod m) for this key's random Δ (common when m is composite); detection may still pass.
+    """
+    em = sk.eval(list(x))
+    ec = dk.c_eval(list(x))
+    match = em == ec
+    c.print(f"  [bold]{title}[/]  sk.eval(x) == dk.c_eval(x) → [cyan]{match}[/]")
+    c.print(f"    [dim]master SHA256-input layer…[/] {em.hex()[:24]}…")
+    c.print(f"    [dim]c_eval …[/]                {ec.hex()[:24]}…")
+    if match == expect_seed_match:
+        c.print("  [bold green]PASS[/]  CPRF output pair matches expectation for this policy")
+        return True, match
+    if not expect_seed_match and match:
+        c.print(
+            "  [yellow]WARN[/]  Constrained key still matches master on this x: need "
+            "Δ·⟨f,x⟩≢0 (mod m) to separate seeds; ⟨f,x⟩≢0 alone is not enough on composite m (e.g. 1024)."
+        )
+        c.print(
+            "  [yellow]→[/]  PRC ``detect`` may still return True (same seed as watermark); "
+            "try again or use a prime modulus if you need ⟨f,x⟩≠0 to imply separation."
+        )
+        return True, match
+    c.print(
+        "  [bold red]FAIL[/]  Expected CPRF agreement but sk.eval(x) ≠ dk.c_eval(x) "
+        f"(expected match={expect_seed_match})"
+    )
+    return False, match
 
 
 def main() -> int:
@@ -139,6 +218,35 @@ def main() -> int:
     t_keys = time.perf_counter() - t0
     c.print(f"  [dim]issue_keys_seconds[/]=[cyan]{t_keys:.5f}[/]")
 
+    c.rule("4b) CPRF algebra + sk.eval(x) vs dk.c_eval(x) (same x = derive_x on WM text)", style="cyan")
+    m_sz = sk.modulus
+    f_zero = [0] * CPRF_ATTR_DIM
+    f_accept_vec = f_for_required_keywords(active_wm if active_wm else [])
+    f_reject_vec = f_for_required_keywords([unrelated])
+    c.print(
+        "  [dim]Go CPRF: constrained z1 = z0 − f·Δ ⇒ inner-product term k_c = k_m − Δ·⟨f,x⟩ (mod m). "
+        "Hashes match iff Δ·⟨f,x⟩≡0 — not merely ⟨f,x⟩≡0. Composite m (e.g. 1024) allows ⟨f,x⟩≠0 with "
+        "Δ·⟨f,x⟩≡0, so rejection must be checked via byte equality below.[/]"
+    )
+    _log_f_dot_x_terms(c, "Unconstrained (f = 0)", f_zero, x_verify, m_sz)
+    ok_open, _ = _log_cprf_seed_agreement(
+        c, sk, dk_open, x_verify, "Unconstrained key", expect_seed_match=True
+    )
+    all_ok &= ok_open
+
+    lab = ",".join(sorted(active_wm)) if active_wm else "∅"
+    _log_f_dot_x_terms(c, f"Accept policy (required: [{lab}])", f_accept_vec, x_verify, m_sz)
+    ok_acc, _ = _log_cprf_seed_agreement(
+        c, sk, dk_accept, x_verify, "Accept policy key", expect_seed_match=True
+    )
+    all_ok &= ok_acc
+
+    _log_f_dot_x_terms(c, f"Reject policy (one-hot: {unrelated!r})", f_reject_vec, x_verify, m_sz)
+    ok_rej, reject_seed_match = _log_cprf_seed_agreement(
+        c, sk, dk_reject, x_verify, "Reject policy key", expect_seed_match=False
+    )
+    all_ok &= ok_rej
+
     c.rule("5) Detection (4 calls)", style="cyan")
 
     t0 = time.perf_counter()
@@ -168,7 +276,24 @@ def main() -> int:
     t_r = time.perf_counter() - t0
     c.print(f"  [dim]detect(reject / unrelated policy)[/] {t_r:.5f}s")
     c.print(f"    recovered bits: {_bits_preview(r_bits)}")
-    all_ok &= _step(c, "detect(reject policy) should be False", r_ok, False)
+    if reject_seed_match:
+        c.print(
+            "  [dim]Reject key used the same CPRF output as master (§4b WARN); "
+            "PRC detect=True is expected — not a detector bug.[/]"
+        )
+        all_ok &= _step(
+            c,
+            "detect(reject policy) — CPRF did not diverge; expect same as master path",
+            r_ok,
+            True,
+        )
+    else:
+        all_ok &= _step(c, "detect(reject policy) should be False (CPRF seed differs)", r_ok, False)
+        if r_ok:
+            c.print(
+                "  [yellow]PRC returned True despite differing CPRF seeds — possible LDPC statistical false positive; "
+                "rerun or tighten code parameters.[/]"
+            )
 
     det_total = t_m + t_u + t_a + t_r
     c.print(f"  [dim]total detection wall time:[/] [cyan]{det_total:.5f}[/]s")

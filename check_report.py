@@ -7,7 +7,13 @@ from rich.panel import Panel
 
 
 def expect_cprf_ceval_ok(f: list[int], x: list[int], modulus: int) -> bool:
-    """True iff constrained CPRF c_eval should agree with master eval (f·x ≡ 0 mod modulus)."""
+    """True iff ⟨f,x⟩ ≡ 0 (mod modulus).
+
+    The Go CPRF uses ``k_c = k_m - Δ·⟨f,x⟩ (mod m)`` in the inner-product layer, so **master and
+    constrained outputs agree iff Δ·⟨f,x⟩ ≡ 0 (mod m)** for that key's Δ. Having ⟨f,x⟩≡0 is
+    sufficient, but ⟨f,x⟩≢0 does *not* imply disagreement on composite ``m`` (e.g. ``m=1024``).
+    Compare ``sk.eval(x)`` and ``dk.c_eval(x)`` for ground truth.
+    """
     return sum(f[i] * x[i] for i in range(len(x))) % modulus == 0
 
 

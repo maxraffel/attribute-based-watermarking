@@ -96,6 +96,8 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
     """
     x = derive_x(watermarked_text, dk.modulus)
     prc.set_code_length(SECURITY_PARAM)
+    # CPRF seed is sha256(commonEval···); constrained vs master outputs match iff Δ·⟨f,x⟩≡0 (mod m),
+    # not merely ⟨f,x⟩≡0 on composite modulus — compare dk.c_eval(x) to sk.eval(x) when debugging policies.
     recovered_s = prc.key_gen_from_seed(sha256(dk.c_eval(x)).digest())
     bits, _ = randrecover.recover_bitstream_from_text(watermarked_text, TOKENIZER, DEVICE)
     bits = (bits + [0] * SECURITY_PARAM)[:SECURITY_PARAM]
