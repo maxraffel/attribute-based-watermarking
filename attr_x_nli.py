@@ -27,6 +27,52 @@ logger = logging.getLogger(__name__)
 _classifier: Optional[Any] = None
 
 
+def _format_zero_shot_scores_table(scores: Mapping[str, float], *, row_indent: str = "  ") -> str:
+    """Aligned rows in ``VOCABULARY`` order for log output (matches closed-vocab prefix layout)."""
+    labels = list(VOCABULARY)
+    col_w = max(len(lab) for lab in labels) if labels else 8
+    col_w = max(col_w, 10)
+    lines = [
+        f"{row_indent}{'label':<{col_w}}  {'score':>7}  active",
+        f"{row_indent}{'-' * col_w}  {'-----':>7}  ------",
+    ]
+    for lab in labels:
+        s = float(scores.get(lab, 0.0))
+        active = "yes" if s >= NLI_LABEL_ACTIVE_MIN_SCORE else "no"
+        lines.append(f"{row_indent}{lab:<{col_w}}  {s:>7.4f}  {active}")
+    return "\n".join(lines)
+
+
+def _format_paired_zero_shot_table(
+    baseline: Mapping[str, float],
+    watermarked: Mapping[str, float],
+    *,
+    row_indent: str = "  ",
+) -> str:
+    """
+    One table: greedy baseline vs watermarked scores per label, delta, and y/n active at
+    ``NLI_LABEL_ACTIVE_MIN_SCORE`` (columns ``b`` / ``w``).
+    """
+    labels = list(VOCABULARY)
+    col_w = max(len(lab) for lab in labels) if labels else 8
+    col_w = max(col_w, 10)
+    bar = NLI_LABEL_ACTIVE_MIN_SCORE
+    lines = [
+        f"{row_indent}{'label':<{col_w}}  {'baseline':>8}  {'wm':>8}  {'Δ':>8}  {'b':>3}  {'w':>3}",
+        f"{row_indent}{'-' * col_w}  {'-' * 8}  {'-' * 8}  {'-' * 8}  {'-' * 3}  {'-' * 3}",
+    ]
+    for lab in labels:
+        sb = float(baseline.get(lab, 0.0))
+        sw = float(watermarked.get(lab, 0.0))
+        delta = sw - sb
+        b_act = "y" if sb >= bar else "n"
+        w_act = "y" if sw >= bar else "n"
+        lines.append(
+            f"{row_indent}{lab:<{col_w}}  {sb:>8.4f}  {sw:>8.4f}  {delta:+8.4f}  {b_act:>3}  {w_act:>3}"
+        )
+    return "\n".join(lines)
+
+
 def _pipeline_device() -> int:
     return 0 if torch.cuda.is_available() else -1
 
@@ -74,12 +120,13 @@ def log_pair_zero_shot_scores(
     baseline: Mapping[str, float],
     watermarked: Mapping[str, float],
 ) -> None:
-    """One INFO line with both score maps for side-by-side log comparison."""
-    logger.info(
-        "Zero-shot label scores — baseline: %s | watermarked: %s",
-        dict(baseline),
-        dict(watermarked),
+    """Log greedy baseline vs watermarked NLI scores in one aligned comparison table."""
+    msg = (
+        f"Zero-shot label scores — greedy vs watermarked (NLI bar >= {NLI_LABEL_ACTIVE_MIN_SCORE}; "
+        "b/w = active y/n)\n"
+        f"{_format_paired_zero_shot_table(baseline, watermarked)}"
     )
+    logger.info(msg)
 
 
 def _fixed_tail(n: int, modulus: int) -> List[int]:
@@ -99,7 +146,11 @@ def derive_x(
 ) -> List[int]:
     final_scores, prefix = _scores_and_absence_bits(text)
     if log_nli_scores:
-        logger.info("Zero-shot label scores: %s", final_scores)
+        logger.info(
+            "Zero-shot label scores (NLI bar >= %s)\n%s",
+            NLI_LABEL_ACTIVE_MIN_SCORE,
+            _format_zero_shot_scores_table(final_scores),
+        )
     if nli_scores_out is not None:
         nli_scores_out.clear()
         nli_scores_out.update(final_scores)
