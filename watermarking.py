@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import torch
 import cprf
 import prc
+import cot_reasoning
 import randrecover
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -125,8 +126,12 @@ def attr_x_for_prompt(sk: cprf.MasterKey, prompt: str) -> List[int]:
 
 
 def generate(sk: cprf.MasterKey, prompt: str) -> dict:
+    _ensure_llm()
+    assert MODEL is not None and TOKENIZER is not None
     t0 = time.perf_counter()
-    baseline = _baseline(prompt)
+    baseline, bl_gen_ids = randrecover.generate_baseline(
+        MODEL, TOKENIZER, prompt, SECURITY_PARAM, DEVICE, return_token_ids=True
+    )
     t1 = time.perf_counter()
     baseline_nli: dict[str, float] = {}
     x = _derive_x(
@@ -140,11 +145,32 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     c = prc.encode(prc.key_gen_from_seed(sha256(r).digest()))
     bits = [1 if b else 0 for b in c]
     t2 = time.perf_counter()
-    assert MODEL is not None and TOKENIZER is not None
-    out = randrecover.generate_with_watermark(MODEL, TOKENIZER, prompt, bits, DEVICE)
+    cot_str, _ = cot_reasoning.split_completion_at_reasoning_end(baseline)
+    cot_k = cot_reasoning.find_cot_token_boundary(bl_gen_ids.tolist(), TOKENIZER)
+    prefill = None
+    used_cot = False
+    if cot_k is not None and 0 < cot_k < int(bl_gen_ids.shape[0]):
+        prefill = bl_gen_ids[:cot_k]
+        used_cot = True
+    out = randrecover.generate_with_watermark(
+        MODEL,
+        TOKENIZER,
+        prompt,
+        bits,
+        DEVICE,
+        prefill_completion_ids=prefill,
+    )
     t3 = time.perf_counter()
+    if used_cot:
+        wm_suffix = out["generated_text_wm"]
+        out["generated_text_wm"] = cot_str + wm_suffix
+        if isinstance(out.get("input_ids_wm"), torch.Tensor):
+            pre_rows = bl_gen_ids[:cot_k].unsqueeze(0).to(out["input_ids_wm"].device)
+            out["input_ids_wm"] = torch.cat([pre_rows, out["input_ids_wm"]], dim=-1)
     out["attr_x"] = x
     out["baseline_text"] = baseline
+    out["baseline_cot_text"] = cot_str if used_cot else ""
+    out["used_baseline_cot_prefill"] = used_cot
     out["nli_label_scores_baseline"] = dict(baseline_nli)
     out["seconds_baseline_gen"] = t1 - t0
     out["seconds_watermarked_gen"] = t3 - t2
@@ -167,7 +193,8 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
     # CPRF seed is sha256(commonEval···); constrained vs master outputs match iff Δ·⟨f,x⟩≡0 (mod m),
     # not merely ⟨f,x⟩≡0 on composite modulus — compare dk.c_eval(x) to sk.eval(x) when debugging policies.
     recovered_s = prc.key_gen_from_seed(sha256(dk.c_eval(x)).digest())
-    bits, _ = randrecover.recover_bitstream_from_text(watermarked_text, TOKENIZER, DEVICE)
+    recover_text = cot_reasoning.prc_recovery_text(watermarked_text)
+    bits, _ = randrecover.recover_bitstream_from_text(recover_text, TOKENIZER, DEVICE)
     bits = (bits + [0] * SECURITY_PARAM)[:SECURITY_PARAM]
     bits_int = [1 if b else 0 for b in bits]
     ok = prc.detect(recovered_s, [bool(b) for b in bits])
@@ -181,7 +208,8 @@ def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> Tuple[bool, List
     x = _derive_x(watermarked_text, sk.modulus, log_nli_scores=False)
     prc.set_code_length(SECURITY_PARAM)
     s = prc.key_gen_from_seed(sha256(sk.eval(x)).digest())
-    bits, _ = randrecover.recover_bitstream_from_text(watermarked_text, TOKENIZER, DEVICE)
+    recover_text = cot_reasoning.prc_recovery_text(watermarked_text)
+    bits, _ = randrecover.recover_bitstream_from_text(recover_text, TOKENIZER, DEVICE)
     bits = (bits + [0] * SECURITY_PARAM)[:SECURITY_PARAM]
     bits_int = [1 if b else 0 for b in bits]
     ok = prc.detect(s, [bool(b) for b in bits])

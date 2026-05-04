@@ -2,7 +2,7 @@ import torch
 from transformers import AutoTokenizer
 import hashlib
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 def get_vectorized_partition(vocab_size: int, device: str, seed_index: int) -> torch.BoolTensor:
     """Generates a boolean mask for the entire vocabulary using a deterministic seed."""
@@ -19,12 +19,28 @@ def generate_with_watermark(
     secret_bitstream: List[int],
     device: str = "cpu",
     track_token_alignment: bool = False,
+    prefill_completion_ids: Optional[torch.LongTensor] = None,
 ) -> Dict:
     special_ids = set(getattr(tokenizer, "all_special_ids", []))
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_ids_wm = inputs["input_ids"].clone()
-    prompt_len = inputs["input_ids"].shape[1]
+    prompt_ids = inputs["input_ids"]
     attn_mask = inputs.get("attention_mask", None)
+    if prefill_completion_ids is not None:
+        pre = prefill_completion_ids.to(device=device, dtype=prompt_ids.dtype)
+        if pre.dim() > 1:
+            pre = pre.squeeze(0)
+        pre = pre.unsqueeze(0)
+        input_ids_wm = torch.cat([prompt_ids, pre], dim=-1)
+        if attn_mask is not None:
+            ext = torch.ones(
+                (1, pre.shape[1]),
+                dtype=attn_mask.dtype,
+                device=device,
+            )
+            attn_mask = torch.cat([attn_mask, ext], dim=-1)
+    else:
+        input_ids_wm = prompt_ids.clone()
+    prompt_len = input_ids_wm.shape[1]
 
     bit_index = 0
     bit_index_to_token_id = [-1] * len(secret_bitstream)
@@ -120,10 +136,15 @@ def generate_baseline(
     prompt: str,
     max_new_tokens: int,
     device: str = "cpu",
-) -> str:
+    *,
+    return_token_ids: bool = False,
+) -> str | tuple[str, torch.Tensor]:
     """
     Greedy unwatermarked generation (deterministic for fixed model+prompt) used to derive
     the attribute vector x. Match this to what verifiers will reproduce.
+
+    If ``return_token_ids`` is True, also returns the **generated** token ids (suffix after
+    the prompt) as a 1-D long tensor for CoT prefill in ``generate_with_watermark``.
     """
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     prompt_len = inputs["input_ids"].shape[1]
@@ -138,7 +159,10 @@ def generate_baseline(
             pad_token_id=pad_id,
         )
     gen_ids = out[0, prompt_len:]
-    return tokenizer.decode(gen_ids, skip_special_tokens=True)
+    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    if return_token_ids:
+        return text, gen_ids.detach().clone()
+    return text
 
 def recover_bitstream(
     full_sequence_ids: List[int],
