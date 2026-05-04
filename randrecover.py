@@ -134,7 +134,7 @@ def generate_baseline(
         out = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
+            do_sample=True,
             pad_token_id=pad_id,
         )
     gen_ids = out[0, prompt_len:]
