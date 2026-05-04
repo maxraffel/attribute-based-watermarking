@@ -70,7 +70,13 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     t0 = time.perf_counter()
     baseline = _baseline(prompt)
     t1 = time.perf_counter()
-    x = derive_x(baseline, sk.modulus)
+    baseline_nli: dict[str, float] = {}
+    x = derive_x(
+        baseline,
+        sk.modulus,
+        log_nli_scores=False,
+        nli_scores_out=baseline_nli,
+    )
     r = sk.eval(x)
     prc.set_code_length(SECURITY_PARAM)
     c = prc.encode(prc.key_gen_from_seed(sha256(r).digest()))
@@ -80,6 +86,7 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     t3 = time.perf_counter()
     out["attr_x"] = x
     out["baseline_text"] = baseline
+    out["nli_label_scores_baseline"] = dict(baseline_nli)
     out["seconds_baseline_gen"] = t1 - t0
     out["seconds_watermarked_gen"] = t3 - t2
     out["prc_secret_bits"] = list(bits)
@@ -94,7 +101,7 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
     Returns ``(prc_ok, recovered_bits)`` where ``recovered_bits`` are ``0``/``1`` integers of length
     ``SECURITY_PARAM`` (for logging / BER).
     """
-    x = derive_x(watermarked_text, dk.modulus)
+    x = derive_x(watermarked_text, dk.modulus, log_nli_scores=False)
     prc.set_code_length(SECURITY_PARAM)
     # CPRF seed is sha256(commonEval···); constrained vs master outputs match iff Δ·⟨f,x⟩≡0 (mod m),
     # not merely ⟨f,x⟩≡0 on composite modulus — compare dk.c_eval(x) to sk.eval(x) when debugging policies.
@@ -108,7 +115,7 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
 
 def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> Tuple[bool, List[int]]:
     """Same as ``detect`` but using the master key (oracle verifier)."""
-    x = derive_x(watermarked_text, sk.modulus)
+    x = derive_x(watermarked_text, sk.modulus, log_nli_scores=False)
     prc.set_code_length(SECURITY_PARAM)
     s = prc.key_gen_from_seed(sha256(sk.eval(x)).digest())
     bits, _ = randrecover.recover_bitstream_from_text(watermarked_text, TOKENIZER, DEVICE)

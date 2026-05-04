@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Any, List, Optional
+from typing import Any, List, Mapping, MutableMapping, Optional
 
 import torch
 from transformers import pipeline
@@ -20,7 +20,7 @@ _FIXED_TAIL_SEED = b"watermarking-for-llm/attr-x/fixed-tail/v1\x00"
 NLI_LABEL_ACTIVE_MIN_SCORE: float = 0.9
 
 # Hugging Face ``hypothesis_template`` for zero-shot labels; ``{}`` is replaced by each candidate.
-NLI_HYPOTHESIS_TEMPLATE = "{} is the primary topic of this text."
+NLI_HYPOTHESIS_TEMPLATE = "{} is the primary subject of this text."
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +42,11 @@ def _get_classifier():
     return _classifier
 
 
-def _nli_label_absence_bits(text: str) -> List[int]:
-    """Per vocabulary label: absence_bit 0 means label active (score >= NLI_LABEL_ACTIVE_MIN_SCORE)."""
+def _scores_and_absence_bits(text: str) -> tuple[dict[str, float], List[int]]:
+    """
+    Run zero-shot NLI on ``text``; return rounded per-label scores (VOCABULARY order in the dict)
+    and prefix absence bits (0 = label active at or above ``NLI_LABEL_ACTIVE_MIN_SCORE``).
+    """
     clf = _get_classifier()
     premise = (text or " ").strip() or " "
     if len(premise) > 6000:
@@ -57,15 +60,26 @@ def _nli_label_absence_bits(text: str) -> List[int]:
     )
     score_by_label = {lab: float(s) for lab, s in zip(raw["labels"], raw["scores"])}
 
+    final_scores = {w: round(score_by_label.get(w, 0.0), 4) for w in VOCABULARY}
     out: List[int] = []
     for w in VOCABULARY:
         score = score_by_label.get(w, 0.0)
         bit = 0 if score >= NLI_LABEL_ACTIVE_MIN_SCORE else 1
         out.append(bit)
+    return final_scores, out
 
-    final_scores = {w: round(score_by_label.get(w, 0.0), 4) for w in VOCABULARY}
-    logger.info("Zero-shot label scores: %s", final_scores)
-    return out
+
+def log_pair_zero_shot_scores(
+    *,
+    baseline: Mapping[str, float],
+    watermarked: Mapping[str, float],
+) -> None:
+    """One INFO line with both score maps for side-by-side log comparison."""
+    logger.info(
+        "Zero-shot label scores — baseline: %s | watermarked: %s",
+        dict(baseline),
+        dict(watermarked),
+    )
 
 
 def _fixed_tail(n: int, modulus: int) -> List[int]:
@@ -76,8 +90,19 @@ def _fixed_tail(n: int, modulus: int) -> List[int]:
     ]
 
 
-def derive_x(text: str, modulus: int) -> List[int]:
-    prefix = _nli_label_absence_bits(text)
+def derive_x(
+    text: str,
+    modulus: int,
+    *,
+    log_nli_scores: bool = True,
+    nli_scores_out: Optional[MutableMapping[str, float]] = None,
+) -> List[int]:
+    final_scores, prefix = _scores_and_absence_bits(text)
+    if log_nli_scores:
+        logger.info("Zero-shot label scores: %s", final_scores)
+    if nli_scores_out is not None:
+        nli_scores_out.clear()
+        nli_scores_out.update(final_scores)
     tail = _fixed_tail(ATTR_TAIL_DIM, modulus)
     combined = prefix + tail
     return [v % modulus for v in combined]
