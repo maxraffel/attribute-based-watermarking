@@ -4,7 +4,7 @@ This repository ties a **CPRF** (constrained pseudorandom function) attribute ve
 
 ## How it works
 
-1. **Baseline text** — For a fixed prompt, the code runs **greedy** generation (temperature 0) for a fixed horizon (`SECURITY_PARAM` in `watermarking.py`) to obtain a reference string.
+1. **Baseline text** — For a fixed prompt, the code runs **greedy** generation (temperature 0) for a fixed horizon (``SECURITY_PARAM``, set at import or via ``watermarking.set_prc_code_length``) to obtain a reference string.
 2. **Attribute `x`** — `derive_x` in `attr_x_nli.py` maps that string to an integer vector of length `CPRF_ATTR_DIM` (see `closed_vocab.py`):
    - **Prefix** (`len(VOCABULARY)` entries): each closed-vocab label gets a score from a Hugging Face **`zero-shot-classification`** pipeline (`multi_label=True`). The pipeline uses the model’s **default** hypothesis behavior (no custom template). Coordinate `i` is **0** if the score for `VOCABULARY[i]` is at least **`NLI_LABEL_ACTIVE_MIN_SCORE`** in `attr_x_nli.py`, otherwise **1** (label treated as inactive for CPRF).
    - **Tail** (`ATTR_TAIL_DIM` entries): a **fixed**, predetermined sequence (expanded from a project constant with SHAKE256, then reduced mod the CPRF modulus)—the same for every baseline, independent of text or prefix. Keyword constraints **do not** depend on the tail (`f` is padded with zeros on the tail).
@@ -17,7 +17,7 @@ Because the **prefix** of `x` comes from zero-shot scores on whichever string is
 
 | Piece | Role |
 |--------|------|
-| `watermarking.py` | Llama load, `setup` / `generate` / `detect` / `master_detect`, `issue_*` helpers |
+| `watermarking.py` | Llama load, `set_prc_code_length`, `setup` / `generate` / `detect` / `master_detect`, `issue_*` |
 | `closed_vocab.py` | `VOCABULARY`, `ATTR_TAIL_DIM`, `CPRF_ATTR_DIM`, `f_for_required_keywords` |
 | `attr_x_nli.py` | Zero-shot scores → prefix bits; fixed tail; one INFO log line with final scores per label |
 | `randrecover.py` | Baseline gen, watermark injection, bit recovery |
@@ -66,6 +66,14 @@ Attribute + CPRF consistency checks (includes the same watermark checks plus exp
 uv run python test_attr_classification.py
 ```
 
+Policy + PRC scaling benchmark (Wilson CIs, configurable trials):
+
+```sh
+uv run python benchmark_policy_detection.py --runs 50 --code-length 300
+```
+
+Use `--reuse-key` to fix one CPRF key per scenario across trials (faster; isolates generation/NLI noise). Default is a **new master key every trial**. **`--code-length`** sets the PRC codeword length (via `watermarking.set_prc_code_length`), same knob as baseline / recovery horizon for the whole process.
+
 You can also activate `.venv` and run `python app.py` as usual.
 
 ## Tuning
@@ -73,7 +81,7 @@ You can also activate `.venv` and run `python app.py` as usual.
 - **Label sensitivity** — Edit **`NLI_LABEL_ACTIVE_MIN_SCORE`** in `attr_x_nli.py` (higher → fewer labels marked active; more strict).
 - **Vocabulary and CPRF size** — Edit **`VOCABULARY`** and **`ATTR_TAIL_DIM`** in `closed_vocab.py` (changing them changes `CPRF_ATTR_DIM` and invalidates old keys relative to new `x`).
 
-Generation horizon and PRC length are still fixed in code (`SECURITY_PARAM`).
+PRC length / generation horizon: call ``watermarking.set_prc_code_length(n)`` before ``generate`` (default at import is 300), or pass ``--code-length`` to the benchmark script.
 
 ## Upstream components
 

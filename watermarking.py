@@ -21,6 +21,18 @@ MODEL = AutoModelForCausalLM.from_pretrained(MODEL_ID).to(DEVICE)
 SECURITY_PARAM = 300
 
 
+def set_prc_code_length(n: int) -> None:
+    """
+    Set the PRC codeword length and the greedy-baseline / bit-recovery horizon (``SECURITY_PARAM``).
+    Also calls ``prc.set_code_length(n)`` so the Rust LDPC instance matches.
+    """
+    global SECURITY_PARAM
+    if n < 1:
+        raise ValueError("PRC code length must be positive")
+    SECURITY_PARAM = n
+    prc.set_code_length(n)
+
+
 def _baseline(prompt: str) -> str:
     return randrecover.generate_baseline(
         MODEL, TOKENIZER, prompt, SECURITY_PARAM, DEVICE
@@ -62,6 +74,7 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     bits = [1 if b else 0 for b in c]
     out = randrecover.generate_with_watermark(MODEL, TOKENIZER, prompt, bits, DEVICE)
     out["attr_x"] = x
+    out["baseline_text"] = baseline
     return out
 
 
