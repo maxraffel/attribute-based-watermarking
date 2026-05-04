@@ -6,6 +6,8 @@ keys → ``master_detect`` plus three ``detect`` calls. Records success counts, 
 embedded PRC bits from ``generate``), timings (baseline vs watermarked generation from
 ``watermarking.generate``), and whether encode-time ``attr_x`` exactly equals verify-time
 ``derive_x`` on the watermarked text (count of perfect matches per prompt over runs).
+Also reports **KPI/x**: among runs with a perfect ``x`` match, how often all detection KPIs
+passed; and **total wall time** per operation summed over the whole benchmark (footer).
 
 CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, and repeatable
 ``--prompt-case id:prompt`` (split on first ``:`` only). If no cases are given, two defaults are used.
@@ -102,6 +104,8 @@ class PromptRollup:
     reject_correct: int = 0
     ber_sum: float = 0.0
     x_perfect_match: int = 0
+    #: Runs where x matched *and* master/open/accept/reject KPIs all succeeded.
+    full_kpi_when_x_perfect: int = 0
     t_baseline_sum: float = 0.0
     t_wm_sum: float = 0.0
     t_issue_sum: float = 0.0
@@ -139,6 +143,8 @@ class PromptRollup:
         self.ber_sum += ber
         if x_perfect:
             self.x_perfect_match += 1
+        if x_perfect and master_ok and open_ok and accept_ok and (not reject_got_true):
+            self.full_kpi_when_x_perfect += 1
         self.t_baseline_sum += t_baseline
         self.t_wm_sum += t_wm
         self.t_issue_sum += t_issue
@@ -146,6 +152,83 @@ class PromptRollup:
         self.t_open_sum += t_open
         self.t_accept_sum += t_accept
         self.t_reject_sum += t_reject
+
+
+def _fmt_kpi_rate_given_x(r: PromptRollup) -> str:
+    """Full KPI successes among runs where encode-time x equals verify-time x."""
+    nx = r.x_perfect_match
+    if nx == 0:
+        return "    n/a"
+    return f"{r.full_kpi_when_x_perfect}/{nx}".rjust(7)
+
+
+def _aggregate_timings(
+    roll: dict[str, PromptRollup], prompt_cases: Sequence[tuple[str, str]]
+) -> dict[str, float]:
+    out = {k: 0.0 for k in (
+        "t_baseline",
+        "t_wm",
+        "t_issue",
+        "t_master",
+        "t_open",
+        "t_accept",
+        "t_reject",
+    )}
+    for sid, _ in prompt_cases:
+        r = roll[sid]
+        if r.runs == 0:
+            continue
+        out["t_baseline"] += r.t_baseline_sum
+        out["t_wm"] += r.t_wm_sum
+        out["t_issue"] += r.t_issue_sum
+        out["t_master"] += r.t_master_sum
+        out["t_open"] += r.t_open_sum
+        out["t_accept"] += r.t_accept_sum
+        out["t_reject"] += r.t_reject_sum
+    det = (
+        out["t_master"] + out["t_open"] + out["t_accept"] + out["t_reject"]
+    )
+    out["t_detect_total"] = det
+    out["t_grand"] = (
+        out["t_baseline"]
+        + out["t_wm"]
+        + out["t_issue"]
+        + det
+    )
+    return out
+
+
+def _print_aggregate_timings_footer(
+    *,
+    roll: dict[str, PromptRollup],
+    prompt_cases: Sequence[tuple[str, str]],
+    console: Console,
+    plain: bool,
+) -> None:
+    t = _aggregate_timings(roll, prompt_cases)
+    lines = [
+        "",
+        "Total wall time (sum over every benchmark run; all prompts)",
+        f"  baseline_generation (greedy):     {t['t_baseline']:10.3f} s",
+        f"  watermarked_generation:           {t['t_wm']:10.3f} s",
+        f"  issue_keys (3 policies):        {t['t_issue']:10.3f} s",
+        f"  master_detect:                    {t['t_master']:10.3f} s",
+        f"  detect (unconstrained):         {t['t_open']:10.3f} s",
+        f"  detect (accept policy):         {t['t_accept']:10.3f} s",
+        f"  detect (reject policy):           {t['t_reject']:10.3f} s",
+        f"  detection subtotal (4 calls):   {t['t_detect_total']:10.3f} s",
+        "  --------------------------------------------",
+        f"  all measured operations:        {t['t_grand']:10.3f} s",
+    ]
+    if plain:
+        print("\n".join(lines))
+    else:
+        console.print()
+        for line in lines:
+            if line.startswith("  all measured"):
+                console.print("[bold]" + line + "[/]")
+            else:
+                console.print("[dim]" + line + "[/]")
 
 
 def _print_plain_results_table(
@@ -158,7 +241,8 @@ def _print_plain_results_table(
     print("Per-prompt averages over runs")
     header = (
         f"{'prompt_id':<{w_sid}} {'runs':>5} {'master':>7} {'open':>7} {'accept':>7} "
-        f"{'rej_ok':>7} {'BER%':>7} {'x==':>7} {'t_bl':>9} {'t_wm':>9} {'t_key':>9} {'t_det':>9}"
+        f"{'rej_ok':>7} {'BER%':>7} {'x==':>7} {'KPI/x':>7} "
+        f"{'t_bl':>9} {'t_wm':>9} {'t_key':>9} {'t_det':>9}"
     )
     print(header)
     print("-" * len(header))
@@ -173,16 +257,19 @@ def _print_plain_results_table(
             continue
         det_avg = (r.t_master_sum + r.t_open_sum + r.t_accept_sum + r.t_reject_sum) / n
         sid_disp = sid if len(sid) <= w_sid else sid[: w_sid - 3] + "..."
+        kpi_x = _fmt_kpi_rate_given_x(r)
         print(
             f"{sid_disp:<{w_sid}} {n:5d} "
             f"{ratio(r.master_ok, n):>7} {ratio(r.open_ok, n):>7} {ratio(r.accept_ok, n):>7} "
             f"{ratio(r.reject_correct, n):>7} {r.ber_sum / n:7.2f} {ratio(r.x_perfect_match, n):>7} "
+            f"{kpi_x:>7} "
             f"{r.t_baseline_sum / n:9.3f} {r.t_wm_sum / n:9.3f} {r.t_issue_sum / n:9.4f} {det_avg:9.4f}"
         )
     print()
     print(
         "Legend: master/open/accept = successes/runs; rej_ok = correct reject (expect reject=False); "
         "BER% = mean bit error vs embedded PRC (master recovery); x== = runs with full x match; "
+        "KPI/x = full KPI successes among x-matched runs (n/a if no x match); "
         "t_bl / t_wm / t_key / t_det = mean seconds."
     )
 
@@ -301,6 +388,7 @@ def run_benchmark(
         table.add_column("rej_ok", justify="right")
         table.add_column("BER%", justify="right")
         table.add_column("x==", justify="right")
+        table.add_column("KPI/x", justify="right")
         table.add_column("t_bl", justify="right")
         table.add_column("t_wm", justify="right")
         table.add_column("t_key", justify="right")
@@ -320,6 +408,7 @@ def run_benchmark(
                 f"{r.reject_correct}/{n}",
                 f"{r.ber_sum / n:.2f}",
                 f"{r.x_perfect_match}/{n}",
+                _fmt_kpi_rate_given_x(r).strip(),
                 f"{r.t_baseline_sum / n:.3f}",
                 f"{r.t_wm_sum / n:.3f}",
                 f"{r.t_issue_sum / n:.4f}",
@@ -330,10 +419,10 @@ def run_benchmark(
             "[dim]master/open/accept = successes / runs; rej_ok = correct reject (expect False). "
             "BER% = mean bit error vs embedded PRC stream (master path recovery). "
             "x== = runs where encode-time attr_x equals verify-time derive_x (full vector). "
+            "KPI/x = full KPI successes among x-matched runs (n/a if none). "
             "t_bl / t_wm = mean baseline vs watermarked gen seconds from generate(). "
             "t_key = mean issue time; t_det = mean total of four detection calls.[/]"
         )
-
     if not all_ok:
         if _use_plain_table():
             print()
@@ -378,6 +467,13 @@ def run_benchmark(
                     bad.append(f"reject_false_positive {n - r.reject_correct}/{n}")
                 if bad:
                     console.print(f"  [yellow]{sid}:[/] " + ", ".join(bad))
+
+    _print_aggregate_timings_footer(
+        roll=roll,
+        prompt_cases=prompt_cases,
+        console=console,
+        plain=_use_plain_table(),
+    )
 
     return 0 if all_ok else 1
 
