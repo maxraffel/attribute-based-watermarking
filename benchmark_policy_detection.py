@@ -9,7 +9,8 @@ embedded PRC bits from ``generate``), timings (baseline vs watermarked generatio
 Also reports **KPI/x**: among runs with a perfect ``x`` match, how often all detection KPIs
 passed; and **total wall time** per operation summed over the whole benchmark (footer).
 
-CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, and repeatable
+CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, optional ``--llm-model HF_HUB_ID``
+(HF causal LM for ``watermarking``; overrides ``WATERMARK_LLM_ID`` for this process), and repeatable
 ``--prompt-case id:prompt`` (split on first ``:`` only). If no cases are given, two defaults are used.
 Non-TTY / captured stdout (e.g. Colab ``subprocess.run(..., capture_output=True)``) prints a
 **plain-text** results table automatically; set ``BENCHMARK_PLAIN_TABLE=0`` to force the Rich
@@ -282,6 +283,7 @@ def run_benchmark(
     code_length: int,
     fresh_key_per_trial: bool,
     console: Console,
+    llm_model_id: str | None = None,
 ) -> int:
     import watermarking as wm
     import attr_x_nli
@@ -290,13 +292,17 @@ def run_benchmark(
         pick_unrelated_keyword_for_policy,
     )
 
+    if llm_model_id is not None and llm_model_id.strip():
+        wm.set_llm_model_id(llm_model_id.strip())
+
     wm.set_prc_code_length(code_length)
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     sk_shared: dict[str, object] = {}
 
     console.print(
         f"code_length={wm.SECURITY_PARAM}  modulus={modulus}  runs={runs}  "
-        f"keys={'fresh per run' if fresh_key_per_trial else 'reuse per prompt id'}"
+        f"keys={'fresh per run' if fresh_key_per_trial else 'reuse per prompt id'}  "
+        f"llm={wm.MODEL_ID!r}"
     )
 
     for _ in range(runs):
@@ -495,6 +501,13 @@ def main() -> int:
         metavar="ID:PROMPT",
         help="Benchmark case (repeatable). First ':' separates id from prompt.",
     )
+    p.add_argument(
+        "--llm-model",
+        dest="llm_model",
+        metavar="HF_HUB_ID",
+        default=None,
+        help="Hugging Face hub id for the causal LM (calls watermarking.set_llm_model_id).",
+    )
     args = p.parse_args()
     if args.runs < 1 or args.code_length < 1:
         print("runs and code-length must be >= 1", file=sys.stderr)
@@ -517,6 +530,7 @@ def main() -> int:
         code_length=args.code_length,
         fresh_key_per_trial=not args.reuse_key,
         console=console,
+        llm_model_id=args.llm_model,
     )
 
 

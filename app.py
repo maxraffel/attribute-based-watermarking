@@ -30,6 +30,8 @@ from closed_vocab import (
 # --- customize here ---
 MODULUS = 1024
 CODE_LENGTH = 300
+# Hub id for the watermark causal LM; ``None`` keeps ``watermarking`` default / notebook ``set_llm_model_id``.
+LLM_MODEL_ID: str | None = None
 PROMPT = (
     "Explain how a DCF works in the context of finance."
 )
@@ -149,9 +151,13 @@ def main() -> int:
     n_prefix = len(VOCABULARY)
     all_ok = True
 
+    if LLM_MODEL_ID:
+        wm.set_llm_model_id(LLM_MODEL_ID.strip())
+
     c.print(
         Panel.fit(
             f"[bold]modulus[/] {MODULUS}  ·  [bold]code_length[/] {CODE_LENGTH}\n"
+            f"[bold]LLM[/] {wm.MODEL_ID}\n"
             f"[bold]vocab[/] |V|={n_prefix}  ·  [bold]NLI bar[/] {attr_x_nli.NLI_LABEL_ACTIVE_MIN_SCORE}",
             title="app.py protocol run",
         )
