@@ -1,7 +1,9 @@
 """
 Single-run walkthrough of the same protocol shape as ``benchmark_policy_detection`` (one prompt),
 with verbose Rich logging: texts, NLI-derived classifications, timings, recovered bits / BER, and
-per-step pass/fail. Tweak the constants below; this file does not import the benchmark module.
+per-step pass/fail. Issues one constrained CPRF key per closed-vocabulary label and compares
+``detect`` to the expectation that the label is (or is not) in the verify-time recovered NLI
+attribute set. Tweak the constants below; this file does not import the benchmark module.
 
 Run: ``uv run python app.py``
 """
@@ -24,7 +26,6 @@ from closed_vocab import (
     VOCABULARY,
     active_labels_from_verify_x,
     f_for_required_keywords,
-    pick_unrelated_keyword_for_policy,
 )
 
 # --- customize here ---
@@ -222,30 +223,30 @@ def main() -> int:
         "  [dim]encode-time attr_x equals verify-time derive_x (full vector):[/] " + _xtag
     )
 
-    c.rule("4) Issue keys (unconstrained, accept=all active, reject=unrelated)", style="cyan")
+    c.rule("4) Issue keys (unconstrained + one constrained key per vocab label)", style="cyan")
     t0 = time.perf_counter()
     dk_open = wm.issue_unconstrained(sk)
-    if active_wm:
-        dk_accept = wm.issue_keyword_policy(sk, list(active_wm))
-        c.print(f"  accept policy: [cyan]{', '.join(sorted(active_wm))}[/]")
-    else:
-        dk_accept = wm.issue_keyword_policy(sk, [])
-        c.print("  [yellow]no NLI-active label on WM text — accept key uses empty keyword list (f=0).[/]")
-    unrelated = pick_unrelated_keyword_for_policy(x_verify, sk.modulus, set(active_wm))
-    dk_reject = wm.issue_keyword_policy(sk, [unrelated])
-    c.print(f"  reject policy single label: [cyan]{unrelated}[/]")
+    active_set = set(active_wm)
+    dk_by_word = {w: wm.issue_keyword_policy(sk, [w]) for w in VOCABULARY}
+    c.print(
+        f"  [bold]Verify-time NLI-active (recovered attribute):[/] "
+        f"{sorted(active_wm) if active_wm else '(none)'}"
+    )
+    c.print(
+        "  Each other key requires exactly one label; detection should succeed when that "
+        "label appears in the recovered attribute set above."
+    )
     t_keys = time.perf_counter() - t0
-    c.print(f"  [dim]issue_keys_seconds[/]=[cyan]{t_keys:.5f}[/]")
+    c.print(f"  [dim]issue_keys_seconds[/]=[cyan]{t_keys:.5f}[/]  ([cyan]{1 + len(VOCABULARY)}[/] keys)")
 
     c.rule("4b) CPRF algebra + sk.eval(x) vs dk.c_eval(x) (same x = derive_x on WM text)", style="cyan")
     m_sz = sk.modulus
     f_zero = [0] * CPRF_ATTR_DIM
-    f_accept_vec = f_for_required_keywords(active_wm if active_wm else [])
-    f_reject_vec = f_for_required_keywords([unrelated])
     c.print(
         "  [dim]Go CPRF: constrained z1 = z0 − f·Δ ⇒ inner-product term k_c = k_m − Δ·⟨f,x⟩ (mod m). "
         "Hashes match iff Δ·⟨f,x⟩≡0 — not merely ⟨f,x⟩≡0. Composite m (e.g. 1024) allows ⟨f,x⟩≠0 with "
-        "Δ·⟨f,x⟩≡0, so rejection must be checked via byte equality below.[/]"
+        "Δ·⟨f,x⟩≡0, so match expectation uses byte equality below. For one-hot f on label w, "
+        "⟨f,x⟩≡0 when w is NLI-active (prefix coordinate ≡ 0 mod m).[/]"
     )
     _log_f_dot_x_terms(c, "Unconstrained (f = 0)", f_zero, x_verify, m_sz)
     ok_open, _ = _log_cprf_seed_agreement(
@@ -253,20 +254,35 @@ def main() -> int:
     )
     all_ok &= ok_open
 
-    lab = ",".join(sorted(active_wm)) if active_wm else "∅"
-    _log_f_dot_x_terms(c, f"Accept policy (required: [{lab}])", f_accept_vec, x_verify, m_sz)
-    ok_acc, _ = _log_cprf_seed_agreement(
-        c, sk, dk_accept, x_verify, "Accept policy key", expect_seed_match=True
-    )
-    all_ok &= ok_acc
+    policy_table = Table(show_header=True, header_style="bold", title="Per-label constrained keys (verify x)")
+    policy_table.add_column("required label")
+    policy_table.add_column("in recovered attr", justify="center")
+    policy_table.add_column("expect seed match", justify="center")
+    policy_table.add_column("sk.eval==dk.c_eval", justify="center")
+    seed_match_by_word: dict[str, bool] = {}
+    for w in VOCABULARY:
+        f_w = f_for_required_keywords([w])
+        expect_match = w in active_set
+        _log_f_dot_x_terms(c, f"Policy requires [{w!r}]", f_w, x_verify, m_sz)
+        ok_w, sm = _log_cprf_seed_agreement(
+            c,
+            sk,
+            dk_by_word[w],
+            x_verify,
+            f"Constrained key (required: {w!r})",
+            expect_seed_match=expect_match,
+        )
+        all_ok &= ok_w
+        seed_match_by_word[w] = sm
+        policy_table.add_row(
+            w,
+            "yes" if w in active_set else "no",
+            "yes" if expect_match else "no",
+            "yes" if sm else "no",
+        )
+    c.print(policy_table)
 
-    _log_f_dot_x_terms(c, f"Reject policy (one-hot: {unrelated!r})", f_reject_vec, x_verify, m_sz)
-    ok_rej, reject_seed_match = _log_cprf_seed_agreement(
-        c, sk, dk_reject, x_verify, "Reject policy key", expect_seed_match=False
-    )
-    all_ok &= ok_rej
-
-    c.rule("5) Detection (4 calls)", style="cyan")
+    c.rule("5) Detection (master + unconstrained + one detect per vocab label)", style="cyan")
 
     t0 = time.perf_counter()
     m_ok, m_bits = wm.master_detect(sk, wm_text)
@@ -283,38 +299,46 @@ def main() -> int:
     c.print(f"    recovered bits: {_bits_preview(u_bits)}")
     all_ok &= _step(c, "detect(unconstrained)", u_ok, True)
 
-    t0 = time.perf_counter()
-    a_ok, a_bits = wm.detect(dk_accept, wm_text)
-    t_a = time.perf_counter() - t0
-    c.print(f"  [dim]detect(accept policy)[/] {t_a:.5f}s")
-    c.print(f"    recovered bits: {_bits_preview(a_bits)}")
-    all_ok &= _step(c, "detect(accept policy)", a_ok, True)
-
-    t0 = time.perf_counter()
-    r_ok, r_bits = wm.detect(dk_reject, wm_text)
-    t_r = time.perf_counter() - t0
-    c.print(f"  [dim]detect(reject / unrelated policy)[/] {t_r:.5f}s")
-    c.print(f"    recovered bits: {_bits_preview(r_bits)}")
-    if reject_seed_match:
-        c.print(
-            "  [dim]Reject key used the same CPRF output as master (§4b WARN); "
-            "PRC detect=True is expected — not a detector bug.[/]"
+    det_total = t_m + t_u
+    det_rows: list[tuple[str, str, str, str, str]] = []
+    for w in VOCABULARY:
+        expect_ok = w in active_set
+        t0 = time.perf_counter()
+        w_ok, w_bits = wm.detect(dk_by_word[w], wm_text)
+        t_w = time.perf_counter() - t0
+        det_total += t_w
+        c.print(f"  [dim]detect(required={w!r})[/] {t_w:.5f}s")
+        c.print(f"    recovered bits: {_bits_preview(w_bits)}")
+        step_label = (
+            f"detect(required={w!r}) — expect {'True' if expect_ok else 'False'} "
+            f"(label {'in' if expect_ok else 'not in'} recovered attribute)"
         )
-        all_ok &= _step(
-            c,
-            "detect(reject policy) — CPRF did not diverge; expect same as master path",
-            r_ok,
-            True,
-        )
-    else:
-        all_ok &= _step(c, "detect(reject policy) should be False (CPRF seed differs)", r_ok, False)
-        if r_ok:
+        all_ok &= _step(c, step_label, w_ok, expect_ok)
+        if w_ok != expect_ok:
+            sm = seed_match_by_word[w]
             c.print(
-                "  [yellow]PRC returned True despite differing CPRF seeds — possible LDPC statistical false positive; "
-                "rerun or tighten code parameters.[/]"
+                "  [yellow]Outcome differs from attribute-based expectation[/] "
+                f"(sk.eval==dk.c_eval was {sm} for this key; composite modulus / LDPC may apply — see step 4b)."
             )
+        det_rows.append(
+            (
+                w,
+                "yes" if w in active_set else "no",
+                "True" if expect_ok else "False",
+                "True" if w_ok else "False",
+                "[green]PASS[/]" if bool(w_ok) == bool(expect_ok) else "[red]FAIL[/]",
+            )
+        )
 
-    det_total = t_m + t_u + t_a + t_r
+    det_table = Table(show_header=True, header_style="bold", title="Per-label detection vs recovered attribute")
+    det_table.add_column("required label")
+    det_table.add_column("in recovered attr", justify="center")
+    det_table.add_column("expect detect", justify="center")
+    det_table.add_column("got detect", justify="center")
+    det_table.add_column("check", justify="center")
+    for row in det_rows:
+        det_table.add_row(*row)
+    c.print(det_table)
     c.print(f"  [dim]total detection wall time:[/] [cyan]{det_total:.5f}[/]s")
 
     c.rule("6) Summary metrics (this run)", style="cyan")
