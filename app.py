@@ -43,11 +43,11 @@ def _env_int(*names: str, default: int) -> int:
 
 # --- customize here (env overrides: APP_* or WATERMARK_*; see module docstring) ---
 MODULUS = 1024
-CODE_LENGTH = _env_int("APP_CODE_LENGTH", "WATERMARK_CODE_LENGTH", default=300)
+CODE_LENGTH = _env_int("APP_CODE_LENGTH", "WATERMARK_CODE_LENGTH", default=100)
 WM_BIT_REDUNDANCY = _env_int(
     "APP_WM_BIT_REDUNDANCY",
     "WATERMARK_WM_BIT_REDUNDANCY",
-    default=1,
+    default=3,
 )  # token-channel repeats per logical PRC bit; recovery = strict majority (tie → 0)
 # Hub id for the watermark causal LM; ``None`` keeps ``watermarking`` default / notebook ``set_llm_model_id``.
 LLM_MODEL_ID: str | None = None

@@ -28,7 +28,7 @@ print(f"Average BER: {avg_ber:.2%}")
 print(f"False Positives (Watermark Detected): {false_positives} / {num_random_tests} ({false_positives/num_random_tests:.2%})")
 
 print("\n--- Testing CPRF + PRC Pipeline ---")
-CODE_LEN = 200
+CODE_LEN = 100
 prc.set_code_length(CODE_LEN)
 sk = cprf.keygen(1024, CODE_LEN)
 

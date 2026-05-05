@@ -4,7 +4,7 @@ This repository ties a **CPRF** (constrained pseudorandom function) attribute ve
 
 ## How it works
 
-1. **Baseline text** — For a fixed prompt, the code runs **greedy** generation (temperature 0) for a fixed horizon (``SECURITY_PARAM``, set at import or via ``watermarking.set_prc_code_length``) to obtain a reference string.
+1. **Baseline text** — For a fixed prompt, the code runs sampling with the same new-token horizon as the watermarked path (``watermarking.wm_channel_bits_length()`` = logical ``SECURITY_PARAM`` × ``WM_BIT_REDUNDANCY``), set via ``set_prc_code_length`` / ``set_wm_bit_redundancy``.
 2. **Attribute `x`** — `derive_x` in `attr_x_nli.py` maps that string to an integer vector of length `CPRF_ATTR_DIM` (see `closed_vocab.py`):
    - **Prefix** (`len(VOCABULARY)` entries): each closed-vocab label gets a score from a Hugging Face **`zero-shot-classification`** pipeline (`multi_label=False` so scores are a **softmax** over candidates—comparable for picking one primary subject; `hypothesis_template` from **`NLI_HYPOTHESIS_TEMPLATE`** in `attr_x_nli.py`). Coordinate `i` is **0** for the label with the **highest** score (ties: smallest index in `VOCABULARY`), and **1** for all others.
    - **Tail** (`ATTR_TAIL_DIM` entries): a **fixed**, predetermined sequence (expanded from a project constant with SHAKE256, then reduced mod the CPRF modulus)—the same for every baseline, independent of text or prefix. Keyword constraints **do not** depend on the tail (`f` is padded with zeros on the tail).

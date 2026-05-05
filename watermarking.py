@@ -44,7 +44,10 @@ WM_BIT_REDUNDANCY = 1
 
 
 def wm_channel_bits_length() -> int:
-    """Physical watermark bit positions (tokens) per completion: logical ``SECURITY_PARAM`` × ``WM_BIT_REDUNDANCY``."""
+    """
+    New-token horizon for **both** baseline sampling and watermarked embedding: logical
+    ``SECURITY_PARAM`` × ``WM_BIT_REDUNDANCY`` (one payload token per physical channel bit).
+    """
     return int(SECURITY_PARAM) * int(WM_BIT_REDUNDANCY)
 
 
@@ -54,7 +57,8 @@ def set_wm_bit_redundancy(r: int) -> None:
 
     Each logical PRC bit is expanded to ``r`` identical channel bits before ``generate_with_watermark``;
     ``detect`` / ``master_detect`` recover ``SECURITY_PARAM * r`` raw bits and fold with strict majority
-    (ties become ``0``) before ``prc.detect``. Baseline generation length stays ``SECURITY_PARAM``.
+    (ties become ``0``) before ``prc.detect``. Baseline sampling uses the same new-token count as the
+    watermarked path (``wm_channel_bits_length()``).
     """
     global WM_BIT_REDUNDANCY
     ri = int(r)
@@ -133,9 +137,10 @@ def set_llm_model_id(model_id: str) -> None:
 
 def set_prc_code_length(n: int) -> None:
     """
-    Set the **logical** PRC codeword length (``SECURITY_PARAM``): LDPC block size, baseline decode length,
-    and the length of ``prc.encode`` / ``prc.detect`` bit vectors. Watermarked generation uses
-    ``SECURITY_PARAM * WM_BIT_REDUNDANCY`` physical channel bits. Also calls ``prc.set_code_length(n)``.
+    Set the **logical** PRC codeword length (``SECURITY_PARAM``): LDPC block size and the length of
+    ``prc.encode`` / ``prc.detect`` bit vectors. Baseline and watermarked LM paths both use
+    ``wm_channel_bits_length()`` = ``SECURITY_PARAM * WM_BIT_REDUNDANCY`` new tokens. Also calls
+    ``prc.set_code_length(n)``.
     """
     global SECURITY_PARAM
     if n < 1:
@@ -148,7 +153,7 @@ def _baseline(prompt: str) -> str:
     _ensure_llm()
     assert MODEL is not None and TOKENIZER is not None
     return randrecover.generate_baseline(
-        MODEL, TOKENIZER, prompt, SECURITY_PARAM, DEVICE
+        MODEL, TOKENIZER, prompt, wm_channel_bits_length(), DEVICE
     )
 
 
