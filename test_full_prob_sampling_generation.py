@@ -13,10 +13,12 @@ defines a template—otherwise it is encoded as plain text.
    and draws one token via full-vocab ``multinomial``. Secret bits are **not** used for
    decoding; they only tie the stepping horizon to ``length``.
 
-3. **Partition on processed probabilities** —
-   ``randrecover.generate_with_watermark``: same logits processing as (2), then half-space
-   restriction driven by cryptographic random bits (`secrets`) as extra entropy beside
-   coin flips tied to marginal mass ``p``. After printing (3), the script runs
+3. **Partition before logits processing** —
+   ``randrecover.generate_with_watermark``: restricts to one vocabulary half by masking logits
+   *before* the same Hugging Face logits-processor stack as (2); then softmax and multinomial.
+   Cryptographic bits (`secrets`) drive the scheme together with coin flips tied to marginal mass
+   ``p`` computed on the full HF-processed scores (same as before), while the actual token draw
+   applies the half-vocab mask **before** that processing stack at each step. After printing (3), the script runs
    ``recover_bitstream_from_text`` on that transcript and logs **BER** against the encoded
    ``bits``.
 
@@ -123,7 +125,7 @@ def main() -> int:
     LOG.info("%s", processor_only_text)
     LOG.info("")
     LOG.info(
-        "=== (3) Same processed probabilities as (2); partition + secret-bit entropy ==="
+        "=== (3) Partition-half logit mask → same HF logits processing as (2) → multinomial ==="
     )
     LOG.info("%s", partition_text)
 

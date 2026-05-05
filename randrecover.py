@@ -157,21 +157,24 @@ def _scores_to_next_token_probs(
     return F.softmax(next_scores, dim=-1).squeeze(0)
 
 
-def _sample_modified_token_partition(
-    probs: torch.Tensor, mask_A: torch.BoolTensor, p: float, q: float, random_bit: int
+def _watermark_keep_set_a_choice(p: float, random_bit: int) -> bool:
+    """Whether to retain partition set A (vs B); matches prior ``_sample_modified_token_partition`` branch."""
+    q = min(p, 1.0 - p)
+    return (random_bit == 0) if random.random() < (2 * q) else (p > 0.5)
+
+
+def _logits_masked_to_single_partition(
+    logits_last: torch.Tensor,
+    mask_A: torch.BoolTensor,
+    *,
+    keep_set_a: bool,
+    device_str: str,
 ) -> torch.Tensor:
-    """Pick a half-space from ``mask_A`` (bit + randomness), then multinomial on renormalized ``probs``."""
-    choose_set_A = (random_bit == 0) if random.random() < (2 * q) else (p > 0.5)
-    if choose_set_A:
-        modified = torch.where(mask_A, probs, torch.zeros_like(probs))
-    else:
-        modified = torch.where(mask_A, torch.zeros_like(probs), probs)
-    total = float(modified.sum().item())
-    if total <= 0.0 or total != total:  # second: NaN guard
-        modified = probs
-    else:
-        modified = modified / modified.sum()
-    return torch.multinomial(modified, num_samples=1)
+    """Set logits to ``-inf`` on the excluded half (partition **before** HF logits processors)."""
+    logits_f = logits_last.detach().float().clone().to(torch.device(device_str))
+    m = mask_A.to(device=logits_f.device, dtype=torch.bool)
+    keep = m if keep_set_a else ~m
+    return logits_f.masked_fill(~keep, float("-inf"))
 
 
 def _generate_watermark_incremental(
@@ -187,9 +190,10 @@ def _generate_watermark_incremental(
 ) -> Dict:
     """
     Shared KV-cache loop: stop once ``len(secret_bitstream)`` non-special tokens have
-    advanced ``bit_index``. Sampling uses Hugging Face ``generate`` logits processing
-    (same as ``do_sample=True``), then either full-vocab multinomial or partition-based
-    half-space sampling via ``_sample_modified_token_partition``.
+    advanced ``bit_index``. Sampling uses either full-vocab multinomial or, for the
+    watermark path, deterministic half-vocabulary masking **before** Hugging Face logits
+    processing (temperature, top-*p*, etc.), then softmax and multinomial on the restricted
+    distribution (matching ``do_sample=True`` aside from the mask).
     """
     special_ids = set(getattr(tokenizer, "all_special_ids", []))
     inputs = encode_prompt_for_generation(tokenizer, prompt, device)
@@ -218,19 +222,31 @@ def _generate_watermark_incremental(
         with torch.no_grad():
             outputs = model(input_ids=step_input_ids, **model_kwargs)
             logits_wm = outputs.logits[0, -1, :]
-            probs_wm = _scores_to_next_token_probs(logits_wm, input_ids_wm, logits_processor)
             model_kwargs["past_key_values"] = outputs.past_key_values
 
         if full_vocab_only:
+            probs_wm = _scores_to_next_token_probs(logits_wm, input_ids_wm, logits_processor)
             next_token_id_wm = torch.multinomial(probs_wm, num_samples=1)
         else:
-            mask_A = get_vectorized_partition(probs_wm.shape[-1], device, bit_index)
-            p = probs_wm[mask_A].sum().item()
+            mask_A = get_vectorized_partition(logits_wm.shape[-1], device, bit_index)
+            probs_hf_full = _scores_to_next_token_probs(
+                logits_wm, input_ids_wm, logits_processor
+            )
+            p = probs_hf_full[mask_A.to(probs_hf_full.device)].sum().item()
             p_count += 1
             running_mean_p += (p - running_mean_p) / p_count
-            next_token_id_wm = _sample_modified_token_partition(
-                probs_wm, mask_A, p, min(p, 1 - p), secret_bitstream[bit_index]
+            keep_a = _watermark_keep_set_a_choice(p, secret_bitstream[bit_index])
+            logits_for_proc = _logits_masked_to_single_partition(
+                logits_wm, mask_A, keep_set_a=keep_a, device_str=device
             )
+            probs_wm = _scores_to_next_token_probs(
+                logits_for_proc, input_ids_wm, logits_processor
+            )
+            if not torch.isfinite(probs_wm).all():
+                probs_wm = _scores_to_next_token_probs(logits_wm, input_ids_wm, logits_processor)
+            elif float(probs_wm.sum().item()) <= 0:
+                probs_wm = _scores_to_next_token_probs(logits_wm, input_ids_wm, logits_processor)
+            next_token_id_wm = torch.multinomial(probs_wm, num_samples=1)
 
         tid = int(next_token_id_wm.item())
         input_ids_wm = torch.cat([input_ids_wm, next_token_id_wm.unsqueeze(0)], dim=-1)
@@ -296,7 +312,7 @@ def generate_with_watermark(
     *,
     generation_extra: Dict[str, Any] | None = None,
 ) -> Dict:
-    """Partitioned vocabulary + bit-driven half-space multinomial sampling (HF-processed probs)."""
+    """Partitioned vocabulary (logit mask **before** HF logits processors), then softmax + multinomial."""
     return _generate_watermark_incremental(
         model,
         tokenizer,
