@@ -34,7 +34,7 @@ CODE_LENGTH = 300
 # Hub id for the watermark causal LM; ``None`` keeps ``watermarking`` default / notebook ``set_llm_model_id``.
 LLM_MODEL_ID: str | None = None
 PROMPT = (
-            "Explain why Tom Brady is the GOAT, and why Drake Maye is an upcoming star in football, in a brief paragraph for each, comparing their football legacies."
+            "Explain how Tom Brady's football legacy economically impacted the New England area."
 )
 
 

@@ -6,7 +6,7 @@ from typing import List, Sequence, Set
 
 # Single project-wide label list (CPRF inner-product prefix length).
 VOCABULARY: List[str] = [
-    "medicine", "law", "software", "business", "art", "football", "cooking", "philosophy", "carpentry", "architecture"
+    "medicine", "software", "business", "art", "football", "cooking", "philosophy", "New England"
 ]
 
 # Fixed random coordinates appended after label bits (ignored by keyword constraints).

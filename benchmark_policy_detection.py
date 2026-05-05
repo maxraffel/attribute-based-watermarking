@@ -61,9 +61,8 @@ def _use_plain_table() -> bool:
 
 DEFAULT_PROMPT_CASES: list[tuple[str, str]] = [
     (
-        "patriots_qbs",
-        "Explain why Tom Brady is the GOAT, and why Drake Maye is an upcoming star in football, "
-        "in a brief paragraph for each, comparing their football legacies.",
+        "brady_econ_new_england",
+        "Explain how Tom Brady's football legacy economically impacted the New England area."
     ),
 ]
 
