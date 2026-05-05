@@ -26,6 +26,15 @@ DEFAULT_LLM_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 MODEL_ID: str = DEFAULT_LLM_MODEL_ID
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Hugging Face merges ``model.generation_config`` into every ``model.generate`` call and into
+# ``randrecover``'s incremental path (``_prepare_generation_config``). Set keys here to override
+# the model card (e.g. Llama-3.2-1B-Instruct defaults: temperature≈0.6, top_k=50, top_p=0.9).
+GENERATION_SAMPLING_OVERRIDES: dict = {
+    "temperature": 0.3,
+    "top_p": 1.0,
+    "top_k": 0,  # HF: 0 often means disable top-k
+}
+
 TOKENIZER: Optional[AutoTokenizer] = None
 MODEL: Optional[AutoModelForCausalLM] = None
 
@@ -40,6 +49,8 @@ def _load_llm() -> None:
     print(f"Loading causal LM {MODEL_ID!r} on {DEVICE}")
     TOKENIZER = AutoTokenizer.from_pretrained(MODEL_ID)
     MODEL = AutoModelForCausalLM.from_pretrained(MODEL_ID).to(DEVICE)
+    for attr, value in GENERATION_SAMPLING_OVERRIDES.items():
+        setattr(MODEL.generation_config, attr, value)
     if not MODEL.config.is_encoder_decoder:
         TOKENIZER.padding_side = "left"
 
@@ -169,7 +180,10 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
     # CPRF seed is sha256(commonEval···); constrained vs master outputs match iff Δ·⟨f,x⟩≡0 (mod m),
     # not merely ⟨f,x⟩≡0 on composite modulus — compare dk.c_eval(x) to sk.eval(x) when debugging policies.
     recovered_s = prc.key_gen_from_seed(sha256(dk.c_eval(x)).digest())
-    bits, _ = randrecover.recover_bitstream_from_text(watermarked_text, TOKENIZER, DEVICE)
+    assert MODEL is not None
+    bits, _ = randrecover.recover_bitstream_from_text(
+        watermarked_text, TOKENIZER, DEVICE, model=MODEL
+    )
     bits = (bits + [0] * SECURITY_PARAM)[:SECURITY_PARAM]
     bits_int = [1 if b else 0 for b in bits]
     ok = prc.detect(recovered_s, [bool(b) for b in bits])
@@ -183,7 +197,10 @@ def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> Tuple[bool, List
     x = _derive_x(watermarked_text, sk.modulus, log_nli_scores=False)
     prc.set_code_length(SECURITY_PARAM)
     s = prc.key_gen_from_seed(sha256(sk.eval(x)).digest())
-    bits, _ = randrecover.recover_bitstream_from_text(watermarked_text, TOKENIZER, DEVICE)
+    assert MODEL is not None
+    bits, _ = randrecover.recover_bitstream_from_text(
+        watermarked_text, TOKENIZER, DEVICE, model=MODEL
+    )
     bits = (bits + [0] * SECURITY_PARAM)[:SECURITY_PARAM]
     bits_int = [1 if b else 0 for b in bits]
     ok = prc.detect(s, [bool(b) for b in bits])

@@ -13,12 +13,16 @@ defines a template—otherwise it is encoded as plain text.
    and draws one token via full-vocab ``multinomial``. Secret bits are **not** used for
    decoding; they only tie the stepping horizon to ``length``.
 
-3. **Partition on processed probabilities** —
-   ``randrecover.generate_with_watermark``: same logits processing as (2), then half-space
-   restriction driven by cryptographic random bits (`secrets`) as extra entropy beside
-   coin flips tied to marginal mass ``p``. After printing (3), the script runs
-   ``recover_bitstream_from_text`` on that transcript and logs **BER** against the encoded
-   ``bits``.
+3. **Partition on raw logits, then HF logits processing** —
+   ``randrecover.generate_with_watermark``: half-vocab -inf mask on **pre-warp** logits (bit +
+   stochastic choice from raw ``p``), then the same processor stack as (2), softmax, multinomial.
+   After (2) and (3), the script runs
+   ``recover_bitstream_from_text`` on each transcript and logs **BER** against the same
+   secret ``bits`` (full-vocab path is a **negative control**: bits do not steer sampling).
+   The script also runs ``verify_partition_embed_recovery_sync`` on the partition run: for each
+   payload token it rebuilds the generation and recovery partitions, **compares every vocabulary
+   cell**, membership for that token, and ``recover_bitstream`` consistency (see log lines).
+   It also asserts both incremental runs share ``partition_vocab_dim``.
 
 Run: ``python test_full_prob_sampling_generation.py`` or ``uv run python ...``
 """
@@ -55,6 +59,32 @@ def _ber_vs_secret(secret: list[int], extracted: list[int]) -> tuple[float, int]
     return ((errs / len(secret)) * 100.0, errs)
 
 
+def _recover_transcript_and_log_ber(
+    secret: list[int],
+    transcript: str,
+    *,
+    section_title: str,
+    ber_metric_name: str,
+    partition_vocab_size: int | None,
+) -> None:
+    recovered, _ = randrecover.recover_bitstream_from_text(
+        transcript,
+        wm.TOKENIZER,
+        wm.DEVICE,
+        model=wm.MODEL,
+        partition_vocab_size=partition_vocab_size,
+    )
+    ber_pct, err_count = _ber_vs_secret(secret, recovered)
+    LOG.info("")
+    LOG.info(section_title, len(secret), len(recovered))
+    LOG.info(
+        "BER [%s]: %.2f%% (%d errors, denom = len(secret))",
+        ber_metric_name,
+        ber_pct,
+        err_count,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -86,6 +116,17 @@ def main() -> int:
     assert wm.MODEL is not None and wm.TOKENIZER is not None
     n = args.length
     bits = random_secret_bits(n)
+
+    for line in randrecover.format_sampling_logits_debug_lines(
+        randrecover.infer_sampling_logits_debug_for_prompt(
+            wm.MODEL, wm.TOKENIZER, args.prompt, n, wm.DEVICE
+        )
+    ):
+        LOG.info(line)
+    LOG.info(
+        "(runs 2-3 share this HF-resolved logits stack; run 1 is model.generate with the same defaults "
+        "unless you extend both paths with matching generation kwargs)"
+    )
 
     hf_generate_out = randrecover.generate_baseline(
         wm.MODEL,
@@ -123,25 +164,43 @@ def main() -> int:
     LOG.info("%s", processor_only_text)
     LOG.info("")
     LOG.info(
-        "=== (3) Same processed probabilities as (2); partition + secret-bit entropy ==="
+        "=== (3) Raw-logit partition mask, then same HF logits stack as (2); secret-bit entropy ==="
     )
     LOG.info("%s", partition_text)
 
-    recovered_bits, _ = randrecover.recover_bitstream_from_text(
-        partition_text, wm.TOKENIZER, wm.DEVICE
+    randrecover.verify_partition_embed_recovery_sync(
+        partition_wm,
+        wm.TOKENIZER,
+        wm.DEVICE,
+        model=wm.MODEL,
+        recovery_partition_vocab_size=int(partition_wm["partition_vocab_dim"]),
+        log=LOG.info,
     )
-    ber_pct, err_count = _ber_vs_secret(bits, recovered_bits)
-    LOG.info("")
-    LOG.info(
-        "--- Entropy recovery: decode partition transcript → recovered bits vs secret "
-        "(len secret=%d, len recovered=%d) ---",
-        len(bits),
-        len(recovered_bits),
+    LOG.info("verify_partition_embed_recovery_sync: OK (full per-token partition audit logged above)")
+
+    pv_full = logits_processor_full_vocab["partition_vocab_dim"]
+    pv_part = partition_wm["partition_vocab_dim"]
+    assert pv_full == pv_part, "partition_vocab_dim must match across incremental runs on the same model"
+
+    _recover_transcript_and_log_ber(
+        bits,
+        processor_only_text,
+        section_title=(
+            "--- Full-vocab transcript: recovered bits vs secret (negative control; "
+            "len secret=%d, len recovered=%d) ---"
+        ),
+        ber_metric_name="full-vocab (bits not used for decoding)",
+        partition_vocab_size=pv_full,
     )
-    LOG.info(
-        "BER [partition-encoded entropy recovery]: %.2f%% (%d errors, denom = len(secret))",
-        ber_pct,
-        err_count,
+    _recover_transcript_and_log_ber(
+        bits,
+        partition_text,
+        section_title=(
+            "--- Partition transcript: recovered bits vs secret "
+            "(len secret=%d, len recovered=%d) ---"
+        ),
+        ber_metric_name="partition-encoded entropy recovery",
+        partition_vocab_size=pv_part,
     )
     return 0
 

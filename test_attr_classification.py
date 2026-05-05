@@ -81,6 +81,7 @@ def main() -> int:
         wm.TOKENIZER,
         wm.DEVICE,
         n_bits=wm.SECURITY_PARAM,
+        model=wm.MODEL,
     )
     mw, _ = wm.master_detect(sk, wrong_tx)
     rep.add_boolean("master_detect(wrong transcript)", mw, False)

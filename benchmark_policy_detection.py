@@ -322,6 +322,8 @@ def run_benchmark(
 
         out = wm.generate(sk, prompt)
         text = out["generated_text_wm"]
+        suffix_ids = out["input_ids_wm"][0].tolist()
+        wm_pv = int(out["partition_vocab_dim"])
         x_gen = out["attr_x"]
         secret = out["prc_secret_bits"]
         t_bl = float(out["seconds_baseline_gen"])
@@ -344,19 +346,39 @@ def run_benchmark(
         t_issue = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        m_ok, m_bits = wm.master_detect(sk, text)
+        m_ok, m_bits = wm.master_detect(
+            sk,
+            text,
+            recovery_suffix_token_ids=suffix_ids,
+            partition_vocab_dim=wm_pv,
+        )
         t_m = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        u_ok, _ = wm.detect(dk_open, text)
+        u_ok, _ = wm.detect(
+            dk_open,
+            text,
+            recovery_suffix_token_ids=suffix_ids,
+            partition_vocab_dim=wm_pv,
+        )
         t_u = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        a_ok, _ = wm.detect(dk_accept, text)
+        a_ok, _ = wm.detect(
+            dk_accept,
+            text,
+            recovery_suffix_token_ids=suffix_ids,
+            partition_vocab_dim=wm_pv,
+        )
         t_a = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        r_ok, _ = wm.detect(dk_reject, text)
+        r_ok, _ = wm.detect(
+            dk_reject,
+            text,
+            recovery_suffix_token_ids=suffix_ids,
+            partition_vocab_dim=wm_pv,
+        )
         t_r = time.perf_counter() - t0
 
         ber = _ber_percent(secret, m_bits)

@@ -335,6 +335,7 @@ def main() -> int:
         wm.TOKENIZER,
         wm.DEVICE,
         n_bits=wm.SECURITY_PARAM,
+        model=wm.MODEL,
     )
     c.print(
         f"  [dim]decoy length: {len(wrong)} chars (watermarked ref: {len(wm_text)}), "
