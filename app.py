@@ -158,7 +158,7 @@ def main() -> int:
         Panel.fit(
             f"[bold]modulus[/] {MODULUS}  ·  [bold]code_length[/] {CODE_LENGTH}\n"
             f"[bold]LLM[/] {wm.MODEL_ID}\n"
-            f"[bold]vocab[/] |V|={n_prefix}  ·  [bold]NLI prefix[/] argmax primary label",
+            f"[bold]vocab[/] |V|={n_prefix}  ·  [bold]NLI prefix[/] multi-label (cutoff={attr_x_nli.NLI_MULTI_LABEL_SCORE_CUTOFF:g})",
             title="app.py protocol run",
         )
     )
@@ -187,7 +187,7 @@ def main() -> int:
     c.print(f"  [dim]encode-time attr_x (len {len(x_encode)}), prefix:[/] {x_encode[:n_prefix]}")
     c.print(f"  [dim]PRC secret bits (len {len(secret)}):[/] {_bits_preview(secret)}")
 
-    c.rule("3) Verify-time x and NLI-primary label (argmax)", style="cyan")
+    c.rule("3) Verify-time x and NLI-active labels (multi-label cutoff)", style="cyan")
     wm_nli: dict[str, float] = {}
     try:
         x_verify = attr_x_nli.derive_x(
@@ -212,8 +212,8 @@ def main() -> int:
     active_wm = active_labels_from_verify_x(x_verify, sk.modulus)
     # Encode-time x is derive_x(baseline); same NLI view as re-running on baseline_text.
     active_bl = active_labels_from_verify_x(x_encode, sk.modulus)
-    c.print(f"  [bold]NLI-primary (baseline text):[/] {active_bl or '(none)'}")
-    c.print(f"  [bold]NLI-primary (watermarked text):[/] {active_wm or '(none)'}")
+    c.print(f"  [bold]NLI-active (baseline text):[/] {active_bl or '(none)'}")
+    c.print(f"  [bold]NLI-active (watermarked text):[/] {active_wm or '(none)'}")
     c.print(f"  [dim]derive_x(wm) prefix:[/] {x_verify[:n_prefix]}")
     x_perfect = list(x_encode) == list(x_verify)
     # Do not nest style tags (e.g. [cyan][bold]…[/][/]) — Rich parses that poorly and looks broken.
@@ -230,7 +230,7 @@ def main() -> int:
         c.print(f"  accept policy: [cyan]{', '.join(sorted(active_wm))}[/]")
     else:
         dk_accept = wm.issue_keyword_policy(sk, [])
-        c.print("  [yellow]no NLI-primary label on WM text — accept key uses empty keyword list (f=0).[/]")
+        c.print("  [yellow]no NLI-active label on WM text — accept key uses empty keyword list (f=0).[/]")
     unrelated = pick_unrelated_keyword_for_policy(x_verify, sk.modulus, set(active_wm))
     dk_reject = wm.issue_keyword_policy(sk, [unrelated])
     c.print(f"  reject policy single label: [cyan]{unrelated}[/]")

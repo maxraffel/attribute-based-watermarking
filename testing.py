@@ -5,7 +5,7 @@ from hashlib import sha256
 
 
 print("\n--- Testing Many Random Strings ---")
-TEST_CODE_LEN = 5000
+TEST_CODE_LEN = 1200
 prc.set_code_length(TEST_CODE_LEN)
 random_testing_s = prc.key_gen_from_seed(sha256(secrets.token_bytes(TEST_CODE_LEN)).digest())
 num_random_tests = 5000
@@ -28,7 +28,7 @@ print(f"Average BER: {avg_ber:.2%}")
 print(f"False Positives (Watermark Detected): {false_positives} / {num_random_tests} ({false_positives/num_random_tests:.2%})")
 
 print("\n--- Testing CPRF + PRC Pipeline ---")
-CODE_LEN = 2000
+CODE_LEN = 12000
 prc.set_code_length(CODE_LEN)
 sk = cprf.keygen(1024, CODE_LEN)
 

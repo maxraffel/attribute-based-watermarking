@@ -12,14 +12,42 @@ def get_vectorized_partition(vocab_size: int, device: str, seed_index: int) -> t
     g.manual_seed(seed)
     return torch.rand(vocab_size, generator=g, device=device) > 0.5
 
-def generate_with_watermark(
+def _sample_modified_token_partition(
+    probs: torch.Tensor, mask_A: torch.BoolTensor, p: float, q: float, random_bit: int
+) -> torch.Tensor:
+    """
+    Same half-space choice as the former argmax path, but draw ``next_token`` from the
+    renormalized distribution restricted to the chosen side of ``mask_A``.
+    """
+    choose_set_A = (random_bit == 0) if random.random() < (2 * q) else (p > 0.5)
+    if choose_set_A:
+        modified = torch.where(mask_A, probs, torch.zeros_like(probs))
+    else:
+        modified = torch.where(mask_A, torch.zeros_like(probs), probs)
+    total = float(modified.sum().item())
+    if total <= 0.0 or total != total:  # second: NaN guard
+        modified = probs
+    else:
+        modified = modified / modified.sum()
+    return torch.multinomial(modified, num_samples=1)
+
+
+def _generate_watermark_incremental(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
     prompt: str,
     secret_bitstream: List[int],
-    device: str = "cpu",
-    track_token_alignment: bool = False,
+    device: str,
+    track_token_alignment: bool,
+    *,
+    full_vocab_only: bool,
 ) -> Dict:
+    """
+    Shared KV-cache loop: stop once ``len(secret_bitstream)`` non-special tokens have
+    advanced ``bit_index``. If ``full_vocab_only``, sample from full ``softmax(logits)``
+    each step (bits unused for decoding). Otherwise partition + bit-driven half-space
+    sampling via ``_sample_modified_token_partition``.
+    """
     special_ids = set(getattr(tokenizer, "all_special_ids", []))
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_ids_wm = inputs["input_ids"].clone()
@@ -30,22 +58,11 @@ def generate_with_watermark(
     bit_index_to_token_id = [-1] * len(secret_bitstream)
     running_mean_p, p_count = 0.0, 0
 
-    def _argmax_modified_token(probs, mask_A, p, q, random_bit):
-        modified = probs.clone()
-        choose_set_A = (random_bit == 0) if random.random() < (2 * q) else (p > 0.5)
-        if choose_set_A:
-            modified[~mask_A] = 0
-        else:
-            modified[mask_A] = 0
-        return torch.argmax(modified).unsqueeze(0)
-
-    # Incremental decoding with KV cache avoids full-sequence forward each step.
     model_kwargs = {"use_cache": True}
     if attn_mask is not None:
         model_kwargs["attention_mask"] = attn_mask
     step_input_ids = input_ids_wm
 
-    # Force generation until bitstream is exhausted
     while bit_index < len(secret_bitstream):
         with torch.no_grad():
             outputs = model(input_ids=step_input_ids, **model_kwargs)
@@ -53,14 +70,17 @@ def generate_with_watermark(
             probs_wm = torch.softmax(logits_wm, dim=-1)
             model_kwargs["past_key_values"] = outputs.past_key_values
 
-        mask_A = get_vectorized_partition(probs_wm.shape[-1], device, bit_index)
-        p = probs_wm[mask_A].sum().item()
-        p_count += 1
-        running_mean_p += (p - running_mean_p) / p_count
-        
-        next_token_id_wm = _argmax_modified_token(
-            probs_wm, mask_A, p, min(p, 1 - p), secret_bitstream[bit_index]
-        )
+        if full_vocab_only:
+            next_token_id_wm = torch.multinomial(probs_wm, num_samples=1)
+        else:
+            mask_A = get_vectorized_partition(probs_wm.shape[-1], device, bit_index)
+            p = probs_wm[mask_A].sum().item()
+            p_count += 1
+            running_mean_p += (p - running_mean_p) / p_count
+            next_token_id_wm = _sample_modified_token_partition(
+                probs_wm, mask_A, p, min(p, 1 - p), secret_bitstream[bit_index]
+            )
+
         tid = int(next_token_id_wm.item())
         input_ids_wm = torch.cat([input_ids_wm, next_token_id_wm.unsqueeze(0)], dim=-1)
         step_input_ids = next_token_id_wm.unsqueeze(0)
@@ -102,17 +122,60 @@ def generate_with_watermark(
         else:
             if tid not in special_ids:
                 bit_index_to_token_id[bit_index] = tid
-            bit_index += 1
+                bit_index += 1
 
     return {
         "prompt_text": prompt,
         "generated_text_wm": tokenizer.decode(input_ids_wm[0, prompt_len:], skip_special_tokens=True),
-        "input_ids_wm": input_ids_wm[:, prompt_len:], 
+        "input_ids_wm": input_ids_wm[:, prompt_len:],
         "secret_bitstream": secret_bitstream,
         "bit_index_to_token_id": bit_index_to_token_id,
         "running_mean_p": running_mean_p,
         "p_count": p_count,
     }
+
+
+def generate_with_watermark(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    secret_bitstream: List[int],
+    device: str = "cpu",
+    track_token_alignment: bool = False,
+) -> Dict:
+    """Partitioned vocabulary + bit-driven half-space; next token is **sampled** (not argmax)."""
+    return _generate_watermark_incremental(
+        model,
+        tokenizer,
+        prompt,
+        secret_bitstream,
+        device,
+        track_token_alignment,
+        full_vocab_only=False,
+    )
+
+
+def generate_with_watermark_full_vocab_sample(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    secret_bitstream: List[int],
+    device: str = "cpu",
+    track_token_alignment: bool = False,
+) -> Dict:
+    """
+    Same stepping / KV cache / bit-index horizon as ``generate_with_watermark``, but each
+    step samples from the full next-token softmax (no partition; bits are not used for decoding).
+    """
+    return _generate_watermark_incremental(
+        model,
+        tokenizer,
+        prompt,
+        secret_bitstream,
+        device,
+        track_token_alignment,
+        full_vocab_only=True,
+    )
 
 def generate_baseline(
     model: torch.nn.Module,
@@ -230,6 +293,7 @@ def log_recovery_evaluation(secret, extracted, label=""):
 __all__ = [
     "get_vectorized_partition",
     "generate_with_watermark",
+    "generate_with_watermark_full_vocab_sample",
     "generate_baseline",
     "recover_bitstream",
     "recover_bitstream_from_text",
