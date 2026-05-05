@@ -30,14 +30,14 @@ def generate_with_watermark(
     bit_index_to_token_id = [-1] * len(secret_bitstream)
     running_mean_p, p_count = 0.0, 0
 
-    def _sample_modified_token(probs, mask_A, p, q, random_bit):
+    def _argmax_modified_token(probs, mask_A, p, q, random_bit):
         modified = probs.clone()
         choose_set_A = (random_bit == 0) if random.random() < (2 * q) else (p > 0.5)
         if choose_set_A:
             modified[~mask_A] = 0
         else:
             modified[mask_A] = 0
-        return torch.multinomial(modified / modified.sum(), num_samples=1)
+        return torch.argmax(modified).unsqueeze(0)
 
     # Incremental decoding with KV cache avoids full-sequence forward each step.
     model_kwargs = {"use_cache": True}
@@ -58,7 +58,7 @@ def generate_with_watermark(
         p_count += 1
         running_mean_p += (p - running_mean_p) / p_count
         
-        next_token_id_wm = _sample_modified_token(
+        next_token_id_wm = _argmax_modified_token(
             probs_wm, mask_A, p, min(p, 1 - p), secret_bitstream[bit_index]
         )
         tid = int(next_token_id_wm.item())
@@ -121,10 +121,6 @@ def generate_baseline(
     max_new_tokens: int,
     device: str = "cpu",
 ) -> str:
-    """
-    Greedy unwatermarked generation (deterministic for fixed model+prompt) used to derive
-    the attribute vector x. Match this to what verifiers will reproduce.
-    """
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     prompt_len = inputs["input_ids"].shape[1]
     pad_id = getattr(tokenizer, "pad_token_id", None)
