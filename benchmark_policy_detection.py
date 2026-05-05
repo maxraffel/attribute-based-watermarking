@@ -1,46 +1,40 @@
 """
-Watermarking benchmark: multiple prompts, repeated runs, one summary table per prompt.
+Policy-detection benchmark: same end-to-end flow as ``app.py`` (generate → verify ``derive_x`` →
+issue unconstrained + one constrained key per closed-vocabulary label → CPRF seed checks →
+``master_detect`` / ``detect`` on good transcript → negative-control ``master_detect`` on decoy).
 
-For each prompt and run: ``generate`` → issue unconstrained, matching-policy, and unrelated
-keys → ``master_detect`` plus three ``detect`` calls. Records success counts, BER (recovered vs
-embedded PRC bits from ``generate``), timings (baseline vs watermarked generation from
-``watermarking.generate``), and whether encode-time ``attr_x`` exactly equals verify-time
-``derive_x`` on the watermarked text (count of perfect matches per prompt over runs).
-Also reports **KPI/x**: among runs with a perfect ``x`` match, how often all detection KPIs
-passed; and **total wall time** per operation summed over the whole benchmark (footer).
+Runs many trials over configurable prompts and code length with a Rich **progress bar** (transient).
+Per-trial logging is minimal; results are **aggregated into tables**: per-prompt TPR/FNR/TNR/FPR for
+policy ``detect`` vs NLI-recovered attribute expectation, counts of which protocol stages matched,
+and mean wall time per pipeline stage.
 
-CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, optional ``--llm-model HF_HUB_ID``
-(HF causal LM for ``watermarking``; overrides ``WATERMARK_LLM_ID`` for this process), and repeatable
-``--prompt-case id:prompt`` (split on first ``:`` only). If no cases are given, two defaults are used.
-While trials run, a **Rich progress bar** shows completion; it clears when the benchmark finishes
-(``transient``). Non-TTY / captured stdout (e.g. Colab ``subprocess.run(..., capture_output=True)``)
-prints a **plain-text** results table automatically; set ``BENCHMARK_PLAIN_TABLE=0`` to force the Rich
-table anyway, or ``=1`` to force plain text even on a TTY. ``BENCHMARK_CONSOLE_WIDTH`` /
-``BENCHMARK_CONSOLE_HEIGHT`` tune the Rich console when stdout is not a TTY.
+CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, optional ``--llm-model``,
+repeatable ``--prompt-case id:prompt``. Env: ``BENCHMARK_PLAIN_TABLE``, ``BENCHMARK_CONSOLE_*``
+(see ``make_benchmark_console`` / ``_use_plain_table``).
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
-from typing import Sequence
+from dataclasses import dataclass, field
+from typing import Any, Sequence
 
 from rich.console import Console
 from rich.progress import track
 from rich.table import Table
 
+import attr_x_nli
+import randrecover
+import watermarking as wm
+from closed_vocab import VOCABULARY, active_labels_from_verify_x
+
 
 def make_benchmark_console() -> Console:
-    """
-    When stdout is a **real TTY**, use the terminal's size (do not force a wide floor — that
-    reflows badly in <168-column terminals). When stdout is **not** a TTY (piped / Colab
-    ``capture_output``), set explicit dimensions so Rich's own ``print`` helpers still measure
-    consistently; the results table itself switches to plain text (see ``_use_plain_table()``).
-    """
     floor_w = int(os.environ.get("BENCHMARK_CONSOLE_WIDTH", "168"))
     floor_h = int(os.environ.get("BENCHMARK_CONSOLE_HEIGHT", "120"))
     try:
@@ -57,7 +51,6 @@ def make_benchmark_console() -> Console:
 
 
 def _use_plain_table() -> bool:
-    """Rich boxed tables ellipsize badly under captured/piped stdout; use fixed-width text."""
     v = os.environ.get("BENCHMARK_PLAIN_TABLE", "").strip().lower()
     if v in ("1", "true", "yes", "always"):
         return True
@@ -69,7 +62,8 @@ def _use_plain_table() -> bool:
 DEFAULT_PROMPT_CASES: list[tuple[str, str]] = [
     (
         "patriots_qbs",
-            "Explain why Tom Brady is the GOAT, and why Drake Maye is an upcoming star in football."
+        "Explain why Tom Brady is the GOAT, and why Drake Maye is an upcoming star in football, "
+        "in a brief paragraph for each, comparing their football legacies.",
     ),
 ]
 
@@ -95,184 +89,553 @@ def _ber_percent(secret: list[int], recovered: list[int]) -> float:
     return 100.0 * errs / n
 
 
+def _rates(tp: int, fn: int, tn: int, fp: int) -> tuple[float, float, float, float]:
+    """Return TPR, FNR, TNR, FPR in [0,1] or -1 if denominator zero."""
+    tpr = (tp / (tp + fn)) if (tp + fn) > 0 else -1.0
+    fnr = (fn / (tp + fn)) if (tp + fn) > 0 else -1.0
+    tnr = (tn / (tn + fp)) if (tn + fp) > 0 else -1.0
+    fpr = (fp / (tn + fp)) if (tn + fp) > 0 else -1.0
+    return tpr, fnr, tnr, fpr
+
+
+def _fmt_rate(x: float) -> str:
+    if x < 0:
+        return "n/a"
+    return f"{100.0 * x:.2f}%"
+
+
+@dataclass
+class TimingTotals:
+    t_setup: float = 0.0
+    t_baseline_gen: float = 0.0
+    t_wm_gen: float = 0.0
+    t_derive_verify: float = 0.0
+    t_issue_keys: float = 0.0
+    t_cprf_checks: float = 0.0
+    t_master_good: float = 0.0
+    t_detect_open: float = 0.0
+    t_detect_per_label: float = 0.0
+    t_negative_control: float = 0.0
+
+
 @dataclass
 class PromptRollup:
-    """Accumulated stats for one prompt id across runs."""
+    """Aggregates over all runs for one prompt id."""
 
     runs: int = 0
-    master_ok: int = 0
-    open_ok: int = 0
-    accept_ok: int = 0
-    reject_correct: int = 0
+    #: Per-label policy decisions: gold = (label in verify-time active set), pred = detect True.
+    tp: int = 0
+    fn: int = 0
+    tn: int = 0
+    fp: int = 0
+
+    x_perfect: int = 0
+    master_good: int = 0
+    open_detect_good: int = 0
+    unconstrained_cprf_ok: int = 0
+    cprf_per_label_expect_ok: int = 0
+    cprf_per_label_checks: int = 0
+    control_correct: int = 0
+
     ber_sum: float = 0.0
-    x_perfect_match: int = 0
-    #: Runs where x matched *and* master/open/accept/reject KPIs all succeeded.
-    full_kpi_when_x_perfect: int = 0
-    t_baseline_sum: float = 0.0
-    t_wm_sum: float = 0.0
-    t_issue_sum: float = 0.0
-    t_master_sum: float = 0.0
-    t_open_sum: float = 0.0
-    t_accept_sum: float = 0.0
-    t_reject_sum: float = 0.0
+
+    #: When policy detect differs from attribute-based expectation — likely cause buckets.
+    mismatch_total: int = 0
+    mismatch_cprf_heuristic_ok: int = 0  # seed_match aligned with CPRF-vs-attribute expectation
+    mismatch_cprf_heuristic_bad: int = 0  # CPRF equality disagreed with attribute-based seed expectation
+    mismatch_fn_with_matching_seeds: int = 0  # expect True, got False, seeds matched
+    mismatch_fn_with_split_seeds: int = 0
+    mismatch_fp_with_matching_seeds: int = 0  # expect False, got True, seeds matched (e.g. composite m)
+    mismatch_fp_with_split_seeds: int = 0  # LDPC false positive suspect
+
+    timings: TimingTotals = field(default_factory=TimingTotals)
 
     def add_run(
         self,
         *,
+        word_stats: list[dict[str, Any]],
+        x_perfect: bool,
         master_ok: bool,
         open_ok: bool,
-        accept_ok: bool,
-        reject_got_true: bool,
+        unconstrained_cprf_ok: bool,
+        cprf_per_label_ok: int,
+        cprf_per_label_n: int,
+        control_ok: bool,
         ber: float,
-        x_perfect: bool,
-        t_baseline: float,
-        t_wm: float,
-        t_issue: float,
-        t_master: float,
-        t_open: float,
-        t_accept: float,
-        t_reject: float,
+        timings: TimingTotals,
     ) -> None:
         self.runs += 1
-        if master_ok:
-            self.master_ok += 1
-        if open_ok:
-            self.open_ok += 1
-        if accept_ok:
-            self.accept_ok += 1
-        if not reject_got_true:
-            self.reject_correct += 1
-        self.ber_sum += ber
         if x_perfect:
-            self.x_perfect_match += 1
-        if x_perfect and master_ok and open_ok and accept_ok and (not reject_got_true):
-            self.full_kpi_when_x_perfect += 1
-        self.t_baseline_sum += t_baseline
-        self.t_wm_sum += t_wm
-        self.t_issue_sum += t_issue
-        self.t_master_sum += t_master
-        self.t_open_sum += t_open
-        self.t_accept_sum += t_accept
-        self.t_reject_sum += t_reject
+            self.x_perfect += 1
+        if master_ok:
+            self.master_good += 1
+        if open_ok:
+            self.open_detect_good += 1
+        if unconstrained_cprf_ok:
+            self.unconstrained_cprf_ok += 1
+        self.cprf_per_label_expect_ok += cprf_per_label_ok
+        self.cprf_per_label_checks += cprf_per_label_n
+        if control_ok:
+            self.control_correct += 1
+        self.ber_sum += ber
+
+        for row in word_stats:
+            exp = bool(row["expect_detect"])
+            got = bool(row["got_detect"])
+            if exp and got:
+                self.tp += 1
+            elif exp and not got:
+                self.fn += 1
+            elif not exp and not got:
+                self.tn += 1
+            else:
+                self.fp += 1
+
+            if got != exp:
+                self.mismatch_total += 1
+                sm = bool(row["seed_match"])
+                em = bool(row["expect_seed_match"])
+                if sm == em:
+                    self.mismatch_cprf_heuristic_ok += 1
+                else:
+                    self.mismatch_cprf_heuristic_bad += 1
+                if exp and not got:
+                    if sm:
+                        self.mismatch_fn_with_matching_seeds += 1
+                    else:
+                        self.mismatch_fn_with_split_seeds += 1
+                if not exp and got:
+                    if sm:
+                        self.mismatch_fp_with_matching_seeds += 1
+                    else:
+                        self.mismatch_fp_with_split_seeds += 1
+
+        self.timings.t_setup += timings.t_setup
+        self.timings.t_baseline_gen += timings.t_baseline_gen
+        self.timings.t_wm_gen += timings.t_wm_gen
+        self.timings.t_derive_verify += timings.t_derive_verify
+        self.timings.t_issue_keys += timings.t_issue_keys
+        self.timings.t_cprf_checks += timings.t_cprf_checks
+        self.timings.t_master_good += timings.t_master_good
+        self.timings.t_detect_open += timings.t_detect_open
+        self.timings.t_detect_per_label += timings.t_detect_per_label
+        self.timings.t_negative_control += timings.t_negative_control
 
 
-def _fmt_kpi_rate_given_x(r: PromptRollup) -> str:
-    """Full KPI successes among runs where encode-time x equals verify-time x."""
-    nx = r.x_perfect_match
-    if nx == 0:
-        return "    n/a"
-    return f"{r.full_kpi_when_x_perfect}/{nx}".rjust(7)
+def _derive_x_verify(wm_text: str, modulus: int) -> list[int]:
+    try:
+        return attr_x_nli.derive_x(
+            wm_text,
+            modulus,
+            log_nli_scores=False,
+            nli_scores_out={},
+        )
+    except TypeError:
+        return attr_x_nli.derive_x(wm_text, modulus)
 
 
-def _aggregate_timings(
-    roll: dict[str, PromptRollup], prompt_cases: Sequence[tuple[str, str]]
+def run_one_trial(
+    sk: Any,
+    prompt: str,
+) -> tuple[
+    list[dict[str, Any]],
+    bool,
+    bool,
+    bool,
+    int,
+    int,
+    bool,
+    float,
+    TimingTotals,
+    bool,
+]:
+    """
+    One full app.py-shaped trial. Returns word-level rows, flags, CPRF sub-counts, BER, timings,
+    and whether unconstrained CPRF seeds matched.
+    """
+    tt = TimingTotals()
+
+    out = wm.generate(sk, prompt)
+    wm_text = out["generated_text_wm"]
+    x_encode = list(out["attr_x"])
+    secret = list(out["prc_secret_bits"])
+    t_baseline = float(out["seconds_baseline_gen"])
+    t_wm = float(out["seconds_watermarked_gen"])
+    tt.t_baseline_gen = t_baseline
+    tt.t_wm_gen = t_wm
+
+    t_d0 = time.perf_counter()
+    x_verify = _derive_x_verify(wm_text, sk.modulus)
+    tt.t_derive_verify = time.perf_counter() - t_d0
+
+    active_wm = active_labels_from_verify_x(x_verify, sk.modulus)
+    active_set = set(active_wm)
+    x_perfect = x_encode == x_verify
+
+    t_k0 = time.perf_counter()
+    dk_open = wm.issue_unconstrained(sk)
+    dk_by_word = {w: wm.issue_keyword_policy(sk, [w]) for w in VOCABULARY}
+    tt.t_issue_keys = time.perf_counter() - t_k0
+
+    xl = list(x_verify)
+    t_c0 = time.perf_counter()
+    em_master = sk.eval(xl)
+    ec_open = dk_open.c_eval(xl)
+    em_open_m = em_master == ec_open
+    cprf_per_label_ok = 0
+    cprf_per_label_n = len(VOCABULARY)
+    seed_match_by_word: dict[str, bool] = {}
+    for w in VOCABULARY:
+        dk = dk_by_word[w]
+        expect_sm = w in active_set
+        sm = em_master == dk.c_eval(xl)
+        seed_match_by_word[w] = sm
+        if sm == expect_sm:
+            cprf_per_label_ok += 1
+    tt.t_cprf_checks = time.perf_counter() - t_c0
+
+    t_m0 = time.perf_counter()
+    m_ok, m_bits = wm.master_detect(sk, wm_text)
+    tt.t_master_good = time.perf_counter() - t_m0
+    ber = _ber_percent(secret, m_bits)
+
+    t_u0 = time.perf_counter()
+    u_ok, _ = wm.detect(dk_open, wm_text)
+    tt.t_detect_open = time.perf_counter() - t_u0
+
+    word_stats: list[dict[str, Any]] = []
+    t_pv0 = time.perf_counter()
+    for w in VOCABULARY:
+        expect_detect = w in active_set
+        got, _ = wm.detect(dk_by_word[w], wm_text)
+        word_stats.append(
+            {
+                "word": w,
+                "expect_detect": expect_detect,
+                "got_detect": got,
+                "expect_seed_match": expect_detect,
+                "seed_match": seed_match_by_word[w],
+            }
+        )
+    tt.t_detect_per_label = time.perf_counter() - t_pv0
+
+    t_nc0 = time.perf_counter()
+    assert wm.TOKENIZER is not None and wm.MODEL is not None
+    wrong = randrecover.negative_control_transcript_like(
+        wm_text,
+        wm.TOKENIZER,
+        wm.DEVICE,
+        n_bits=wm.SECURITY_PARAM,
+        model=wm.MODEL,
+    )
+    ctrl_ok_raw, _ = wm.master_detect(sk, wrong)
+    control_ok = not bool(ctrl_ok_raw)
+    tt.t_negative_control = time.perf_counter() - t_nc0
+
+    return (
+        word_stats,
+        x_perfect,
+        bool(m_ok),
+        bool(u_ok),
+        cprf_per_label_ok,
+        cprf_per_label_n,
+        control_ok,
+        ber,
+        tt,
+        em_open_m,
+    )
+
+
+def _mean_timings(r: PromptRollup) -> dict[str, float]:
+    n = r.runs
+    if n == 0:
+        return {}
+    t = r.timings
+    keys = (
+        "t_setup",
+        "t_baseline_gen",
+        "t_wm_gen",
+        "t_derive_verify",
+        "t_issue_keys",
+        "t_cprf_checks",
+        "t_master_good",
+        "t_detect_open",
+        "t_detect_per_label",
+        "t_negative_control",
+    )
+    return {k: getattr(t, k) / n for k in keys}
+
+
+def _aggregate_timing_means(
+    roll: dict[str, PromptRollup],
+    prompt_cases: Sequence[tuple[str, str]],
 ) -> dict[str, float]:
-    out = {k: 0.0 for k in (
-        "t_baseline",
-        "t_wm",
-        "t_issue",
-        "t_master",
-        "t_open",
-        "t_accept",
-        "t_reject",
+    """Grand mean over all runs (all prompts): sum component / total runs."""
+    total_runs = 0
+    acc = {k: 0.0 for k in (
+        "t_setup",
+        "t_baseline_gen",
+        "t_wm_gen",
+        "t_derive_verify",
+        "t_issue_keys",
+        "t_cprf_checks",
+        "t_master_good",
+        "t_detect_open",
+        "t_detect_per_label",
+        "t_negative_control",
     )}
     for sid, _ in prompt_cases:
         r = roll[sid]
-        if r.runs == 0:
+        n = r.runs
+        if n == 0:
             continue
-        out["t_baseline"] += r.t_baseline_sum
-        out["t_wm"] += r.t_wm_sum
-        out["t_issue"] += r.t_issue_sum
-        out["t_master"] += r.t_master_sum
-        out["t_open"] += r.t_open_sum
-        out["t_accept"] += r.t_accept_sum
-        out["t_reject"] += r.t_reject_sum
-    det = (
-        out["t_master"] + out["t_open"] + out["t_accept"] + out["t_reject"]
-    )
-    out["t_detect_total"] = det
-    out["t_grand"] = (
-        out["t_baseline"]
-        + out["t_wm"]
-        + out["t_issue"]
-        + det
-    )
-    return out
+        total_runs += n
+        t = r.timings
+        for k in acc:
+            acc[k] += getattr(t, k)
+    if total_runs == 0:
+        return {**acc, "t_grand_avg": 0.0}
+    for k in acc:
+        acc[k] /= total_runs
+    acc["t_grand_avg"] = sum(acc.values())
+    return acc
 
 
-def _print_aggregate_timings_footer(
-    *,
+def _print_timing_table_plain(
     roll: dict[str, PromptRollup],
     prompt_cases: Sequence[tuple[str, str]],
-    console: Console,
-    plain: bool,
 ) -> None:
-    t = _aggregate_timings(roll, prompt_cases)
-    lines = [
-        "",
-        "Total wall time (sum over every benchmark run; all prompts)",
-        f"  baseline_generation (greedy):     {t['t_baseline']:10.3f} s",
-        f"  watermarked_generation:           {t['t_wm']:10.3f} s",
-        f"  issue_keys (3 policies):        {t['t_issue']:10.3f} s",
-        f"  master_detect:                    {t['t_master']:10.3f} s",
-        f"  detect (unconstrained):         {t['t_open']:10.3f} s",
-        f"  detect (accept policy):         {t['t_accept']:10.3f} s",
-        f"  detect (reject policy):           {t['t_reject']:10.3f} s",
-        f"  detection subtotal (4 calls):   {t['t_detect_total']:10.3f} s",
-        "  --------------------------------------------",
-        f"  all measured operations:        {t['t_grand']:10.3f} s",
-    ]
-    if plain:
-        print("\n".join(lines))
-    else:
-        console.print()
-        for line in lines:
-            if line.startswith("  all measured"):
-                console.print("[bold]" + line + "[/]")
-            else:
-                console.print("[dim]" + line + "[/]")
-
-
-def _print_plain_results_table(
-    *,
-    prompt_cases: Sequence[tuple[str, str]],
-    roll: dict[str, PromptRollup],
-) -> None:
-    w_sid = 26
     print()
-    print("Per-prompt averages over runs")
+    print("Mean wall time per pipeline stage (seconds; averaged over runs per prompt)")
+    w = 18
     header = (
-        f"{'prompt_id':<{w_sid}} {'runs':>5} {'master':>7} {'open':>7} {'accept':>7} "
-        f"{'rej_ok':>7} {'BER%':>7} {'x==':>7} {'KPI/x':>7} "
-        f"{'t_bl':>9} {'t_wm':>9} {'t_key':>9} {'t_det':>9}"
+        f"{'prompt_id':<26}"
+        + "".join(f"{k:>{w}}" for k in (
+            "setup",
+            "baseline",
+            "wm_gen",
+            "derive_x",
+            "issue_keys",
+            "cprf",
+            "m_good",
+            "det_open",
+            "det_vocab",
+            "neg_ctrl",
+        ))
     )
     print(header)
     print("-" * len(header))
 
-    def ratio(k: int, n: int) -> str:
-        return f"{k}/{n}"
+    for sid, _ in prompt_cases:
+        r = roll[sid]
+        if r.runs == 0:
+            continue
+        m = _mean_timings(r)
+        sid_disp = sid if len(sid) <= 26 else sid[:23] + "..."
+        parts = (
+            m.get("t_setup", 0),
+            m["t_baseline_gen"],
+            m["t_wm_gen"],
+            m["t_derive_verify"],
+            m["t_issue_keys"],
+            m["t_cprf_checks"],
+            m["t_master_good"],
+            m["t_detect_open"],
+            m["t_detect_per_label"],
+            m["t_negative_control"],
+        )
+        row = f"{sid_disp:<26}" + "".join(f"{p:>{w}.4f}" for p in parts)
+        print(row)
+
+    gm = _aggregate_timing_means(roll, prompt_cases)
+    print("-" * len(header))
+    print(
+        f"{'ALL (mean / run)':<26}"
+        + f"{gm['t_setup']:>{w}.4f}"
+        + f"{gm['t_baseline_gen']:>{w}.4f}"
+        + f"{gm['t_wm_gen']:>{w}.4f}"
+        + f"{gm['t_derive_verify']:>{w}.4f}"
+        + f"{gm['t_issue_keys']:>{w}.4f}"
+        + f"{gm['t_cprf_checks']:>{w}.4f}"
+        + f"{gm['t_master_good']:>{w}.4f}"
+        + f"{gm['t_detect_open']:>{w}.4f}"
+        + f"{gm['t_detect_per_label']:>{w}.4f}"
+        + f"{gm['t_negative_control']:>{w}.4f}"
+    )
+    print(f"[footer] sum of listed stage means (per run): {gm['t_grand_avg']:.4f} s")
+
+
+def _print_timing_rich_table(
+    roll: dict[str, PromptRollup],
+    prompt_cases: Sequence[tuple[str, str]],
+    console: Console,
+) -> None:
+    console.print()
+    table = Table(
+        title="Mean wall time per pipeline stage (s; avg over runs)",
+    )
+    table.add_column("prompt_id", style="dim")
+    for col in (
+        "setup",
+        "baseline",
+        "wm_gen",
+        "derive_x",
+        "issue_keys",
+        "cprf",
+        "m_good",
+        "det_open",
+        "det_vocab",
+        "neg_ctrl",
+    ):
+        table.add_column(col, justify="right")
+
+    for sid, _ in prompt_cases:
+        r = roll[sid]
+        if r.runs == 0:
+            continue
+        m = _mean_timings(r)
+        table.add_row(
+            sid,
+            f"{m.get('t_setup', 0):.4f}",
+            f"{m['t_baseline_gen']:.4f}",
+            f"{m['t_wm_gen']:.4f}",
+            f"{m['t_derive_verify']:.4f}",
+            f"{m['t_issue_keys']:.4f}",
+            f"{m['t_cprf_checks']:.4f}",
+            f"{m['t_master_good']:.4f}",
+            f"{m['t_detect_open']:.4f}",
+            f"{m['t_detect_per_label']:.4f}",
+            f"{m['t_negative_control']:.4f}",
+        )
+
+    gm = _aggregate_timing_means(roll, prompt_cases)
+    table.add_row(
+        "[bold]ALL/run[/]",
+        f"{gm['t_setup']:.4f}",
+        f"{gm['t_baseline_gen']:.4f}",
+        f"{gm['t_wm_gen']:.4f}",
+        f"{gm['t_derive_verify']:.4f}",
+        f"{gm['t_issue_keys']:.4f}",
+        f"{gm['t_cprf_checks']:.4f}",
+        f"{gm['t_master_good']:.4f}",
+        f"{gm['t_detect_open']:.4f}",
+        f"{gm['t_detect_per_label']:.4f}",
+        f"{gm['t_negative_control']:.4f}",
+    )
+    console.print(table)
+    console.print(f"[dim]Sum of listed stage means per run:[/] {gm['t_grand_avg']:.4f} s")
+
+
+def _print_plain_results(
+    *,
+    prompt_cases: Sequence[tuple[str, str]],
+    roll: dict[str, PromptRollup],
+    vocab_n: int,
+) -> None:
+    print()
+    print(
+        "Per-prompt aggregates: policy detection vs NLI attribute (counts over runs × labels="
+        + str(vocab_n)
+        + ")"
+    )
+    w_sid = 22
+    line = (
+        f"{'id':<{w_sid}} {'runs':>5} {'TPR%':>7} {'FNR%':>7} {'TNR%':>7} {'FPR%':>7} "
+        f"{'x==':>7} {'mast':>6} {'open':>6} {'ucprf':>6} {'lcprf':>6} {'ctrl':>6} "
+        f"{'BER':>8} {'mism':>5} {'m_cp':>4} {'FN_s':>4} {'FP_s':>4}"
+    )
+    print(line)
+    print("-" * len(line))
+
+    def ratio(a: int, b: int) -> str:
+        return f"{a}/{b}"
 
     for sid, _ in prompt_cases:
         r = roll[sid]
         n = r.runs
         if n == 0:
             continue
-        det_avg = (r.t_master_sum + r.t_open_sum + r.t_accept_sum + r.t_reject_sum) / n
+        tpr, fnr, tnr, fpr = _rates(r.tp, r.fn, r.tn, r.fp)
+        lcprf = (
+            ratio(r.cprf_per_label_expect_ok, r.cprf_per_label_checks)
+            if r.cprf_per_label_checks
+            else "n/a"
+        )
+        mism = str(r.mismatch_total) if r.mismatch_total else "0"
         sid_disp = sid if len(sid) <= w_sid else sid[: w_sid - 3] + "..."
-        kpi_x = _fmt_kpi_rate_given_x(r)
         print(
             f"{sid_disp:<{w_sid}} {n:5d} "
-            f"{ratio(r.master_ok, n):>7} {ratio(r.open_ok, n):>7} {ratio(r.accept_ok, n):>7} "
-            f"{ratio(r.reject_correct, n):>7} {r.ber_sum / n:7.2f} {ratio(r.x_perfect_match, n):>7} "
-            f"{kpi_x:>7} "
-            f"{r.t_baseline_sum / n:9.3f} {r.t_wm_sum / n:9.3f} {r.t_issue_sum / n:9.4f} {det_avg:9.4f}"
+            f"{_fmt_rate(tpr):>7} {_fmt_rate(fnr):>7} {_fmt_rate(tnr):>7} {_fmt_rate(fpr):>7} "
+            f"{ratio(r.x_perfect, n):>7} "
+            f"{ratio(r.master_good, n):>6} {ratio(r.open_detect_good, n):>6} "
+            f"{ratio(r.unconstrained_cprf_ok, n):>6} {lcprf:>6} {ratio(r.control_correct, n):>6} "
+            f"{r.ber_sum / n:8.2f} {mism:>5} {r.mismatch_cprf_heuristic_bad:>4} "
+            f"{r.mismatch_fn_with_matching_seeds:>4} {r.mismatch_fp_with_split_seeds:>4}"
         )
+
     print()
     print(
-        "Legend: master/open/accept = successes/runs; rej_ok = correct reject (expect reject=False); "
-        "BER% = mean bit error vs embedded PRC (master recovery); x== = runs with full x match; "
-        "KPI/x = full KPI successes among x-matched runs (n/a if no x match); "
-        "t_bl / t_wm / t_key / t_det = mean seconds."
+        "Legend: TPR/FNR/TNR/FPR from per-(run, vocab label) gold = label in recovered NLI-active set; "
+        "mast/open/ctrl = successes/runs; ucprf = unconstrained CPRF seed match; "
+        "lcprf = fraction of per-label CPRF checks where sk.eval==dk.c_eval matched attribute-based expectation; "
+        "mism = total attribute-vs-detect mismatches; m_cp = mismatches where CPRF seed equality disagreed "
+        "with that expectation (composite modulus heuristic); FN_s = FN with seeds matching anyway (LDPC?); "
+        "FP_s = FP with CPRF seeds split (possible LDPC false positive)."
+    )
+
+
+def _print_rich_results(
+    *,
+    prompt_cases: Sequence[tuple[str, str]],
+    roll: dict[str, PromptRollup],
+    vocab_n: int,
+    console: Console,
+) -> None:
+    console.print()
+    table = Table(
+        title=f"Per-prompt policy metrics (runs × |V|={vocab_n} label decisions per run)",
+    )
+    table.add_column("prompt_id", style="dim")
+    table.add_column("runs", justify="right")
+    for col in ("TPR", "FNR", "TNR", "FPR", "x==", "master", "open", "uCPRF", "lCPRF", "ctrl", "BER%", "mism", "ΔCP", "FN•", "FP•"):
+        table.add_column(col, justify="right")
+
+    for sid, _ in prompt_cases:
+        r = roll[sid]
+        n = r.runs
+        if n == 0:
+            continue
+        tpr, fnr, tnr, fpr = _rates(r.tp, r.fn, r.tn, r.fp)
+        lcprf = (
+            f"{r.cprf_per_label_expect_ok}/{r.cprf_per_label_checks}"
+            if r.cprf_per_label_checks
+            else "n/a"
+        )
+        table.add_row(
+            sid,
+            str(n),
+            _fmt_rate(tpr),
+            _fmt_rate(fnr),
+            _fmt_rate(tnr),
+            _fmt_rate(fpr),
+            f"{r.x_perfect}/{n}",
+            f"{r.master_good}/{n}",
+            f"{r.open_detect_good}/{n}",
+            f"{r.unconstrained_cprf_ok}/{n}",
+            lcprf,
+            f"{r.control_correct}/{n}",
+            f"{r.ber_sum / n:.2f}",
+            str(r.mismatch_total),
+            str(r.mismatch_cprf_heuristic_bad),
+            str(r.mismatch_fn_with_matching_seeds),
+            str(r.mismatch_fp_with_split_seeds),
+        )
+    console.print(table)
+    console.print(
+        "[dim]Gold positive = label in verify-time active set; pred positive = detect True. "
+        "uCPRF = unconstrained sk.eval==dk.c_eval. lCPRF = per-label CPRF expectation hits / checks. "
+        "mism = attribute-vs-detect mismatches; ΔCP = mismatches where CPRF vs attribute expectation disagreed; "
+        "FN• = FN with matching seeds (suspect LDPC); FP• = FP with split seeds (suspect LDPC).[/]"
     )
 
 
@@ -286,118 +649,78 @@ def run_benchmark(
     console: Console,
     llm_model_id: str | None = None,
 ) -> int:
-    import watermarking as wm
-    import attr_x_nli
-    from closed_vocab import (
-        active_labels_from_verify_x,
-        pick_unrelated_keyword_for_policy,
-    )
+    for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
     if llm_model_id is not None and llm_model_id.strip():
         wm.set_llm_model_id(llm_model_id.strip())
 
     wm.set_prc_code_length(code_length)
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
-    sk_shared: dict[str, object] = {}
+    sk_shared: dict[str, Any] = {}
 
+    vocab_n = len(VOCABULARY)
     console.print(
-        f"code_length={wm.SECURITY_PARAM}  modulus={modulus}  runs={runs}  "
-        f"keys={'fresh per run' if fresh_key_per_trial else 'reuse per prompt id'}  "
+        f"code_length={wm.SECURITY_PARAM}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
+        f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
         f"llm={wm.MODEL_ID!r}"
     )
 
-    trials = [(r, sid, prompt) for r in range(runs) for sid, prompt in prompt_cases]
+    trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
     for _, sid, prompt in track(
         trials,
         description="Benchmark",
         console=console,
         transient=True,
     ):
+        t_setup0 = time.perf_counter()
         if fresh_key_per_trial:
             sk = wm.setup(modulus)
         else:
             if sk_shared.get(sid) is None:
                 sk_shared[sid] = wm.setup(modulus)
             sk = sk_shared[sid]
+        t_setup = time.perf_counter() - t_setup0
 
-        out = wm.generate(sk, prompt)
-        text = out["generated_text_wm"]
-        suffix_ids = out["input_ids_wm"][0].tolist()
-        wm_pv = int(out["partition_vocab_dim"])
-        x_gen = out["attr_x"]
-        secret = out["prc_secret_bits"]
-        t_bl = float(out["seconds_baseline_gen"])
-        t_wm = float(out["seconds_watermarked_gen"])
-
-        x_verify = attr_x_nli.derive_x(text, sk.modulus)
-        active = active_labels_from_verify_x(x_verify, sk.modulus)
-        x_perfect = list(x_gen) == list(x_verify)
-
-        t0 = time.perf_counter()
-        dk_open = wm.issue_unconstrained(sk)
-        if active:
-            dk_accept = wm.issue_keyword_policy(sk, list(active))
-        else:
-            dk_accept = wm.issue_keyword_policy(sk, [])
-        unrelated = pick_unrelated_keyword_for_policy(
-            x_verify, sk.modulus, set(active)
-        )
-        dk_reject = wm.issue_keyword_policy(sk, [unrelated])
-        t_issue = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        m_ok, m_bits = wm.master_detect(
-            sk,
-            text,
-            recovery_suffix_token_ids=suffix_ids,
-            partition_vocab_dim=wm_pv,
-        )
-        t_m = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        u_ok, _ = wm.detect(
-            dk_open,
-            text,
-            recovery_suffix_token_ids=suffix_ids,
-            partition_vocab_dim=wm_pv,
-        )
-        t_u = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        a_ok, _ = wm.detect(
-            dk_accept,
-            text,
-            recovery_suffix_token_ids=suffix_ids,
-            partition_vocab_dim=wm_pv,
-        )
-        t_a = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        r_ok, _ = wm.detect(
-            dk_reject,
-            text,
-            recovery_suffix_token_ids=suffix_ids,
-            partition_vocab_dim=wm_pv,
-        )
-        t_r = time.perf_counter() - t0
-
-        ber = _ber_percent(secret, m_bits)
+        (
+            word_stats,
+            x_perfect,
+            master_ok,
+            open_ok,
+            cprf_label_ok,
+            cprf_label_n,
+            control_ok,
+            ber,
+            tt_inner,
+            em_open_m,
+        ) = run_one_trial(sk, prompt)
+        tt_inner.t_setup = t_setup
 
         roll[sid].add_run(
-            master_ok=bool(m_ok),
-            open_ok=bool(u_ok),
-            accept_ok=bool(a_ok),
-            reject_got_true=bool(r_ok),
-            ber=ber,
+            word_stats=word_stats,
             x_perfect=x_perfect,
-            t_baseline=t_bl,
-            t_wm=t_wm,
-            t_issue=t_issue,
-            t_master=t_m,
-            t_open=t_u,
-            t_accept=t_a,
-            t_reject=t_r,
+            master_ok=master_ok,
+            open_ok=open_ok,
+            unconstrained_cprf_ok=em_open_m,
+            cprf_per_label_ok=cprf_label_ok,
+            cprf_per_label_n=cprf_label_n,
+            control_ok=control_ok,
+            ber=ber,
+            timings=tt_inner,
         )
+
+    plain = _use_plain_table()
+    if plain:
+        _print_plain_results(prompt_cases=prompt_cases, roll=roll, vocab_n=vocab_n)
+    else:
+        _print_rich_results(
+            prompt_cases=prompt_cases, roll=roll, vocab_n=vocab_n, console=console
+        )
+
+    if plain:
+        _print_timing_table_plain(roll, prompt_cases)
+    else:
+        _print_timing_rich_table(roll, prompt_cases, console)
 
     all_ok = True
     for sid, _ in prompt_cases:
@@ -405,114 +728,63 @@ def run_benchmark(
         n = r.runs
         if n == 0:
             continue
-        all_ok = all_ok and (
-            r.master_ok == n and r.open_ok == n and r.accept_ok == n and r.reject_correct == n
+        ok = (
+            r.master_good == n
+            and r.open_detect_good == n
+            and r.unconstrained_cprf_ok == n
+            and r.control_correct == n
         )
+        all_ok = all_ok and ok
 
-    console.print()
-    if _use_plain_table():
-        _print_plain_results_table(prompt_cases=prompt_cases, roll=roll)
-    else:
-        table = Table(title="Per-prompt averages over runs")
-        table.add_column("prompt_id", style="dim")
-        table.add_column("runs", justify="right")
-        table.add_column("master", justify="right")
-        table.add_column("open", justify="right")
-        table.add_column("accept", justify="right")
-        table.add_column("rej_ok", justify="right")
-        table.add_column("BER%", justify="right")
-        table.add_column("x==", justify="right")
-        table.add_column("KPI/x", justify="right")
-        table.add_column("t_bl", justify="right")
-        table.add_column("t_wm", justify="right")
-        table.add_column("t_key", justify="right")
-        table.add_column("t_det", justify="right")
-        for sid, _ in prompt_cases:
-            r = roll[sid]
-            n = r.runs
-            if n == 0:
-                continue
-            det_avg = (r.t_master_sum + r.t_open_sum + r.t_accept_sum + r.t_reject_sum) / n
-            table.add_row(
-                sid,
-                str(n),
-                f"{r.master_ok}/{n}",
-                f"{r.open_ok}/{n}",
-                f"{r.accept_ok}/{n}",
-                f"{r.reject_correct}/{n}",
-                f"{r.ber_sum / n:.2f}",
-                f"{r.x_perfect_match}/{n}",
-                _fmt_kpi_rate_given_x(r).strip(),
-                f"{r.t_baseline_sum / n:.3f}",
-                f"{r.t_wm_sum / n:.3f}",
-                f"{r.t_issue_sum / n:.4f}",
-                f"{det_avg:.4f}",
-            )
-        console.print(table)
-        console.print(
-            "[dim]master/open/accept = successes / runs; rej_ok = correct reject (expect False). "
-            "BER% = mean bit error vs embedded PRC stream (master path recovery). "
-            "x== = runs where encode-time attr_x equals verify-time derive_x (full vector). "
-            "KPI/x = full KPI successes among x-matched runs (n/a if none). "
-            "t_bl / t_wm = mean baseline vs watermarked gen seconds from generate(). "
-            "t_key = mean issue time; t_det = mean total of four detection calls.[/]"
-        )
     if not all_ok:
-        if _use_plain_table():
+        msg = (
+            "Protocol checks did not pass on every run (require: master_detect good, detect open, "
+            "unconstrained CPRF match, negative control rejects)."
+        )
+        if plain:
             print()
-            print(
-                "Exiting with code 1: at least one run did not meet all KPI checks "
-                "(master + unconstrained + policy-accept must succeed; policy-reject must fail)."
-            )
+            print(msg)
             for sid, _ in prompt_cases:
                 r = roll[sid]
                 n = r.runs
                 if n == 0:
                     continue
                 bad: list[str] = []
-                if r.master_ok < n:
-                    bad.append(f"master {r.master_ok}/{n}")
-                if r.open_ok < n:
-                    bad.append(f"open {r.open_ok}/{n}")
-                if r.accept_ok < n:
-                    bad.append(f"accept {r.accept_ok}/{n}")
-                if r.reject_correct < n:
-                    bad.append(f"reject_false_positive {n - r.reject_correct}/{n}")
+                if r.master_good < n:
+                    bad.append(f"master {r.master_good}/{n}")
+                if r.open_detect_good < n:
+                    bad.append(f"open {r.open_detect_good}/{n}")
+                if r.unconstrained_cprf_ok < n:
+                    bad.append(f"u_cprf {r.unconstrained_cprf_ok}/{n}")
+                if r.control_correct < n:
+                    bad.append(f"control {r.control_correct}/{n}")
                 if bad:
                     print(f"  {sid}: " + ", ".join(bad))
         else:
-            console.print(
-                "[bold red]Exiting with code 1:[/] at least one run did not meet all KPI checks "
-                "(master + unconstrained + policy-accept must succeed; policy-reject must fail)."
-            )
+            console.print()
+            console.print(f"[bold red]{msg}[/]")
             for sid, _ in prompt_cases:
                 r = roll[sid]
                 n = r.runs
                 if n == 0:
                     continue
                 bad: list[str] = []
-                if r.master_ok < n:
-                    bad.append(f"master {r.master_ok}/{n}")
-                if r.open_ok < n:
-                    bad.append(f"open {r.open_ok}/{n}")
-                if r.accept_ok < n:
-                    bad.append(f"accept {r.accept_ok}/{n}")
-                if r.reject_correct < n:
-                    bad.append(f"reject_false_positive {n - r.reject_correct}/{n}")
+                if r.master_good < n:
+                    bad.append(f"master {r.master_good}/{n}")
+                if r.open_detect_good < n:
+                    bad.append(f"open {r.open_detect_good}/{n}")
+                if r.unconstrained_cprf_ok < n:
+                    bad.append(f"u_cprf {r.unconstrained_cprf_ok}/{n}")
+                if r.control_correct < n:
+                    bad.append(f"control {r.control_correct}/{n}")
                 if bad:
                     console.print(f"  [yellow]{sid}:[/] " + ", ".join(bad))
-
-    _print_aggregate_timings_footer(
-        roll=roll,
-        prompt_cases=prompt_cases,
-        console=console,
-        plain=_use_plain_table(),
-    )
 
     return 0 if all_ok else 1
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--runs", type=int, default=10)
     p.add_argument("--code-length", type=int, default=300, metavar="N")
@@ -520,7 +792,7 @@ def main() -> int:
     p.add_argument(
         "--reuse-key",
         action="store_true",
-        help="Reuse one master key per prompt id across runs",
+        help="Reuse one master key per prompt id across runs (default is fresh key every trial).",
     )
     p.add_argument(
         "--prompt-case",
