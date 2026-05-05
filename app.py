@@ -178,7 +178,7 @@ def main() -> int:
     secret: List[int] = list(out["prc_secret_bits"])
     t_bl = float(out["seconds_baseline_gen"])
     t_wm = float(out["seconds_watermarked_gen"])
-    _log_text(c, "Baseline (greedy) text", baseline_text)
+    _log_text(c, "Baseline (HF sample) text", baseline_text)
     _log_text(c, "Watermarked generated text", wm_text)
     c.print(
         f"  [dim]seconds_baseline_gen[/]=[cyan]{t_bl:.4f}[/]  "

@@ -1,8 +1,14 @@
-import torch
-from transformers import AutoTokenizer
+from __future__ import annotations
+
 import hashlib
+import inspect
 import random
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer
+from transformers.generation.logits_process import LogitsProcessorList
 
 def get_vectorized_partition(vocab_size: int, device: str, seed_index: int) -> torch.BoolTensor:
     """Generates a boolean mask for the entire vocabulary using a deterministic seed."""
@@ -12,13 +18,149 @@ def get_vectorized_partition(vocab_size: int, device: str, seed_index: int) -> t
     g.manual_seed(seed)
     return torch.rand(vocab_size, generator=g, device=device) > 0.5
 
+
+def _tokenizer_pad_token_id(tokenizer: AutoTokenizer) -> int:
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", None)
+    if pad_id is None:
+        raise ValueError("tokenizer has no pad_token_id or eos_token_id for generation")
+    return int(pad_id)
+
+
+def encode_prompt_for_generation(
+    tokenizer: AutoTokenizer,
+    user_prompt: str,
+    device: str | torch.device,
+) -> Dict[str, torch.Tensor]:
+    """
+    Build model inputs for causal generation: apply the tokenizer's ``chat_template``
+    (user turn + ``add_generation_prompt``) when defined, else plain ``tokenizer(...)``.
+
+    ``prompt_len`` for slicing new tokens is ``input_ids.shape[1]`` of the returned batch
+    (includes the full templated prefix).
+    """
+    dev = torch.device(device) if isinstance(device, str) else device
+    if getattr(tokenizer, "chat_template", None) is None:
+        batch = tokenizer(user_prompt, return_tensors="pt")
+    else:
+        messages = [{"role": "user", "content": user_prompt}]
+        out = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt",
+        )
+        if isinstance(out, torch.Tensor):
+            input_ids = out
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
+            batch = {
+                "input_ids": input_ids,
+                "attention_mask": torch.ones_like(input_ids, dtype=torch.long),
+            }
+        else:
+            batch = dict(out)
+            if "attention_mask" not in batch and "input_ids" in batch:
+                batch["attention_mask"] = torch.ones_like(batch["input_ids"], dtype=torch.long)
+    return {k: v.to(dev) for k, v in batch.items()}
+
+
+def _prepare_sampling_logits_processor(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    prompt_inputs: Dict[str, torch.Tensor],
+    *,
+    decode_horizon: int,
+    generation_extra: Dict[str, Any] | None = None,
+) -> LogitsProcessorList:
+    """
+    Build the ``LogitsProcessorList`` used by ``model.generate(do_sample=True, ...)`` so
+    manual sampling uses the same post-processed scores as HF (temperature, top-k/p, repetition
+    penalty, etc.). ``prompt_inputs`` should match ``encode_prompt_for_generation`` (chat prefix
+    when ``tokenizer.chat_template`` is set). Mirrors the ``generate`` preparation path in
+    transformers 5.x.
+    """
+    device = prompt_inputs["input_ids"].device
+    pad_id = _tokenizer_pad_token_id(tokenizer)
+    prep_kwargs: Dict[str, Any] = {
+        **prompt_inputs,
+        "max_new_tokens": decode_horizon,
+        "do_sample": True,
+        "pad_token_id": pad_id,
+        "use_cache": True,
+    }
+    if generation_extra:
+        prep_kwargs.update(generation_extra)
+
+    generation_config, model_kwargs = model._prepare_generation_config(None, **prep_kwargs)
+
+    inputs_tensor, model_input_name, model_kwargs = model._prepare_model_inputs(
+        None,
+        generation_config.bos_token_id,
+        model_kwargs,
+    )
+    kwargs_has_attention_mask = model_kwargs.get("attention_mask") is not None
+    model._prepare_special_tokens(generation_config, kwargs_has_attention_mask, device=device)
+
+    accepts_attention_mask = "attention_mask" in set(inspect.signature(model.forward).parameters.keys())
+    if (
+        not kwargs_has_attention_mask
+        and accepts_attention_mask
+        and not model.config.is_encoder_decoder
+    ):
+        model_kwargs["attention_mask"] = model._prepare_attention_mask_for_generation(
+            inputs_tensor, generation_config, model_kwargs
+        )
+
+    if model.config.is_encoder_decoder:
+        raise NotImplementedError("encoder-decoder models are not supported for watermarked incremental decode")
+    if model_input_name != "input_ids":
+        model_kwargs.pop("input_ids")
+    input_ids_seq_length = int(inputs_tensor.shape[1])
+
+    has_default_max_length = (
+        prep_kwargs.get("max_length") is None
+        and model.generation_config.max_length is None
+    )
+    has_default_min_length = (
+        prep_kwargs.get("min_length") is None
+        and model.generation_config.min_length is None
+    )
+    generation_config = model._prepare_generated_length(
+        generation_config=generation_config,
+        has_default_max_length=has_default_max_length,
+        has_default_min_length=has_default_min_length,
+        model_input_name=model_input_name,
+        input_ids_length=input_ids_seq_length,
+        inputs_tensor=inputs_tensor,
+    )
+
+    logits_processor = model._get_logits_processor(
+        generation_config=generation_config,
+        input_ids_seq_length=input_ids_seq_length,
+        encoder_input_ids=inputs_tensor,
+        device=inputs_tensor.device,
+        model_kwargs=model_kwargs,
+    )
+    return logits_processor
+
+
+def _scores_to_next_token_probs(
+    logits_last: torch.Tensor,
+    input_ids_for_proc: torch.Tensor,
+    logits_processor: LogitsProcessorList,
+) -> torch.Tensor:
+    """Match ``GenerationMixin._sample`` (last-step logits -> processor -> softmax)."""
+    next_logits = logits_last.unsqueeze(0).to(copy=True, dtype=torch.float32, device=input_ids_for_proc.device)
+    next_scores = logits_processor(input_ids_for_proc, next_logits)
+    return F.softmax(next_scores, dim=-1).squeeze(0)
+
+
 def _sample_modified_token_partition(
     probs: torch.Tensor, mask_A: torch.BoolTensor, p: float, q: float, random_bit: int
 ) -> torch.Tensor:
-    """
-    Same half-space choice as the former argmax path, but draw ``next_token`` from the
-    renormalized distribution restricted to the chosen side of ``mask_A``.
-    """
+    """Pick a half-space from ``mask_A`` (bit + randomness), then multinomial on renormalized ``probs``."""
     choose_set_A = (random_bit == 0) if random.random() < (2 * q) else (p > 0.5)
     if choose_set_A:
         modified = torch.where(mask_A, probs, torch.zeros_like(probs))
@@ -41,24 +183,33 @@ def _generate_watermark_incremental(
     track_token_alignment: bool,
     *,
     full_vocab_only: bool,
+    generation_extra: Dict[str, Any] | None = None,
 ) -> Dict:
     """
     Shared KV-cache loop: stop once ``len(secret_bitstream)`` non-special tokens have
-    advanced ``bit_index``. If ``full_vocab_only``, sample from full ``softmax(logits)``
-    each step (bits unused for decoding). Otherwise partition + bit-driven half-space
-    sampling via ``_sample_modified_token_partition``.
+    advanced ``bit_index``. Sampling uses Hugging Face ``generate`` logits processing
+    (same as ``do_sample=True``), then either full-vocab multinomial or partition-based
+    half-space sampling via ``_sample_modified_token_partition``.
     """
     special_ids = set(getattr(tokenizer, "all_special_ids", []))
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    inputs = encode_prompt_for_generation(tokenizer, prompt, device)
     input_ids_wm = inputs["input_ids"].clone()
-    prompt_len = inputs["input_ids"].shape[1]
+    prompt_len = int(inputs["input_ids"].shape[1])
     attn_mask = inputs.get("attention_mask", None)
+
+    logits_processor = _prepare_sampling_logits_processor(
+        model,
+        tokenizer,
+        inputs,
+        decode_horizon=len(secret_bitstream),
+        generation_extra=generation_extra,
+    )
 
     bit_index = 0
     bit_index_to_token_id = [-1] * len(secret_bitstream)
     running_mean_p, p_count = 0.0, 0
 
-    model_kwargs = {"use_cache": True}
+    model_kwargs: Dict[str, Any] = {"use_cache": True}
     if attn_mask is not None:
         model_kwargs["attention_mask"] = attn_mask
     step_input_ids = input_ids_wm
@@ -67,7 +218,7 @@ def _generate_watermark_incremental(
         with torch.no_grad():
             outputs = model(input_ids=step_input_ids, **model_kwargs)
             logits_wm = outputs.logits[0, -1, :]
-            probs_wm = torch.softmax(logits_wm, dim=-1)
+            probs_wm = _scores_to_next_token_probs(logits_wm, input_ids_wm, logits_processor)
             model_kwargs["past_key_values"] = outputs.past_key_values
 
         if full_vocab_only:
@@ -142,8 +293,10 @@ def generate_with_watermark(
     secret_bitstream: List[int],
     device: str = "cpu",
     track_token_alignment: bool = False,
+    *,
+    generation_extra: Dict[str, Any] | None = None,
 ) -> Dict:
-    """Partitioned vocabulary + bit-driven half-space; next token is **sampled** (not argmax)."""
+    """Partitioned vocabulary + bit-driven half-space multinomial sampling (HF-processed probs)."""
     return _generate_watermark_incremental(
         model,
         tokenizer,
@@ -152,6 +305,7 @@ def generate_with_watermark(
         device,
         track_token_alignment,
         full_vocab_only=False,
+        generation_extra=generation_extra,
     )
 
 
@@ -162,11 +316,10 @@ def generate_with_watermark_full_vocab_sample(
     secret_bitstream: List[int],
     device: str = "cpu",
     track_token_alignment: bool = False,
+    *,
+    generation_extra: Dict[str, Any] | None = None,
 ) -> Dict:
-    """
-    Same stepping / KV cache / bit-index horizon as ``generate_with_watermark``, but each
-    step samples from the full next-token softmax (no partition; bits are not used for decoding).
-    """
+    """Same loop and horizon as ``generate_with_watermark``, but draws from full (HF-processed) distribution."""
     return _generate_watermark_incremental(
         model,
         tokenizer,
@@ -175,6 +328,7 @@ def generate_with_watermark_full_vocab_sample(
         device,
         track_token_alignment,
         full_vocab_only=True,
+        generation_extra=generation_extra,
     )
 
 def generate_baseline(
@@ -184,11 +338,15 @@ def generate_baseline(
     max_new_tokens: int,
     device: str = "cpu",
 ) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    prompt_len = inputs["input_ids"].shape[1]
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = getattr(tokenizer, "eos_token_id", None)
+    """
+    Sample with ``model.generate`` from a **user** ``prompt``: chat template plus generation
+    prefix when ``tokenizer.chat_template`` is set; otherwise encode ``prompt`` as raw text.
+    ``max_new_tokens`` counts assistant tokens **after** that encoded prefix (same slicing rule
+    as the watermark KV loop).
+    """
+    inputs = encode_prompt_for_generation(tokenizer, prompt, device)
+    prompt_len = int(inputs["input_ids"].shape[1])
+    pad_id = _tokenizer_pad_token_id(tokenizer)
     with torch.no_grad():
         out = model.generate(
             **inputs,
@@ -246,6 +404,7 @@ def recover_bitstream_from_text(
     device: str,
     ground_truth_tokens: List[int] | None = None,
 ) -> Tuple[List[int], List[int]]:
+    """Tokenize **generated transcript** only (not the encoded chat prompt used at generation time)."""
     enc = tokenizer(full_text, return_tensors="pt")
     special_ids = set(getattr(tokenizer, "all_special_ids", []))
     return recover_bitstream(
@@ -292,6 +451,7 @@ def log_recovery_evaluation(secret, extracted, label=""):
 
 __all__ = [
     "get_vectorized_partition",
+    "encode_prompt_for_generation",
     "generate_with_watermark",
     "generate_with_watermark_full_vocab_sample",
     "generate_baseline",

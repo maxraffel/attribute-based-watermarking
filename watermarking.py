@@ -40,6 +40,8 @@ def _load_llm() -> None:
     print(f"Loading causal LM {MODEL_ID!r} on {DEVICE}")
     TOKENIZER = AutoTokenizer.from_pretrained(MODEL_ID)
     MODEL = AutoModelForCausalLM.from_pretrained(MODEL_ID).to(DEVICE)
+    if not MODEL.config.is_encoder_decoder:
+        TOKENIZER.padding_side = "left"
 
 
 def _ensure_llm() -> None:
@@ -80,7 +82,7 @@ def set_llm_model_id(model_id: str) -> None:
 
 def set_prc_code_length(n: int) -> None:
     """
-    Set the PRC codeword length and the greedy-baseline / bit-recovery horizon (``SECURITY_PARAM``).
+    Set the PRC codeword length and the HF-sampling baseline / bit-recovery horizon (``SECURITY_PARAM``).
     Also calls ``prc.set_code_length(n)`` so the Rust LDPC instance matches.
     """
     global SECURITY_PARAM
@@ -155,7 +157,7 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
 def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[int]]:
     """
     Recover PRC bits. Rebuilds ``x`` from ``watermarked_text`` via ``derive_x`` (zero-shot prefix + fixed tail).
-    This must match the ``x`` used in ``generate`` (from the greedy baseline) for detection to succeed.
+    This must match the ``x`` used in ``generate`` (from the sampling baseline) for detection to succeed.
 
     Returns ``(prc_ok, recovered_bits)`` where ``recovered_bits`` are ``0``/``1`` integers of length
     ``SECURITY_PARAM`` (for logging / BER).

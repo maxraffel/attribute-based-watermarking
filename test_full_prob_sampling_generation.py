@@ -1,18 +1,24 @@
 """
-Compare three generations at a fixed horizon ``--length``:
+For one user ``--prompt`` and one horizon ``--length``, print three completions. The prompt is
+passed through ``tokenizer.chat_template`` (with ``add_generation_prompt``) whenever the tokenizer
+defines a template—otherwise it is encoded as plain text.
 
-1. **Baseline** — ``randrecover.generate_baseline`` (``model.generate``, ``do_sample=True``,
-   ``max_new_tokens=length``), same as ``watermarking._baseline``.
+1. **``model.generate``** — ``randrecover.generate_baseline``: Hugging Face
+   ``generate(..., do_sample=True, max_new_tokens=length)``.
 
-2. **Partition watermark** — ``randrecover.generate_with_watermark``: partition + bit-driven
-   half-space, **sampling** from the restricted distribution (same logic as before, but
-   multinomial instead of argmax).
+2. **Incremental sampling with the HF logits-processor stack** —
+   ``randrecover.generate_with_watermark_full_vocab_sample``: same KV-cache loop as the
+   watermark path, but each step takes last-step logits through
+   ``_prepare_sampling_logits_processor`` (same list as (1)), softmaxes **after** processing,
+   and draws one token via full-vocab ``multinomial``. Secret bits are **not** used for
+   decoding; they only tie the stepping horizon to ``length``.
 
-3. **Full-vocab control** — ``randrecover.generate_with_watermark_full_vocab_sample``: same
-   incremental loop and bit-index stopping rule as (2), but **no** partition; sample from the
-   full softmax each step (secret bits are only used for horizon length, not decoding).
-
-Secret bits for (2) and (3) are drawn with ``secrets``.
+3. **Partition on processed probabilities** —
+   ``randrecover.generate_with_watermark``: same logits processing as (2), then half-space
+   restriction driven by cryptographic random bits (`secrets`) as extra entropy beside
+   coin flips tied to marginal mass ``p``. After printing (3), the script runs
+   ``recover_bitstream_from_text`` on that transcript and logs **BER** against the encoded
+   ``bits``.
 
 Run: ``python test_full_prob_sampling_generation.py`` or ``uv run python ...``
 """
@@ -36,6 +42,19 @@ def random_secret_bits(n: int) -> list[int]:
     return [secrets.randbelow(2) for _ in range(n)]
 
 
+def _ber_vs_secret(secret: list[int], extracted: list[int]) -> tuple[float, int]:
+    """
+    Same BER rule as ``randrecover.log_recovery_evaluation``: bitwise mismatches over the
+    overlap plus ``abs(len(secret) - len(extracted))``, denominator ``len(secret)``.
+    """
+    if not secret:
+        return (0.0, 0)
+    min_len = min(len(secret), len(extracted))
+    errs = sum(1 for i in range(min_len) if secret[i] != extracted[i])
+    errs += abs(len(secret) - len(extracted))
+    return ((errs / len(secret)) * 100.0, errs)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -47,12 +66,12 @@ def main() -> int:
         "--length",
         type=int,
         default=300,
-        help="Horizon: max_new_tokens for baseline; bitstream length / decode steps for both watermark paths",
+        help="Horizon n: baseline uses max_new_tokens=n; modes (2)-(3) use n decode steps aligned to bits",
     )
     parser.add_argument(
         "--prompt",
-        default="Write one short paragraph about the Roman Empire.",
-        help="Prompt shared by all three generators",
+        default="Explain the rise and fall of the Roman Empire.",
+        help="User message (decoded with chat template when available; shared by all generators)",
     )
     args = parser.parse_args()
 
@@ -68,36 +87,62 @@ def main() -> int:
     n = args.length
     bits = random_secret_bits(n)
 
-    baseline_text = randrecover.generate_baseline(
-        wm.MODEL, wm.TOKENIZER, args.prompt, n, wm.DEVICE
+    hf_generate_out = randrecover.generate_baseline(
+        wm.MODEL,
+        wm.TOKENIZER,
+        args.prompt,
+        n,
+        wm.DEVICE,
     )
 
-    wm_partition = randrecover.generate_with_watermark(
+    logits_processor_full_vocab = randrecover.generate_with_watermark_full_vocab_sample(
         wm.MODEL,
         wm.TOKENIZER,
         args.prompt,
         bits,
         wm.DEVICE,
     )
-    partition_text = wm_partition["generated_text_wm"]
+    processor_only_text = logits_processor_full_vocab["generated_text_wm"]
 
-    wm_full = randrecover.generate_with_watermark_full_vocab_sample(
+    partition_wm = randrecover.generate_with_watermark(
         wm.MODEL,
         wm.TOKENIZER,
         args.prompt,
         bits,
         wm.DEVICE,
     )
-    full_vocab_text = wm_full["generated_text_wm"]
+    partition_text = partition_wm["generated_text_wm"]
 
-    LOG.info("=== (1) Baseline (HF generate, do_sample=True, max_new_tokens=%d) ===", n)
-    LOG.info("%s", baseline_text)
+    LOG.info("=== (1) Model.generate (do_sample=True, max_new_tokens=%d) ===", n)
+    LOG.info("%s", hf_generate_out)
     LOG.info("")
-    LOG.info("=== (2) Partition watermark (sample restricted half; secrets bits) ===")
+    LOG.info(
+        "=== (2) Incremental: _prepare_sampling_logits_processor scores → softmax → "
+        "full-vocab multinomial (repeat; bits only fix horizon) ==="
+    )
+    LOG.info("%s", processor_only_text)
+    LOG.info("")
+    LOG.info(
+        "=== (3) Same processed probabilities as (2); partition + secret-bit entropy ==="
+    )
     LOG.info("%s", partition_text)
+
+    recovered_bits, _ = randrecover.recover_bitstream_from_text(
+        partition_text, wm.TOKENIZER, wm.DEVICE
+    )
+    ber_pct, err_count = _ber_vs_secret(bits, recovered_bits)
     LOG.info("")
-    LOG.info("=== (3) Same loop as (2), no partition (full-vocab multinomial each step) ===")
-    LOG.info("%s", full_vocab_text)
+    LOG.info(
+        "--- Entropy recovery: decode partition transcript → recovered bits vs secret "
+        "(len secret=%d, len recovered=%d) ---",
+        len(bits),
+        len(recovered_bits),
+    )
+    LOG.info(
+        "BER [partition-encoded entropy recovery]: %.2f%% (%d errors, denom = len(secret))",
+        ber_pct,
+        err_count,
+    )
     return 0
 
 
