@@ -80,7 +80,7 @@ def main() -> int:
         text,
         wm.TOKENIZER,
         wm.DEVICE,
-        n_bits=wm.SECURITY_PARAM,
+        n_bits=wm.wm_channel_bits_length(),
         model=wm.MODEL,
     )
     mw, _ = wm.master_detect(sk, wrong_tx)

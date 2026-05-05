@@ -8,8 +8,8 @@ Per-trial logging is minimal; results are **aggregated into tables**: per-prompt
 policy ``detect`` vs NLI-recovered attribute expectation, counts of which protocol stages matched,
 and mean wall time per pipeline stage.
 
-CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, optional ``--llm-model``,
-repeatable ``--prompt-case id:prompt``. Env: ``BENCHMARK_PLAIN_TABLE``, ``BENCHMARK_CONSOLE_*``
+CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, ``--wm-bit-redundancy``,
+optional ``--llm-model``, repeatable ``--prompt-case id:prompt``. Env: ``BENCHMARK_PLAIN_TABLE``, ``BENCHMARK_CONSOLE_*``
 (see ``make_benchmark_console`` / ``_use_plain_table``).
 """
 
@@ -324,7 +324,7 @@ def run_one_trial(
         wm_text,
         wm.TOKENIZER,
         wm.DEVICE,
-        n_bits=wm.SECURITY_PARAM,
+        n_bits=wm.wm_channel_bits_length(),
         model=wm.MODEL,
     )
     ctrl_ok_raw, _ = wm.master_detect(sk, wrong)
@@ -647,6 +647,7 @@ def run_benchmark(
     fresh_key_per_trial: bool,
     console: Console,
     llm_model_id: str | None = None,
+    wm_bit_redundancy: int = 1,
 ) -> int:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
@@ -655,12 +656,14 @@ def run_benchmark(
         wm.set_llm_model_id(llm_model_id.strip())
 
     wm.set_prc_code_length(code_length)
+    wm.set_wm_bit_redundancy(wm_bit_redundancy)
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     sk_shared: dict[str, Any] = {}
 
     vocab_n = len(VOCABULARY)
     console.print(
-        f"code_length={wm.SECURITY_PARAM}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
+        f"code_length={wm.SECURITY_PARAM}  wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
+        f"channel_bits={wm.wm_channel_bits_length()}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
         f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
         f"llm={wm.MODEL_ID!r}"
     )
@@ -807,9 +810,19 @@ def main() -> int:
         default=None,
         help="Hugging Face hub id for the causal LM (calls watermarking.set_llm_model_id).",
     )
+    p.add_argument(
+        "--wm-bit-redundancy",
+        type=int,
+        default=1,
+        metavar="R",
+        help="Repeat each logical PRC bit R times on the token channel; recovery uses strict majority (ties→0).",
+    )
     args = p.parse_args()
     if args.runs < 1 or args.code_length < 1:
         print("runs and code-length must be >= 1", file=sys.stderr)
+        return 2
+    if args.wm_bit_redundancy < 1:
+        print("wm-bit-redundancy must be >= 1", file=sys.stderr)
         return 2
 
     if args.prompt_cases:
@@ -830,6 +843,7 @@ def main() -> int:
         fresh_key_per_trial=not args.reuse_key,
         console=console,
         llm_model_id=args.llm_model,
+        wm_bit_redundancy=args.wm_bit_redundancy,
     )
 
 

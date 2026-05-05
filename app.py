@@ -5,12 +5,16 @@ per-step pass/fail. Issues one constrained CPRF key per closed-vocabulary label 
 ``detect`` to the expectation that the label is (or is not) in the verify-time recovered NLI
 attribute set. Tweak the constants below; this file does not import the benchmark module.
 
+Optional **environment** overrides (e.g. Colab before ``runpy.run_path``): ``APP_CODE_LENGTH``,
+``APP_WM_BIT_REDUNDANCY``, or aliases ``WATERMARK_CODE_LENGTH``, ``WATERMARK_WM_BIT_REDUNDANCY``.
+
 Run: ``uv run python app.py``
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import List, Sequence
 
@@ -28,9 +32,23 @@ from closed_vocab import (
     f_for_required_keywords,
 )
 
-# --- customize here ---
+
+def _env_int(*names: str, default: int) -> int:
+    for name in names:
+        v = os.environ.get(name, "").strip()
+        if v:
+            return int(v)
+    return default
+
+
+# --- customize here (env overrides: APP_* or WATERMARK_*; see module docstring) ---
 MODULUS = 1024
-CODE_LENGTH = 300
+CODE_LENGTH = _env_int("APP_CODE_LENGTH", "WATERMARK_CODE_LENGTH", default=300)
+WM_BIT_REDUNDANCY = _env_int(
+    "APP_WM_BIT_REDUNDANCY",
+    "WATERMARK_WM_BIT_REDUNDANCY",
+    default=1,
+)  # token-channel repeats per logical PRC bit; recovery = strict majority (tie → 0)
 # Hub id for the watermark causal LM; ``None`` keeps ``watermarking`` default / notebook ``set_llm_model_id``.
 LLM_MODEL_ID: str | None = None
 PROMPT = (
@@ -157,7 +175,8 @@ def main() -> int:
 
     c.print(
         Panel.fit(
-            f"[bold]modulus[/] {MODULUS}  ·  [bold]code_length[/] {CODE_LENGTH}\n"
+            f"[bold]modulus[/] {MODULUS}  ·  [bold]code_length[/] {CODE_LENGTH}  ·  "
+            f"[bold]wm_bit_redundancy[/] {WM_BIT_REDUNDANCY}  (channel {CODE_LENGTH * WM_BIT_REDUNDANCY} bits)\n"
             f"[bold]LLM[/] {wm.MODEL_ID}\n"
             f"[bold]vocab[/] |V|={n_prefix}  ·  [bold]NLI prefix[/] multi-label (cutoff={attr_x_nli.NLI_MULTI_LABEL_SCORE_CUTOFF:g})",
             title="app.py protocol run",
@@ -165,7 +184,12 @@ def main() -> int:
     )
 
     wm.set_prc_code_length(CODE_LENGTH)
-    c.print(f"[dim]wm.SECURITY_PARAM =[/] {wm.SECURITY_PARAM}")
+    wm.set_wm_bit_redundancy(WM_BIT_REDUNDANCY)
+    c.print(
+        f"[dim]wm.SECURITY_PARAM =[/] {wm.SECURITY_PARAM}  "
+        f"[dim]wm.WM_BIT_REDUNDANCY =[/] {wm.WM_BIT_REDUNDANCY}  "
+        f"[dim]wm.wm_channel_bits_length() =[/] {wm.wm_channel_bits_length()}"
+    )
 
     c.rule("1) CPRF setup", style="cyan")
     sk = wm.setup(MODULUS)
@@ -358,12 +382,12 @@ def main() -> int:
         wm_text,
         wm.TOKENIZER,
         wm.DEVICE,
-        n_bits=wm.SECURITY_PARAM,
+        n_bits=wm.wm_channel_bits_length(),
         model=wm.MODEL,
     )
     c.print(
         f"  [dim]decoy length: {len(wrong)} chars (watermarked ref: {len(wm_text)}), "
-        f"bit horizon {wm.SECURITY_PARAM}[/]"
+        f"channel bit horizon {wm.wm_channel_bits_length()}[/]"
     )
     _log_text(c, "Wrong transcript", wrong, max_chars=400)
     w_ok, w_bits = wm.master_detect(sk, wrong)

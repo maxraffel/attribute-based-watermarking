@@ -39,6 +39,46 @@ TOKENIZER: Optional[AutoTokenizer] = None
 MODEL: Optional[AutoModelForCausalLM] = None
 
 SECURITY_PARAM = 300
+# Each logical PRC bit is embedded WM_BIT_REDUNDANCY times on the token channel; recovery uses strict majority per group.
+WM_BIT_REDUNDANCY = 1
+
+
+def wm_channel_bits_length() -> int:
+    """Physical watermark bit positions (tokens) per completion: logical ``SECURITY_PARAM`` × ``WM_BIT_REDUNDANCY``."""
+    return int(SECURITY_PARAM) * int(WM_BIT_REDUNDANCY)
+
+
+def set_wm_bit_redundancy(r: int) -> None:
+    """
+    Set repetition factor for the partition channel (default ``1`` = legacy one sample per logical bit).
+
+    Each logical PRC bit is expanded to ``r`` identical channel bits before ``generate_with_watermark``;
+    ``detect`` / ``master_detect`` recover ``SECURITY_PARAM * r`` raw bits and fold with strict majority
+    (ties become ``0``) before ``prc.detect``. Baseline generation length stays ``SECURITY_PARAM``.
+    """
+    global WM_BIT_REDUNDANCY
+    ri = int(r)
+    if ri < 1:
+        raise ValueError("WM_BIT_REDUNDANCY must be >= 1")
+    WM_BIT_REDUNDANCY = ri
+
+
+def _expand_bits_for_wm_channel(logical: List[int], r: int) -> List[int]:
+    return [int(b) & 1 for b in logical for _ in range(int(r))]
+
+
+def _majority_fold_channel_bits(raw: List[int], r: int, n_logical: int) -> List[int]:
+    """``n_logical`` groups of ``r`` raw bits → logical bits; strict majority, tie → ``0``."""
+    r = int(r)
+    need = int(n_logical) * r
+    padded = [int(x) & 1 for x in raw] + [0] * max(0, need - len(raw))
+    padded = padded[:need]
+    out: List[int] = []
+    for i in range(int(n_logical)):
+        chunk = padded[i * r : (i + 1) * r]
+        s = sum(chunk)
+        out.append(1 if 2 * s > r else 0)
+    return out
 
 
 def _load_llm() -> None:
@@ -93,8 +133,9 @@ def set_llm_model_id(model_id: str) -> None:
 
 def set_prc_code_length(n: int) -> None:
     """
-    Set the PRC codeword length and the HF-sampling baseline / bit-recovery horizon (``SECURITY_PARAM``).
-    Also calls ``prc.set_code_length(n)`` so the Rust LDPC instance matches.
+    Set the **logical** PRC codeword length (``SECURITY_PARAM``): LDPC block size, baseline decode length,
+    and the length of ``prc.encode`` / ``prc.detect`` bit vectors. Watermarked generation uses
+    ``SECURITY_PARAM * WM_BIT_REDUNDANCY`` physical channel bits. Also calls ``prc.set_code_length(n)``.
     """
     global SECURITY_PARAM
     if n < 1:
@@ -152,9 +193,10 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     prc.set_code_length(SECURITY_PARAM)
     c = prc.encode(prc.key_gen_from_seed(sha256(r).digest()))
     bits = [1 if b else 0 for b in c]
+    channel_bits = _expand_bits_for_wm_channel(bits, WM_BIT_REDUNDANCY)
     t2 = time.perf_counter()
     assert MODEL is not None and TOKENIZER is not None
-    out = randrecover.generate_with_watermark(MODEL, TOKENIZER, prompt, bits, DEVICE)
+    out = randrecover.generate_with_watermark(MODEL, TOKENIZER, prompt, channel_bits, DEVICE)
     t3 = time.perf_counter()
     out["attr_x"] = x
     out["baseline_text"] = baseline
@@ -162,6 +204,8 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     out["seconds_baseline_gen"] = t1 - t0
     out["seconds_watermarked_gen"] = t3 - t2
     out["prc_secret_bits"] = list(bits)
+    out["wm_bit_redundancy"] = int(WM_BIT_REDUNDANCY)
+    out["wm_channel_bits"] = list(channel_bits)
     return out
 
 
@@ -171,7 +215,7 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
     This must match the ``x`` used in ``generate`` (from the sampling baseline) for detection to succeed.
 
     Returns ``(prc_ok, recovered_bits)`` where ``recovered_bits`` are ``0``/``1`` integers of length
-    ``SECURITY_PARAM`` (for logging / BER).
+    ``SECURITY_PARAM`` (logical; majority-folded when ``WM_BIT_REDUNDANCY`` > 1).
     """
     _ensure_llm()
     assert TOKENIZER is not None
@@ -181,10 +225,12 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
     # not merely ⟨f,x⟩≡0 on composite modulus — compare dk.c_eval(x) to sk.eval(x) when debugging policies.
     recovered_s = prc.key_gen_from_seed(sha256(dk.c_eval(x)).digest())
     assert MODEL is not None
-    bits, _ = randrecover.recover_bitstream_from_text(
+    raw, _ = randrecover.recover_bitstream_from_text(
         watermarked_text, TOKENIZER, DEVICE, model=MODEL
     )
-    bits = (bits + [0] * SECURITY_PARAM)[:SECURITY_PARAM]
+    need = wm_channel_bits_length()
+    raw = (raw + [0] * need)[:need]
+    bits = _majority_fold_channel_bits(raw, WM_BIT_REDUNDANCY, SECURITY_PARAM)
     bits_int = [1 if b else 0 for b in bits]
     ok = prc.detect(recovered_s, [bool(b) for b in bits])
     return ok, bits_int
@@ -198,10 +244,12 @@ def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> Tuple[bool, List
     prc.set_code_length(SECURITY_PARAM)
     s = prc.key_gen_from_seed(sha256(sk.eval(x)).digest())
     assert MODEL is not None
-    bits, _ = randrecover.recover_bitstream_from_text(
+    raw, _ = randrecover.recover_bitstream_from_text(
         watermarked_text, TOKENIZER, DEVICE, model=MODEL
     )
-    bits = (bits + [0] * SECURITY_PARAM)[:SECURITY_PARAM]
+    need = wm_channel_bits_length()
+    raw = (raw + [0] * need)[:need]
+    bits = _majority_fold_channel_bits(raw, WM_BIT_REDUNDANCY, SECURITY_PARAM)
     bits_int = [1 if b else 0 for b in bits]
     ok = prc.detect(s, [bool(b) for b in bits])
     return ok, bits_int
