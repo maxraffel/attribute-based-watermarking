@@ -58,16 +58,21 @@ def encode_prompt_for_generation(
     tokenizer: AutoTokenizer,
     user_prompt: str,
     device: str | torch.device,
+    *,
+    use_chat_template: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
-    Build model inputs for causal generation: apply the tokenizer's ``chat_template``
-    (user turn + ``add_generation_prompt``) when defined, else plain ``tokenizer(...)``.
+    Build model inputs for causal generation.
+
+    When ``use_chat_template`` is true and the tokenizer defines ``chat_template``, apply it
+    (user turn + ``add_generation_prompt``). Otherwise encode ``user_prompt`` with plain
+    ``tokenizer(...)`` (text completion / pretrain-style prefix).
 
     ``prompt_len`` for slicing new tokens is ``input_ids.shape[1]`` of the returned batch
-    (includes the full templated prefix).
+    (includes the full encoded prefix).
     """
     dev = torch.device(device) if isinstance(device, str) else device
-    if getattr(tokenizer, "chat_template", None) is None:
+    if not use_chat_template or getattr(tokenizer, "chat_template", None) is None:
         batch = tokenizer(user_prompt, return_tensors="pt")
     else:
         messages = [{"role": "user", "content": user_prompt}]
@@ -186,12 +191,15 @@ def infer_sampling_logits_debug_for_prompt(
     device: str,
     *,
     generation_extra: Dict[str, Any] | None = None,
+    use_chat_template: bool = True,
 ) -> Dict[str, Any]:
     """
     Same bundle as ``generate_with_watermark`` / ``generate_baseline``-aligned ``_prepare_*``:
-    chat-encoded prompt + ``max_new_tokens=decode_horizon``, ``do_sample=True``.
+    encoded prompt + ``max_new_tokens=decode_horizon``, ``do_sample=True``.
     """
-    inputs = encode_prompt_for_generation(tokenizer, user_prompt, device)
+    inputs = encode_prompt_for_generation(
+        tokenizer, user_prompt, device, use_chat_template=use_chat_template
+    )
     gc, lp = _prepare_sampling_logits_processor_bundle(
         model,
         tokenizer,
@@ -219,7 +227,8 @@ def _prepare_sampling_logits_processor_bundle(
     """
     Build the resolved ``GenerationConfig`` and ``LogitsProcessorList`` used by
     ``model.generate(do_sample=True, ...)`` so manual sampling uses the same post-processed
-    scores as HF. ``prompt_inputs`` should match ``encode_prompt_for_generation``.
+    scores as HF. ``prompt_inputs`` should match ``encode_prompt_for_generation`` (same
+    ``use_chat_template`` choice).
     """
     device = prompt_inputs["input_ids"].device
     pad_id = _tokenizer_pad_token_id(tokenizer)
@@ -365,6 +374,7 @@ def _generate_watermark_incremental(
     *,
     full_vocab_only: bool,
     generation_extra: Dict[str, Any] | None = None,
+    use_chat_template: bool = True,
 ) -> Dict:
     """
     Shared KV-cache loop: stop once ``len(secret_bitstream)`` non-special tokens have
@@ -373,7 +383,9 @@ def _generate_watermark_incremental(
     choice as before) → same HF processors → softmax → multinomial.
     """
     special_ids = set(getattr(tokenizer, "all_special_ids", []))
-    inputs = encode_prompt_for_generation(tokenizer, prompt, device)
+    inputs = encode_prompt_for_generation(
+        tokenizer, prompt, device, use_chat_template=use_chat_template
+    )
     input_ids_wm = inputs["input_ids"].clone()
     prompt_len = int(inputs["input_ids"].shape[1])
     attn_mask = inputs.get("attention_mask", None)
@@ -506,6 +518,7 @@ def generate_with_watermark(
     track_token_alignment: bool = False,
     *,
     generation_extra: Dict[str, Any] | None = None,
+    use_chat_template: bool = True,
 ) -> Dict:
     """Partitioned vocabulary: mask raw logits to a half-space, then HF logits warpers + sample."""
     return _generate_watermark_incremental(
@@ -517,6 +530,7 @@ def generate_with_watermark(
         track_token_alignment,
         full_vocab_only=False,
         generation_extra=generation_extra,
+        use_chat_template=use_chat_template,
     )
 
 
@@ -529,6 +543,7 @@ def generate_with_watermark_full_vocab_sample(
     track_token_alignment: bool = False,
     *,
     generation_extra: Dict[str, Any] | None = None,
+    use_chat_template: bool = True,
 ) -> Dict:
     """Same loop and horizon as ``generate_with_watermark``, but draws from full (HF-processed) distribution."""
     return _generate_watermark_incremental(
@@ -540,6 +555,7 @@ def generate_with_watermark_full_vocab_sample(
         track_token_alignment,
         full_vocab_only=True,
         generation_extra=generation_extra,
+        use_chat_template=use_chat_template,
     )
 
 def generate_baseline(
@@ -548,14 +564,19 @@ def generate_baseline(
     prompt: str,
     max_new_tokens: int,
     device: str = "cpu",
+    *,
+    use_chat_template: bool = True,
 ) -> str:
     """
-    Sample with ``model.generate`` from a **user** ``prompt``: chat template plus generation
-    prefix when ``tokenizer.chat_template`` is set; otherwise encode ``prompt`` as raw text.
-    ``max_new_tokens`` counts assistant tokens **after** that encoded prefix (same slicing rule
-    as the watermark KV loop).
+    Sample with ``model.generate`` from ``prompt``. Uses the chat template when
+    ``use_chat_template`` and ``tokenizer.chat_template`` are both set; otherwise encodes as
+    plain text (completion-style prefix).
+    ``max_new_tokens`` counts new tokens **after** that encoded prefix (same slicing rule as
+    the watermark KV loop).
     """
-    inputs = encode_prompt_for_generation(tokenizer, prompt, device)
+    inputs = encode_prompt_for_generation(
+        tokenizer, prompt, device, use_chat_template=use_chat_template
+    )
     prompt_len = int(inputs["input_ids"].shape[1])
     pad_id = _tokenizer_pad_token_id(tokenizer)
     with torch.no_grad():

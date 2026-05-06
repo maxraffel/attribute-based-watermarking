@@ -10,7 +10,9 @@ policy ``detect`` vs NLI-recovered attribute expectation, counts of which protoc
 ``derive_x`` (full vector); then mean wall time per pipeline stage.
 
 CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, ``--wm-bit-redundancy``,
-optional ``--llm-model``, repeatable ``--prompt-case id:prompt``. Env: ``BENCHMARK_PLAIN_TABLE``, ``BENCHMARK_CONSOLE_*``
+optional ``--llm-model``, ``--no-chat-template`` (plain text completion encoding),
+repeatable ``--prompt-case id:prompt`` or ``--prompt-file`` (UTF-8, one ``id:prompt`` per line, ``#`` comments OK).
+Env: ``BENCHMARK_PLAIN_TABLE``, ``BENCHMARK_CONSOLE_*``
 (see ``make_benchmark_console`` / ``_use_plain_table``).
 """
 
@@ -77,6 +79,26 @@ def parse_prompt_case(spec: str) -> tuple[str, str]:
     if not sid or not prompt:
         raise ValueError(f"empty id or prompt in {spec!r}")
     return (sid, prompt)
+
+
+def load_prompt_cases_from_path(path: str) -> list[tuple[str, str]]:
+    """
+    One benchmark case per non-empty line: same ``id:prompt`` rule as ``--prompt-case``.
+    Lines starting with ``#`` (after strip) are ignored.
+    """
+    cases: list[tuple[str, str]] = []
+    with open(path, encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            try:
+                cases.append(parse_prompt_case(s))
+            except ValueError as e:
+                raise ValueError(f"{path}:{line_no}: {e}") from e
+    if not cases:
+        raise ValueError(f"no prompt cases in {path!r}")
+    return cases
 
 
 def _ber_percent(secret: list[int], recovered: list[int]) -> float:
@@ -237,6 +259,8 @@ def _derive_x_verify(wm_text: str, modulus: int) -> list[int]:
 def run_one_trial(
     sk: Any,
     prompt: str,
+    *,
+    use_chat_template: bool = True,
 ) -> tuple[
     list[dict[str, Any]],
     bool,
@@ -255,7 +279,7 @@ def run_one_trial(
     """
     tt = TimingTotals()
 
-    out = wm.generate(sk, prompt)
+    out = wm.generate(sk, prompt, use_chat_template=use_chat_template)
     wm_text = out["generated_text_wm"]
     x_encode = list(out["attr_x"])
     secret = list(out["prc_secret_bits"])
@@ -674,6 +698,7 @@ def run_benchmark(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
+    use_chat_template: bool = True,
 ) -> int:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
@@ -692,6 +717,7 @@ def run_benchmark(
         f"code_length={wm.SECURITY_PARAM}  wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
         f"channel_bits={wm.wm_channel_bits_length()}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
         f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
+        f"prompt_encode={'chat' if use_chat_template else 'plain'}  "
         f"llm={wm.MODEL_ID!r}"
     )
 
@@ -722,7 +748,7 @@ def run_benchmark(
             ber,
             tt_inner,
             em_open_m,
-        ) = run_one_trial(sk, prompt)
+        ) = run_one_trial(sk, prompt, use_chat_template=use_chat_template)
         tt_inner.t_setup = t_setup
 
         roll[sid].add_run(
@@ -881,6 +907,20 @@ def main() -> int:
         help="Benchmark case (repeatable). First ':' separates id from prompt.",
     )
     p.add_argument(
+        "--prompt-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "UTF-8 file of cases, one id:prompt per line (same as --prompt-case). "
+            "Empty lines and #-comments ignored. Appended after any --prompt-case values."
+        ),
+    )
+    p.add_argument(
+        "--no-chat-template",
+        action="store_true",
+        help="Encode prompts as plain tokenizer text (skip chat template); text-completion style.",
+    )
+    p.add_argument(
         "--llm-model",
         dest="llm_model",
         metavar="HF_HUB_ID",
@@ -902,13 +942,23 @@ def main() -> int:
         print("wm-bit-redundancy must be >= 1", file=sys.stderr)
         return 2
 
+    cases: list[tuple[str, str]] = []
     if args.prompt_cases:
         try:
-            cases = [parse_prompt_case(s) for s in args.prompt_cases]
+            cases.extend(parse_prompt_case(s) for s in args.prompt_cases)
         except ValueError as e:
             print(str(e), file=sys.stderr)
             return 2
-    else:
+    if args.prompt_file:
+        try:
+            cases.extend(load_prompt_cases_from_path(args.prompt_file.strip()))
+        except OSError as e:
+            print(f"prompt-file: {e}", file=sys.stderr)
+            return 2
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+    if not cases:
         cases = list(DEFAULT_PROMPT_CASES)
 
     console = make_benchmark_console()
@@ -921,6 +971,7 @@ def main() -> int:
         console=console,
         llm_model_id=args.llm_model,
         wm_bit_redundancy=args.wm_bit_redundancy,
+        use_chat_template=not args.no_chat_template,
     )
 
 

@@ -149,11 +149,16 @@ def set_prc_code_length(n: int) -> None:
     prc.set_code_length(n)
 
 
-def _baseline(prompt: str) -> str:
+def _baseline(prompt: str, *, use_chat_template: bool = True) -> str:
     _ensure_llm()
     assert MODEL is not None and TOKENIZER is not None
     return randrecover.generate_baseline(
-        MODEL, TOKENIZER, prompt, wm_channel_bits_length(), DEVICE
+        MODEL,
+        TOKENIZER,
+        prompt,
+        wm_channel_bits_length(),
+        DEVICE,
+        use_chat_template=use_chat_template,
     )
 
 
@@ -179,13 +184,15 @@ def issue_keyword_policy(sk: cprf.MasterKey, required: List[str]) -> cprf.Constr
     return issue_constrained_key_for_keywords(sk, required)
 
 
-def attr_x_for_prompt(sk: cprf.MasterKey, prompt: str) -> List[int]:
-    return derive_x(_baseline(prompt), sk.modulus)
+def attr_x_for_prompt(
+    sk: cprf.MasterKey, prompt: str, *, use_chat_template: bool = True
+) -> List[int]:
+    return derive_x(_baseline(prompt, use_chat_template=use_chat_template), sk.modulus)
 
 
-def generate(sk: cprf.MasterKey, prompt: str) -> dict:
+def generate(sk: cprf.MasterKey, prompt: str, *, use_chat_template: bool = True) -> dict:
     t0 = time.perf_counter()
-    baseline = _baseline(prompt)
+    baseline = _baseline(prompt, use_chat_template=use_chat_template)
     t1 = time.perf_counter()
     baseline_nli: dict[str, float] = {}
     x = _derive_x(
@@ -201,7 +208,14 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     channel_bits = _expand_bits_for_wm_channel(bits, WM_BIT_REDUNDANCY)
     t2 = time.perf_counter()
     assert MODEL is not None and TOKENIZER is not None
-    out = randrecover.generate_with_watermark(MODEL, TOKENIZER, prompt, channel_bits, DEVICE)
+    out = randrecover.generate_with_watermark(
+        MODEL,
+        TOKENIZER,
+        prompt,
+        channel_bits,
+        DEVICE,
+        use_chat_template=use_chat_template,
+    )
     t3 = time.perf_counter()
     out["attr_x"] = x
     out["baseline_text"] = baseline

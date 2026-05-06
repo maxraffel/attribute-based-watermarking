@@ -1,7 +1,7 @@
 """
-For one user ``--prompt`` and one horizon ``--length``, print three completions. The prompt is
-passed through ``tokenizer.chat_template`` (with ``add_generation_prompt``) whenever the tokenizer
-defines a template—otherwise it is encoded as plain text.
+For one ``--prompt`` and one horizon ``--length``, print three completions. By default the prompt is
+passed through ``tokenizer.chat_template`` (with ``add_generation_prompt``) when the tokenizer defines
+one; pass ``--no-chat-template`` to encode the string as plain text (completion-style prefix).
 
 1. **``model.generate``** — ``randrecover.generate_baseline``: Hugging Face
    ``generate(..., do_sample=True, max_new_tokens=length)``.
@@ -101,7 +101,12 @@ def main() -> int:
     parser.add_argument(
         "--prompt",
         default="Explain the rise and fall of the Roman Empire.",
-        help="User message (decoded with chat template when available; shared by all generators)",
+        help="Prompt string (chat-templated when available unless --no-chat-template).",
+    )
+    parser.add_argument(
+        "--no-chat-template",
+        action="store_true",
+        help="Encode prompt as plain tokenizer text (skip chat template).",
     )
     args = parser.parse_args()
 
@@ -116,10 +121,11 @@ def main() -> int:
     assert wm.MODEL is not None and wm.TOKENIZER is not None
     n = args.length
     bits = random_secret_bits(n)
+    uct = not args.no_chat_template
 
     for line in randrecover.format_sampling_logits_debug_lines(
         randrecover.infer_sampling_logits_debug_for_prompt(
-            wm.MODEL, wm.TOKENIZER, args.prompt, n, wm.DEVICE
+            wm.MODEL, wm.TOKENIZER, args.prompt, n, wm.DEVICE, use_chat_template=uct
         )
     ):
         LOG.info(line)
@@ -134,6 +140,7 @@ def main() -> int:
         args.prompt,
         n,
         wm.DEVICE,
+        use_chat_template=uct,
     )
 
     logits_processor_full_vocab = randrecover.generate_with_watermark_full_vocab_sample(
@@ -142,6 +149,7 @@ def main() -> int:
         args.prompt,
         bits,
         wm.DEVICE,
+        use_chat_template=uct,
     )
     processor_only_text = logits_processor_full_vocab["generated_text_wm"]
 
@@ -151,6 +159,7 @@ def main() -> int:
         args.prompt,
         bits,
         wm.DEVICE,
+        use_chat_template=uct,
     )
     partition_text = partition_wm["generated_text_wm"]
 

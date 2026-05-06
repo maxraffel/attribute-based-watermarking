@@ -7,12 +7,15 @@ attribute set. Tweak the constants below; this file does not import the benchmar
 
 Optional **environment** overrides (e.g. Colab before ``runpy.run_path``): ``APP_CODE_LENGTH``,
 ``APP_WM_BIT_REDUNDANCY``, or aliases ``WATERMARK_CODE_LENGTH``, ``WATERMARK_WM_BIT_REDUNDANCY``.
+Plain text completion encoding (skip tokenizer chat template): ``APP_NO_CHAT_TEMPLATE`` or
+``WATERMARK_NO_CHAT_TEMPLATE`` set to ``1``/``true``/``yes``, or CLI ``--no-chat-template``.
 
-Run: ``uv run python app.py``
+Run: ``uv run python app.py``  (optional: ``uv run python app.py --no-chat-template``)
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import time
@@ -41,6 +44,14 @@ def _env_int(*names: str, default: int) -> int:
     return default
 
 
+def _env_truthy(*names: str) -> bool:
+    for name in names:
+        v = os.environ.get(name, "").strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
 # --- customize here (env overrides: APP_* or WATERMARK_*; see module docstring) ---
 MODULUS = 1024
 CODE_LENGTH = _env_int("APP_CODE_LENGTH", "WATERMARK_CODE_LENGTH", default=100)
@@ -52,7 +63,8 @@ WM_BIT_REDUNDANCY = _env_int(
 # Hub id for the watermark causal LM; ``None`` keeps ``watermarking`` default / notebook ``set_llm_model_id``.
 LLM_MODEL_ID: str | None = None
 PROMPT = (
-            "Explain how Tom Brady's football legacy economically impacted the New England area."
+            "Tom Brady's football legacy has significantly impacted the New England area economically, contributing to the "
+            "region's growth, and generating substantial revenue. Here are some key economic impacts:"
 )
 
 
@@ -166,6 +178,19 @@ def main() -> int:
         logging.getLogger(name).setLevel(logging.WARNING)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
+    ap = argparse.ArgumentParser(
+        description="Single-run watermark protocol walkthrough (optional flags).",
+    )
+    ap.add_argument(
+        "--no-chat-template",
+        action="store_true",
+        help="Encode PROMPT as plain tokenizer text (skip chat template); same as benchmark flag.",
+    )
+    args = ap.parse_args()
+    use_chat_template = not _env_truthy("APP_NO_CHAT_TEMPLATE", "WATERMARK_NO_CHAT_TEMPLATE")
+    if args.no_chat_template:
+        use_chat_template = False
+
     c = Console(highlight=False)
     n_prefix = len(VOCABULARY)
     all_ok = True
@@ -178,6 +203,7 @@ def main() -> int:
             f"[bold]modulus[/] {MODULUS}  ·  [bold]code_length[/] {CODE_LENGTH}  ·  "
             f"[bold]wm_bit_redundancy[/] {WM_BIT_REDUNDANCY}  (channel {CODE_LENGTH * WM_BIT_REDUNDANCY} bits)\n"
             f"[bold]LLM[/] {wm.MODEL_ID}\n"
+            f"[bold]prompt_encode[/] {'chat' if use_chat_template else 'plain'}\n"
             f"[bold]vocab[/] |V|={n_prefix}  ·  [bold]NLI prefix[/] multi-label (cutoff={attr_x_nli.NLI_MULTI_LABEL_SCORE_CUTOFF:g})",
             title="app.py protocol run",
         )
@@ -196,7 +222,7 @@ def main() -> int:
     c.print(f"  Master key OK (modulus={sk.modulus}).")
 
     c.rule("2) Generate (baseline → attr_x → PRC → watermarked)", style="cyan")
-    out = wm.generate(sk, PROMPT)
+    out = wm.generate(sk, PROMPT, use_chat_template=use_chat_template)
     baseline_text = out["baseline_text"]
     wm_text = out["generated_text_wm"]
     x_encode: List[int] = list(out["attr_x"])
