@@ -14,8 +14,8 @@ optional ``--llm-model``, repeatable ``--prompt-case id:prompt``. Env: ``BENCHMA
 (see ``make_benchmark_console`` / ``_use_plain_table``).
 
 For notebooks / plotting: ``run_benchmark_with_summary(..., quiet=True)`` returns a ``BenchmarkRunSummary``;
-``micro_fpr`` pools per-label policy FPR; ``prc_random_detect_positive_rate`` estimates PRC ``detect`` acceptance on
-random bits against a random PRC key (same spirit as ``testing.py``).
+``micro_fpr`` / ``micro_tpr`` pool per-label policy FPR/TPR; ``prc_random_detect_positive_rate`` estimates PRC
+``detect`` acceptance on random bits against a random PRC key (same spirit as ``testing.py``).
 """
 
 from __future__ import annotations
@@ -263,6 +263,15 @@ def micro_fpr(
     """Micro-averaged false positive rate for policy ``detect`` vs NLI-active-set gold."""
     tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
     return _rates(tp, fn, tn, fp)[3]
+
+
+def micro_tpr(
+    roll: dict[str, PromptRollup],
+    prompt_cases: Sequence[tuple[str, str]],
+) -> float:
+    """Micro-averaged true positive rate for policy ``detect`` vs NLI-active-set gold."""
+    tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
+    return _rates(tp, fn, tn, fp)[0]
 
 
 def prc_random_detect_positive_rate(
