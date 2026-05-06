@@ -9,8 +9,10 @@ Optional **environment** overrides (e.g. Colab before ``runpy.run_path``): ``APP
 ``APP_WM_BIT_REDUNDANCY``, or aliases ``WATERMARK_CODE_LENGTH``, ``WATERMARK_WM_BIT_REDUNDANCY``.
 Plain text completion encoding (skip tokenizer chat template): ``APP_NO_CHAT_TEMPLATE`` or
 ``WATERMARK_NO_CHAT_TEMPLATE`` set to ``1``/``true``/``yes``, or CLI ``--no-chat-template``.
+Prompt-source testing: ``APP_USE_C4_SNIPPET`` / ``WATERMARK_USE_C4_SNIPPET`` or
+CLI ``--use-c4-snippet`` to draw one random snippet from ``allenai/c4`` ``realnewslike``.
 
-Run: ``uv run python app.py``  (optional: ``uv run python app.py --no-chat-template``)
+Run: ``uv run python app.py`` (optional: ``--no-chat-template`` / ``--use-c4-snippet``)
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import random
 import time
 from typing import List, Sequence
 
@@ -66,6 +69,52 @@ PROMPT = (
             "Tom Brady's football legacy has significantly impacted the New England area economically, contributing to the "
             "region's growth, and generating substantial revenue. Here are some key economic impacts:"
 )
+USE_C4_SNIPPET = _env_truthy("APP_USE_C4_SNIPPET", "WATERMARK_USE_C4_SNIPPET")
+C4_SNIPPET_CHARS = _env_int("APP_C4_SNIPPET_CHARS", "WATERMARK_C4_SNIPPET_CHARS", default=512)
+C4_INTER_SAMPLE_SKIP_MAX = _env_int(
+    "APP_C4_INTER_SAMPLE_SKIP_MAX",
+    "WATERMARK_C4_INTER_SAMPLE_SKIP_MAX",
+    default=256,
+)
+C4_SPLIT = os.environ.get("APP_C4_SPLIT", os.environ.get("WATERMARK_C4_SPLIT", "train")).strip() or "train"
+C4_SEED_RAW = os.environ.get("APP_C4_SEED", os.environ.get("WATERMARK_C4_SEED", "")).strip()
+C4_SEED: int | None = int(C4_SEED_RAW) if C4_SEED_RAW else None
+
+
+def _sample_prompt_from_c4_realnewslike(
+    *,
+    snippet_chars: int,
+    split: str,
+    seed: int | None,
+    inter_sample_skip_max: int,
+) -> str:
+    """Sample one prompt-sized snippet from ``allenai/c4`` ``realnewslike`` (streaming)."""
+    if snippet_chars < 1:
+        raise ValueError("C4 snippet_chars must be >= 1")
+    if inter_sample_skip_max < 0:
+        raise ValueError("C4 inter_sample_skip_max must be >= 0")
+
+    from datasets import load_dataset  # pyright: ignore[reportMissingImports]
+
+    rng = random.Random(seed) if seed is not None else random.Random()
+    ds = load_dataset("allenai/c4", "realnewslike", split=split, streaming=True)
+    it = iter(ds)
+    for _ in range(rng.randint(0, inter_sample_skip_max)):
+        next(it)
+
+    attempts = 0
+    while attempts < 200:
+        attempts += 1
+        row = next(it)
+        text = " ".join(str(row.get("text") or "").split())
+        if not text:
+            continue
+        if len(text) <= snippet_chars:
+            return text
+        start = rng.randrange(len(text) - snippet_chars + 1)
+        return text[start : start + snippet_chars]
+
+    raise RuntimeError("failed to sample non-empty C4 snippet after 200 attempts")
 
 
 def _ber_percent(secret: list[int], recovered: list[int]) -> float:
@@ -186,10 +235,63 @@ def main() -> int:
         action="store_true",
         help="Encode PROMPT as plain tokenizer text (skip chat template); same as benchmark flag.",
     )
+    ap.add_argument(
+        "--use-c4-snippet",
+        action="store_true",
+        help="Use one random snippet from allenai/c4 realnewslike as the prompt.",
+    )
+    ap.add_argument(
+        "--c4-snippet-chars",
+        type=int,
+        default=C4_SNIPPET_CHARS,
+        metavar="N",
+        help=f"Snippet length for --use-c4-snippet (default: {C4_SNIPPET_CHARS}).",
+    )
+    ap.add_argument(
+        "--c4-seed",
+        type=int,
+        default=C4_SEED,
+        metavar="S",
+        help="Optional RNG seed for C4 sampling (default: env or nondeterministic).",
+    )
+    ap.add_argument(
+        "--c4-split",
+        default=C4_SPLIT,
+        metavar="SPLIT",
+        help=f"C4 split for --use-c4-snippet (default: {C4_SPLIT!r}).",
+    )
+    ap.add_argument(
+        "--c4-inter-sample-skip-max",
+        type=int,
+        default=C4_INTER_SAMPLE_SKIP_MAX,
+        metavar="K",
+        help=f"Skip up to K random rows before sampling C4 text (default: {C4_INTER_SAMPLE_SKIP_MAX}).",
+    )
     args = ap.parse_args()
     use_chat_template = not _env_truthy("APP_NO_CHAT_TEMPLATE", "WATERMARK_NO_CHAT_TEMPLATE")
     if args.no_chat_template:
         use_chat_template = False
+    use_c4_snippet = USE_C4_SNIPPET or bool(args.use_c4_snippet)
+
+    if args.c4_snippet_chars < 1:
+        raise ValueError("c4-snippet-chars must be >= 1")
+    if args.c4_inter_sample_skip_max < 0:
+        raise ValueError("c4-inter-sample-skip-max must be >= 0")
+
+    prompt = PROMPT
+    prompt_src = "static"
+    if use_c4_snippet:
+        split = (args.c4_split or "train").strip() or "train"
+        prompt = _sample_prompt_from_c4_realnewslike(
+            snippet_chars=args.c4_snippet_chars,
+            split=split,
+            seed=args.c4_seed,
+            inter_sample_skip_max=args.c4_inter_sample_skip_max,
+        )
+        prompt_src = (
+            f"c4(realnewslike, split={split!r}, chars={args.c4_snippet_chars}, "
+            f"skip_max={args.c4_inter_sample_skip_max}, seed={args.c4_seed})"
+        )
 
     c = Console(highlight=False)
     n_prefix = len(VOCABULARY)
@@ -204,6 +306,7 @@ def main() -> int:
             f"[bold]wm_bit_redundancy[/] {WM_BIT_REDUNDANCY}  (channel {CODE_LENGTH * WM_BIT_REDUNDANCY} bits)\n"
             f"[bold]LLM[/] {wm.MODEL_ID}\n"
             f"[bold]prompt_encode[/] {'chat' if use_chat_template else 'plain'}\n"
+            f"[bold]prompt_source[/] {prompt_src}\n"
             f"[bold]vocab[/] |V|={n_prefix}  ·  [bold]NLI prefix[/] multi-label (cutoff={attr_x_nli.NLI_MULTI_LABEL_SCORE_CUTOFF:g})",
             title="app.py protocol run",
         )
@@ -222,7 +325,8 @@ def main() -> int:
     c.print(f"  Master key OK (modulus={sk.modulus}).")
 
     c.rule("2) Generate (baseline → attr_x → PRC → watermarked)", style="cyan")
-    out = wm.generate(sk, PROMPT, use_chat_template=use_chat_template)
+    _log_text(c, "Prompt (before generation)", prompt)
+    out = wm.generate(sk, prompt, use_chat_template=use_chat_template)
     baseline_text = out["baseline_text"]
     wm_text = out["generated_text_wm"]
     x_encode: List[int] = list(out["attr_x"])

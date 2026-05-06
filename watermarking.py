@@ -22,7 +22,7 @@ def _derive_x(text: str, modulus: int, **kwargs) -> List[int]:
         return derive_x(text, modulus)
 
 
-DEFAULT_LLM_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_LLM_MODEL_ID = "meta-llama/Llama-3.2-1B"
 MODEL_ID: str = DEFAULT_LLM_MODEL_ID
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 

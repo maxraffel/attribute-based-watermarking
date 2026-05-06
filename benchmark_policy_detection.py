@@ -11,7 +11,8 @@ policy ``detect`` vs NLI-recovered attribute expectation, counts of which protoc
 
 CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, ``--wm-bit-redundancy``,
 optional ``--llm-model``, ``--no-chat-template`` (plain text completion encoding),
-repeatable ``--prompt-case id:prompt`` or ``--prompt-file`` (UTF-8, one ``id:prompt`` per line, ``#`` comments OK).
+repeatable ``--prompt-case id:prompt``, or ``--c4-realnewslike`` to draw random ``allenai/c4``
+``realnewslike`` snippets (snippet length via ``--c4-snippet-chars``).
 Env: ``BENCHMARK_PLAIN_TABLE``, ``BENCHMARK_CONSOLE_*``
 (see ``make_benchmark_console`` / ``_use_plain_table``).
 """
@@ -21,11 +22,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import random
 import shutil
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from rich.console import Console
 from rich.progress import track
@@ -81,24 +83,79 @@ def parse_prompt_case(spec: str) -> tuple[str, str]:
     return (sid, prompt)
 
 
-def load_prompt_cases_from_path(path: str) -> list[tuple[str, str]]:
+C4_HUB_ID = "allenai/c4"
+C4_CONFIG_REALNEWSLIKE = "realnewslike"
+C4_TRIAL_PROMPT_ID = "c4_realnewslike"
+
+
+def _c4_realnewslike_row_stream(split: str):
+    """Yield rows forever by re-opening the stream if a pass ends (streaming iterator)."""
+    while True:
+        from datasets import load_dataset
+
+        ds = load_dataset(
+            C4_HUB_ID,
+            C4_CONFIG_REALNEWSLIKE,
+            split=split,
+            streaming=True,
+        )
+        yield from ds
+
+
+def make_c4_realnewslike_prompt_sampler(
+    *,
+    snippet_chars: int,
+    seed: int | None = None,
+    split: str = "train",
+    inter_sample_skip_max: int = 256,
+) -> tuple[Callable[[], str], str]:
     """
-    One benchmark case per non-empty line: same ``id:prompt`` rule as ``--prompt-case``.
-    Lines starting with ``#`` (after strip) are ignored.
+    Random-window sampler over ``allenai/c4`` ``realnewslike`` documents (streaming).
+
+    Each call returns ``snippet_chars`` characters from a whitespace-collapsed excerpt of a pseudo-
+    random row's ``text`` field (uniform random contiguous window when the document is longer).
+    Before each draw, skip ``Uniform(0, inter_sample_skip_max)`` dataset rows (when > 0) so trials
+    are not always consecutive RealNews-like documents.
     """
-    cases: list[tuple[str, str]] = []
-    with open(path, encoding="utf-8") as f:
-        for line_no, line in enumerate(f, start=1):
-            s = line.strip()
-            if not s or s.startswith("#"):
+    if snippet_chars < 1:
+        raise ValueError("snippet_chars must be >= 1")
+    if inter_sample_skip_max < 0:
+        raise ValueError("inter_sample_skip_max must be >= 0")
+
+    rng = random.Random(seed) if seed is not None else random.Random()
+    rows = _c4_realnewslike_row_stream(split)
+
+    def sample_prompt() -> str:
+        if inter_sample_skip_max > 0:
+            for _ in range(rng.randint(0, inter_sample_skip_max)):
+                next(rows)
+        attempts = 0
+        max_attempts = 200
+        while attempts < max_attempts:
+            attempts += 1
+            row = next(rows)
+            text = str(row.get("text") or "").strip()
+            if not text:
                 continue
-            try:
-                cases.append(parse_prompt_case(s))
-            except ValueError as e:
-                raise ValueError(f"{path}:{line_no}: {e}") from e
-    if not cases:
-        raise ValueError(f"no prompt cases in {path!r}")
-    return cases
+            collapsed = " ".join(text.split())
+            if not collapsed:
+                continue
+            if len(collapsed) <= snippet_chars:
+                return collapsed
+            start = rng.randrange(len(collapsed) - snippet_chars + 1)
+            return collapsed[start : start + snippet_chars]
+
+        raise RuntimeError(
+            f"could not sample a non-empty snippet from {C4_HUB_ID} {C4_CONFIG_REALNEWSLIKE!r} "
+            f"(split={split!r}) after {max_attempts} rows — check connectivity / dataset schema"
+        )
+
+    banner = (
+        f"c4[{C4_CONFIG_REALNEWSLIKE} split={split!r}] len={snippet_chars}"
+        f" inter_skip_max={inter_sample_skip_max}"
+        + (f" rng_seed={seed}" if seed is not None else "")
+    )
+    return sample_prompt, banner
 
 
 def _ber_percent(secret: list[int], recovered: list[int]) -> float:
@@ -690,38 +747,58 @@ def _print_rich_results(
 
 def run_benchmark(
     *,
-    prompt_cases: Sequence[tuple[str, str]],
     runs: int,
     modulus: int,
     code_length: int,
     fresh_key_per_trial: bool,
     console: Console,
+    prompt_cases: Sequence[tuple[str, str]] = (),
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
     use_chat_template: bool = True,
+    trial_prompt_sampler: Callable[[], str] | None = None,
+    trial_prompt_case_id: str = C4_TRIAL_PROMPT_ID,
+    sampler_banner: str | None = None,
 ) -> int:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    if trial_prompt_sampler is not None and prompt_cases:
+        raise ValueError("pass prompt_cases=() when trial_prompt_sampler is set")
+
+    if trial_prompt_sampler is not None:
+        prompt_cases_eff: list[tuple[str, str]] = [
+            (trial_prompt_case_id, sampler_banner or "(random prompts)"),
+        ]
+        trials = [
+            (i, trial_prompt_case_id, trial_prompt_sampler()) for i in range(runs)
+        ]
+    else:
+        prompt_cases_eff = list(prompt_cases) if prompt_cases else list(DEFAULT_PROMPT_CASES)
+        trials = [
+            (run_i, sid, prompt)
+            for run_i in range(runs)
+            for sid, prompt in prompt_cases_eff
+        ]
 
     if llm_model_id is not None and llm_model_id.strip():
         wm.set_llm_model_id(llm_model_id.strip())
 
     wm.set_prc_code_length(code_length)
     wm.set_wm_bit_redundancy(wm_bit_redundancy)
-    roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
-    roll_xmatch: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
+    roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases_eff}
+    roll_xmatch: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases_eff}
     sk_shared: dict[str, Any] = {}
 
     vocab_n = len(VOCABULARY)
+    banner_extra = f"  |  {sampler_banner}" if sampler_banner else ""
     console.print(
         f"code_length={wm.SECURITY_PARAM}  wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
         f"channel_bits={wm.wm_channel_bits_length()}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
         f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
         f"prompt_encode={'chat' if use_chat_template else 'plain'}  "
-        f"llm={wm.MODEL_ID!r}"
+        f"llm={wm.MODEL_ID!r}{banner_extra}"
     )
-
-    trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
     for _, sid, prompt in track(
         trials,
         description="Benchmark",
@@ -789,14 +866,14 @@ def run_benchmark(
     )
     if plain:
         _print_plain_results(
-            prompt_cases=prompt_cases,
+            prompt_cases=prompt_cases_eff,
             roll=roll,
             vocab_n=vocab_n,
             table_heading=_heading_all,
             print_legend=True,
         )
         _print_plain_results(
-            prompt_cases=prompt_cases,
+            prompt_cases=prompt_cases_eff,
             roll=roll_xmatch,
             vocab_n=vocab_n,
             table_heading=_heading_x,
@@ -804,7 +881,7 @@ def run_benchmark(
         )
     else:
         _print_rich_results(
-            prompt_cases=prompt_cases,
+            prompt_cases=prompt_cases_eff,
             roll=roll,
             vocab_n=vocab_n,
             console=console,
@@ -812,7 +889,7 @@ def run_benchmark(
             print_legend=True,
         )
         _print_rich_results(
-            prompt_cases=prompt_cases,
+            prompt_cases=prompt_cases_eff,
             roll=roll_xmatch,
             vocab_n=vocab_n,
             console=console,
@@ -823,12 +900,12 @@ def run_benchmark(
         )
 
     if plain:
-        _print_timing_table_plain(roll, prompt_cases)
+        _print_timing_table_plain(roll, prompt_cases_eff)
     else:
-        _print_timing_rich_table(roll, prompt_cases, console)
+        _print_timing_rich_table(roll, prompt_cases_eff, console)
 
     all_ok = True
-    for sid, _ in prompt_cases:
+    for sid, _ in prompt_cases_eff:
         r = roll[sid]
         n = r.runs
         if n == 0:
@@ -849,7 +926,7 @@ def run_benchmark(
         if plain:
             print()
             print(msg)
-            for sid, _ in prompt_cases:
+            for sid, _ in prompt_cases_eff:
                 r = roll[sid]
                 n = r.runs
                 if n == 0:
@@ -868,7 +945,7 @@ def run_benchmark(
         else:
             console.print()
             console.print(f"[bold red]{msg}[/]")
-            for sid, _ in prompt_cases:
+            for sid, _ in prompt_cases_eff:
                 r = roll[sid]
                 n = r.runs
                 if n == 0:
@@ -907,18 +984,47 @@ def main() -> int:
         help="Benchmark case (repeatable). First ':' separates id from prompt.",
     )
     p.add_argument(
-        "--prompt-file",
-        metavar="PATH",
-        default=None,
-        help=(
-            "UTF-8 file of cases, one id:prompt per line (same as --prompt-case). "
-            "Empty lines and #-comments ignored. Appended after any --prompt-case values."
-        ),
-    )
-    p.add_argument(
         "--no-chat-template",
         action="store_true",
         help="Encode prompts as plain tokenizer text (skip chat template); text-completion style.",
+    )
+    p.add_argument(
+        "--c4-realnewslike",
+        action="store_true",
+        help=(
+            "Use random snippets from Hugging Face ``allenai/c4`` ``realnewslike`` as prompts "
+            "(``--runs`` independent draws). Mutually exclusive with ``--prompt-case``."
+        ),
+    )
+    p.add_argument(
+        "--c4-snippet-chars",
+        type=int,
+        default=512,
+        metavar="N",
+        help="Character length of each random C4 excerpt (default: 512).",
+    )
+    p.add_argument(
+        "--c4-seed",
+        type=int,
+        default=None,
+        metavar="S",
+        help="Optional RNG seed for C4 window placement and row skips (default: nondeterministic).",
+    )
+    p.add_argument(
+        "--c4-split",
+        default="train",
+        metavar="SPLIT",
+        help="C4 split passed to ``load_dataset`` (default: train).",
+    )
+    p.add_argument(
+        "--c4-inter-sample-skip-max",
+        type=int,
+        default=256,
+        metavar="K",
+        help=(
+            "Before each C4 prompt, skip up to K random rows in the stream (default: 256; use 0 "
+            "to always take the next row)."
+        ),
     )
     p.add_argument(
         "--llm-model",
@@ -941,6 +1047,44 @@ def main() -> int:
     if args.wm_bit_redundancy < 1:
         print("wm-bit-redundancy must be >= 1", file=sys.stderr)
         return 2
+    if args.c4_snippet_chars < 1:
+        print("c4-snippet-chars must be >= 1", file=sys.stderr)
+        return 2
+    if args.c4_inter_sample_skip_max < 0:
+        print("c4-inter-sample-skip-max must be >= 0", file=sys.stderr)
+        return 2
+    if args.c4_realnewslike and args.prompt_cases:
+        print(
+            "--c4-realnewslike cannot be combined with --prompt-case (choose one prompt source)",
+            file=sys.stderr,
+        )
+        return 2
+
+    console = make_benchmark_console()
+    if args.c4_realnewslike:
+        try:
+            sampler, banner = make_c4_realnewslike_prompt_sampler(
+                snippet_chars=args.c4_snippet_chars,
+                seed=args.c4_seed,
+                split=args.c4_split.strip() or "train",
+                inter_sample_skip_max=args.c4_inter_sample_skip_max,
+            )
+        except Exception as e:
+            print(f"C4 sampler setup failed: {e}", file=sys.stderr)
+            return 2
+        return run_benchmark(
+            prompt_cases=(),
+            runs=args.runs,
+            modulus=args.modulus,
+            code_length=args.code_length,
+            fresh_key_per_trial=not args.reuse_key,
+            console=console,
+            llm_model_id=args.llm_model,
+            wm_bit_redundancy=args.wm_bit_redundancy,
+            use_chat_template=not args.no_chat_template,
+            trial_prompt_sampler=sampler,
+            sampler_banner=banner,
+        )
 
     cases: list[tuple[str, str]] = []
     if args.prompt_cases:
@@ -949,19 +1093,9 @@ def main() -> int:
         except ValueError as e:
             print(str(e), file=sys.stderr)
             return 2
-    if args.prompt_file:
-        try:
-            cases.extend(load_prompt_cases_from_path(args.prompt_file.strip()))
-        except OSError as e:
-            print(f"prompt-file: {e}", file=sys.stderr)
-            return 2
-        except ValueError as e:
-            print(str(e), file=sys.stderr)
-            return 2
     if not cases:
         cases = list(DEFAULT_PROMPT_CASES)
 
-    console = make_benchmark_console()
     return run_benchmark(
         prompt_cases=cases,
         runs=args.runs,
