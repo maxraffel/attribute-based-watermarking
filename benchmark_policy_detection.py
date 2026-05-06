@@ -14,14 +14,17 @@ optional ``--llm-model``, repeatable ``--prompt-case id:prompt``. Env: ``BENCHMA
 (see ``make_benchmark_console`` / ``_use_plain_table``).
 
 For notebooks / plotting: ``run_benchmark_with_summary(..., quiet=True)`` returns a ``BenchmarkRunSummary``;
-``micro_fpr`` / ``micro_tpr`` pool per-label policy FPR/TPR; ``prc_random_detect_positive_rate`` estimates PRC
-``detect`` acceptance on random bits against a random PRC key (same spirit as ``testing.py``).
+``micro_fpr`` / ``micro_tpr`` pool per-label policy FPR/TPR; ``micro_fpr_wilson`` / ``micro_tpr_wilson``
+add Wilson score ~95 percent intervals on those pooled proportions; ``wilson_score_interval`` applies likewise to Monte Carlo
+rates; ``prc_random_detect_positive_rate`` estimates PRC ``detect`` acceptance on random bits against a random
+PRC key (same spirit as ``testing.py``).
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import random
 import shutil
@@ -313,6 +316,55 @@ def micro_tpr(
     """Micro-averaged true positive rate for policy ``detect`` vs NLI-active-set gold."""
     tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
     return _rates(tp, fn, tn, fp)[0]
+
+
+def wilson_score_interval(
+    k: int,
+    n: int,
+    *,
+    z: float = 1.96,
+) -> tuple[float, float]:
+    """Wilson score interval for binomial proportion ``k/n`` (default ``z`` = 1.96 ≈ two-sided 95%)."""
+    if n < 0 or k < 0 or k > n:
+        raise ValueError(f"invalid wilson_score_interval args: k={k}, n={n}")
+    if n == 0:
+        return (float("nan"), float("nan"))
+    p = k / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = (p + z2 / (2 * n)) / denom
+    rad = (z / denom) * math.sqrt((p * (1.0 - p) + z2 / (4 * n)) / n)
+    return (max(0.0, centre - rad), min(1.0, centre + rad))
+
+
+def micro_fpr_wilson(
+    roll: dict[str, PromptRollup],
+    prompt_cases: Sequence[tuple[str, str]],
+    *,
+    z: float = 1.96,
+) -> tuple[float, float, float]:
+    """Wilson-interval bounds on micro-FPR pooled over prompts (``FP / (TN+FP)``)."""
+    tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
+    n = tn + fp
+    if n <= 0:
+        return (float("nan"), float("nan"), float("nan"))
+    lo, hi = wilson_score_interval(fp, n, z=z)
+    return (fp / n, lo, hi)
+
+
+def micro_tpr_wilson(
+    roll: dict[str, PromptRollup],
+    prompt_cases: Sequence[tuple[str, str]],
+    *,
+    z: float = 1.96,
+) -> tuple[float, float, float]:
+    """Wilson-interval bounds on micro-TPR pooled over prompts (``TP / (TP+FN)``)."""
+    tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
+    n = tp + fn
+    if n <= 0:
+        return (float("nan"), float("nan"), float("nan"))
+    lo, hi = wilson_score_interval(tp, n, z=z)
+    return (tp / n, lo, hi)
 
 
 def prc_random_detect_positive_rate(
