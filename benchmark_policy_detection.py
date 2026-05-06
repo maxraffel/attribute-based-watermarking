@@ -443,12 +443,25 @@ def run_benchmark_label_conditioned_matrix(
             sid_control[sid] += 1
 
         got_by_row = {str(row["word"]): bool(row["got_detect"]) for row in word_stats}
-        active_labels = [str(row["word"]) for row in word_stats if bool(row["expect_detect"])]
-        for col in active_labels:
+        # Columns are the labels attributed to this trial's WM text (multi-label possible).
+        attributed_cols = tuple(
+            str(row["word"]) for row in word_stats if bool(row["expect_detect"])
+        )
+        if not attributed_cols:
+            continue
+
+        # Rule 1: for each attributed label column, +1 denominator in every row.
+        for col in attributed_cols:
             for row in vocab:
                 denominators[row][col] += 1
-                if got_by_row.get(row, False):
-                    numerators[row][col] += 1
+
+        # Rule 2: for each row-detection that is positive, +1 numerator in that row and
+        # each attributed column only (i.e., same columns used above).
+        for row in vocab:
+            if not got_by_row.get(row, False):
+                continue
+            for col in attributed_cols:
+                numerators[row][col] += 1
 
     all_ok = True
     for sid, _ in prompt_cases:
