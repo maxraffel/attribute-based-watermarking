@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from typing import Any, List, Mapping, MutableMapping, Optional
 
 import torch
@@ -25,6 +26,32 @@ NLI_HYPOTHESIS_TEMPLATE = "The primary subject of this text is {}"
 
 # Per-label sigmoid scores when ``multi_label=True``; used as the active threshold for prefix bits.
 NLI_MULTI_LABEL_SCORE_CUTOFF = 0.9
+
+
+def set_nli_multi_label_cutoff(c: float) -> None:
+    """
+    Update the global multi-label activation threshold used by ``derive_x`` when no per-call override
+    is passed. Accepts values in ``[0, 1]`` (sigmoid scores from the zero-shot pipeline).
+    """
+    global NLI_MULTI_LABEL_SCORE_CUTOFF
+    cf = float(c)
+    if not 0.0 <= cf <= 1.0:
+        raise ValueError("NLI multi-label cutoff must be in [0, 1]")
+    NLI_MULTI_LABEL_SCORE_CUTOFF = cf
+
+
+def _apply_nli_cutoff_from_environment() -> None:
+    """If ``ATTR_X_NLI_CUTOFF`` or ``WATERMARK_NLI_CUTOFF`` is set to a float in ``[0, 1]``, apply it."""
+    for key in ("ATTR_X_NLI_CUTOFF", "WATERMARK_NLI_CUTOFF"):
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        try:
+            set_nli_multi_label_cutoff(float(raw))
+        except ValueError as e:
+            raise ValueError(f"invalid NLI cutoff in environment {key}={raw!r}") from e
+        return
+
 
 logger = logging.getLogger(__name__)
 
@@ -203,3 +230,6 @@ def derive_x(
     tail = _fixed_tail(ATTR_TAIL_DIM, modulus)
     combined = prefix + tail
     return [v % modulus for v in combined]
+
+
+_apply_nli_cutoff_from_environment()
