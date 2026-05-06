@@ -164,7 +164,13 @@ def _log_cprf_seed_agreement(
 def main() -> int:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    # In notebooks, logging is often preconfigured so ``basicConfig`` is ignored.
+    # ``force=True`` guarantees INFO-level attr_x_nli tables appear consistently.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
 
     c = Console(highlight=False)
     n_prefix = len(VOCABULARY)

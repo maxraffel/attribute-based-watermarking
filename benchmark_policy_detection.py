@@ -73,6 +73,26 @@ DEFAULT_PROMPT_CASES: list[tuple[str, str]] = [
 ]
 
 
+COMPREHENSIVE_PROMPT_CASES: list[tuple[str, str]] = [
+    (
+        "brady_econ_new_england",
+        "Explain how Tom Brady's football legacy economically impacted the New England area."
+    ),
+    (
+        "picasso_analysis",
+        "Explain the significance of Picasso's artwork in the art world."
+    ),
+    (
+        "socrates_ethics",
+        "Explain the ethical implications of Socrates's philosophy."
+    ),
+    (
+        ""
+    )
+]
+
+
+
 def parse_prompt_case(spec: str) -> tuple[str, str]:
     spec = spec.strip()
     if ":" not in spec:
@@ -241,6 +261,27 @@ class BenchmarkRunSummary:
     strict_protocol_ok: bool
 
 
+@dataclass(frozen=True)
+class LabelConditionedDetectionMatrix:
+    """
+    Matrix over closed vocabulary labels:
+    - rows: constrained key label used for ``detect``
+    - cols: labels active in verify-time attribution (can be multi-label per trial)
+    - cell value: positive-detect count / conditioning count.
+    """
+
+    vocab: tuple[str, ...]
+    numerators: dict[str, dict[str, int]]
+    denominators: dict[str, dict[str, int]]
+    rates: dict[str, dict[str, float]]
+    prompt_cases: tuple[tuple[str, str], ...]
+    runs_per_prompt: int
+    code_length: int
+    wm_bit_redundancy: int
+    modulus: int
+    strict_protocol_ok: bool
+
+
 def sum_confusion_counts(
     roll: dict[str, PromptRollup],
     prompt_cases: Sequence[tuple[str, str]],
@@ -305,6 +346,143 @@ def prc_random_detect_positive_rate(
         if prc.detect(s, bits):
             fp += 1
     return fp / n_trials, fp
+
+
+def run_benchmark_label_conditioned_matrix(
+    *,
+    prompt_cases: Sequence[tuple[str, str]],
+    runs: int,
+    modulus: int,
+    code_length: int,
+    fresh_key_per_trial: bool,
+    console: Console,
+    llm_model_id: str | None = None,
+    wm_bit_redundancy: int = 1,
+    quiet: bool = False,
+) -> tuple[int, LabelConditionedDetectionMatrix]:
+    """
+    Build a ``|V| x |V|`` matrix conditioned on verify-time active labels.
+
+    For each trial, let ``A`` be the active-label set from verify-time ``derive_x``.
+    For every column label ``c in A`` and every row label ``r in VOCABULARY``:
+      - denominator[r,c] += 1
+      - numerator[r,c] += 1 iff ``detect(issue_keyword_policy([r]), wm_text)`` is True.
+    """
+    for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    if llm_model_id is not None and llm_model_id.strip():
+        wm.set_llm_model_id(llm_model_id.strip())
+
+    if runs < 1:
+        raise ValueError("runs must be >= 1")
+    if code_length < 1:
+        raise ValueError("code_length must be >= 1")
+    if wm_bit_redundancy < 1:
+        raise ValueError("wm_bit_redundancy must be >= 1")
+
+    wm.set_prc_code_length(code_length)
+    wm.set_wm_bit_redundancy(wm_bit_redundancy)
+    vocab = tuple(VOCABULARY)
+    numerators: dict[str, dict[str, int]] = {
+        r: {c: 0 for c in vocab} for r in vocab
+    }
+    denominators: dict[str, dict[str, int]] = {
+        r: {c: 0 for c in vocab} for r in vocab
+    }
+    sk_shared: dict[str, Any] = {}
+    sid_runs: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
+    sid_master: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
+    sid_open: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
+    sid_ucprf: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
+    sid_control: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
+
+    if not quiet:
+        console.print(
+            f"matrix benchmark  code_length={wm.SECURITY_PARAM}  "
+            f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  modulus={modulus}  runs={runs}  |V|={len(vocab)}  "
+            f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
+            f"llm={wm.MODEL_ID!r}"
+        )
+
+    trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
+    for _, sid, prompt in track(
+        trials,
+        description="Benchmark matrix",
+        console=console,
+        transient=True,
+        disable=quiet,
+    ):
+        if fresh_key_per_trial:
+            sk = wm.setup(modulus)
+        else:
+            if sk_shared.get(sid) is None:
+                sk_shared[sid] = wm.setup(modulus)
+            sk = sk_shared[sid]
+
+        (
+            word_stats,
+            _x_perfect,
+            master_ok,
+            open_ok,
+            _cprf_label_ok,
+            _cprf_label_n,
+            control_ok,
+            _ber,
+            _tt_inner,
+            em_open_m,
+        ) = run_one_trial(sk, prompt)
+        sid_runs[sid] += 1
+        if master_ok:
+            sid_master[sid] += 1
+        if open_ok:
+            sid_open[sid] += 1
+        if em_open_m:
+            sid_ucprf[sid] += 1
+        if control_ok:
+            sid_control[sid] += 1
+
+        got_by_row = {str(row["word"]): bool(row["got_detect"]) for row in word_stats}
+        active_labels = [str(row["word"]) for row in word_stats if bool(row["expect_detect"])]
+        for col in active_labels:
+            for row in vocab:
+                denominators[row][col] += 1
+                if got_by_row.get(row, False):
+                    numerators[row][col] += 1
+
+    all_ok = True
+    for sid, _ in prompt_cases:
+        n = sid_runs[sid]
+        if n == 0:
+            continue
+        ok = (
+            sid_master[sid] == n
+            and sid_open[sid] == n
+            and sid_ucprf[sid] == n
+            and sid_control[sid] == n
+        )
+        all_ok = all_ok and ok
+
+    rates: dict[str, dict[str, float]] = {r: {} for r in vocab}
+    for r in vocab:
+        for c in vocab:
+            d = denominators[r][c]
+            n = numerators[r][c]
+            rates[r][c] = (n / d) if d > 0 else -1.0
+
+    matrix = LabelConditionedDetectionMatrix(
+        vocab=vocab,
+        numerators=numerators,
+        denominators=denominators,
+        rates=rates,
+        prompt_cases=tuple((sid, p) for sid, p in prompt_cases),
+        runs_per_prompt=runs,
+        code_length=code_length,
+        wm_bit_redundancy=wm.WM_BIT_REDUNDANCY,
+        modulus=modulus,
+        strict_protocol_ok=all_ok,
+    )
+    return (0 if all_ok else 1, matrix)
 
 
 def _derive_x_verify(wm_text: str, modulus: int) -> list[int]:
