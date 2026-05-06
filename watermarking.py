@@ -30,7 +30,7 @@ DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 # ``randrecover``'s incremental path (``_prepare_generation_config``). Set keys here to override
 # the model card (e.g. Llama-3.2-1B-Instruct defaults: temperature≈0.6, top_k=50, top_p=0.9).
 GENERATION_SAMPLING_OVERRIDES: dict = {
-    "temperature": 1,
+    "temperature": 0.7,
     "top_p": 1.0,
     "top_k": 0,  # HF: 0 often means disable top-k
 }
