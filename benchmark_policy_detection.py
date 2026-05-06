@@ -5,8 +5,9 @@ issue unconstrained + one constrained key per closed-vocabulary label → CPRF s
 
 Runs many trials over configurable prompts and code length with a Rich **progress bar** (transient).
 Per-trial logging is minimal; results are **aggregated into tables**: per-prompt TPR/FNR/TNR/FPR for
-policy ``detect`` vs NLI-recovered attribute expectation, counts of which protocol stages matched,
-and mean wall time per pipeline stage.
+policy ``detect`` vs NLI-recovered attribute expectation, counts of which protocol stages matched;
+**the same policy table** computed only on runs where encode-time ``attr_x`` equals verify-time
+``derive_x`` (full vector); then mean wall time per pipeline stage.
 
 CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, ``--wm-bit-redundancy``,
 optional ``--llm-model``, repeatable ``--prompt-case id:prompt``. Env: ``BENCHMARK_PLAIN_TABLE``, ``BENCHMARK_CONSOLE_*``
@@ -530,13 +531,11 @@ def _print_plain_results(
     prompt_cases: Sequence[tuple[str, str]],
     roll: dict[str, PromptRollup],
     vocab_n: int,
+    table_heading: str,
+    print_legend: bool,
 ) -> None:
     print()
-    print(
-        "Per-prompt aggregates: policy detection vs NLI attribute (counts over runs × labels="
-        + str(vocab_n)
-        + ")"
-    )
+    print(table_heading)
     w_sid = 22
     line = (
         f"{'id':<{w_sid}} {'runs':>5} {'TPR%':>7} {'FNR%':>7} {'TNR%':>7} {'FPR%':>7} "
@@ -552,7 +551,14 @@ def _print_plain_results(
     for sid, _ in prompt_cases:
         r = roll[sid]
         n = r.runs
+        sid_disp = sid if len(sid) <= w_sid else sid[: w_sid - 3] + "..."
         if n == 0:
+            print(
+                f"{sid_disp:<{w_sid}} {n:5d} "
+                f"{'n/a':>7} {'n/a':>7} {'n/a':>7} {'n/a':>7} "
+                f"{'0/0':>7} {'n/a':>6} {'n/a':>6} {'n/a':>6} {'n/a':>6} {'n/a':>6} "
+                f"{'n/a':>8} {'n/a':>5} {'n/a':>4} {'n/a':>4} {'n/a':>4}"
+            )
             continue
         tpr, fnr, tnr, fpr = _rates(r.tp, r.fn, r.tn, r.fp)
         lcprf = (
@@ -561,7 +567,6 @@ def _print_plain_results(
             else "n/a"
         )
         mism = str(r.mismatch_total) if r.mismatch_total else "0"
-        sid_disp = sid if len(sid) <= w_sid else sid[: w_sid - 3] + "..."
         print(
             f"{sid_disp:<{w_sid}} {n:5d} "
             f"{_fmt_rate(tpr):>7} {_fmt_rate(fnr):>7} {_fmt_rate(tnr):>7} {_fmt_rate(fpr):>7} "
@@ -572,15 +577,16 @@ def _print_plain_results(
             f"{r.mismatch_fn_with_matching_seeds:>4} {r.mismatch_fp_with_split_seeds:>4}"
         )
 
-    print()
-    print(
-        "Legend: TPR/FNR/TNR/FPR from per-(run, vocab label) gold = label in recovered NLI-active set; "
-        "mast/open/ctrl = successes/runs; ucprf = unconstrained CPRF seed match; "
-        "lcprf = fraction of per-label CPRF checks where sk.eval==dk.c_eval matched attribute-based expectation; "
-        "mism = total attribute-vs-detect mismatches; m_cp = mismatches where CPRF seed equality disagreed "
-        "with that expectation (composite modulus heuristic); FN_s = FN with seeds matching anyway (LDPC?); "
-        "FP_s = FP with CPRF seeds split (possible LDPC false positive)."
-    )
+    if print_legend:
+        print()
+        print(
+            "Legend: TPR/FNR/TNR/FPR from per-(run, vocab label) gold = label in recovered NLI-active set; "
+            "mast/open/ctrl = successes/runs; ucprf = unconstrained CPRF seed match; "
+            "lcprf = fraction of per-label CPRF checks where sk.eval==dk.c_eval matched attribute-based expectation; "
+            "mism = total attribute-vs-detect mismatches; m_cp = mismatches where CPRF seed equality disagreed "
+            "with that expectation (composite modulus heuristic); FN_s = FN with seeds matching anyway (LDPC?); "
+            "FP_s = FP with CPRF seeds split (possible LDPC false positive)."
+        )
 
 
 def _print_rich_results(
@@ -589,11 +595,11 @@ def _print_rich_results(
     roll: dict[str, PromptRollup],
     vocab_n: int,
     console: Console,
+    table_title: str,
+    print_legend: bool,
 ) -> None:
     console.print()
-    table = Table(
-        title=f"Per-prompt policy metrics (runs × |V|={vocab_n} label decisions per run)",
-    )
+    table = Table(title=table_title)
     table.add_column("prompt_id", style="dim")
     table.add_column("runs", justify="right")
     for col in ("TPR", "FNR", "TNR", "FPR", "x==", "master", "open", "uCPRF", "lCPRF", "ctrl", "BER%", "mism", "ΔCP", "FN•", "FP•"):
@@ -603,6 +609,25 @@ def _print_rich_results(
         r = roll[sid]
         n = r.runs
         if n == 0:
+            table.add_row(
+                sid,
+                "0",
+                "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+                "0/0",
+                "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+            )
             continue
         tpr, fnr, tnr, fpr = _rates(r.tp, r.fn, r.tn, r.fp)
         lcprf = (
@@ -630,12 +655,13 @@ def _print_rich_results(
             str(r.mismatch_fp_with_split_seeds),
         )
     console.print(table)
-    console.print(
-        "[dim]Gold positive = label in verify-time active set; pred positive = detect True. "
-        "uCPRF = unconstrained sk.eval==dk.c_eval. lCPRF = per-label CPRF expectation hits / checks. "
-        "mism = attribute-vs-detect mismatches; ΔCP = mismatches where CPRF vs attribute expectation disagreed; "
-        "FN• = FN with matching seeds (suspect LDPC); FP• = FP with split seeds (suspect LDPC).[/]"
-    )
+    if print_legend:
+        console.print(
+            "[dim]Gold positive = label in verify-time active set; pred positive = detect True. "
+            "uCPRF = unconstrained sk.eval==dk.c_eval. lCPRF = per-label CPRF expectation hits / checks. "
+            "mism = attribute-vs-detect mismatches; ΔCP = mismatches where CPRF vs attribute expectation disagreed; "
+            "FN• = FN with matching seeds (suspect LDPC); FP• = FP with split seeds (suspect LDPC).[/]"
+        )
 
 
 def run_benchmark(
@@ -658,6 +684,7 @@ def run_benchmark(
     wm.set_prc_code_length(code_length)
     wm.set_wm_bit_redundancy(wm_bit_redundancy)
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
+    roll_xmatch: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     sk_shared: dict[str, Any] = {}
 
     vocab_n = len(VOCABULARY)
@@ -710,13 +737,63 @@ def run_benchmark(
             ber=ber,
             timings=tt_inner,
         )
+        if x_perfect:
+            roll_xmatch[sid].add_run(
+                word_stats=word_stats,
+                x_perfect=True,
+                master_ok=master_ok,
+                open_ok=open_ok,
+                unconstrained_cprf_ok=em_open_m,
+                cprf_per_label_ok=cprf_label_ok,
+                cprf_per_label_n=cprf_label_n,
+                control_ok=control_ok,
+                ber=ber,
+                timings=tt_inner,
+            )
 
     plain = _use_plain_table()
+    _heading_all = (
+        "Per-prompt aggregates: policy detection vs NLI attribute (counts over runs × labels="
+        + str(vocab_n)
+        + ")"
+    )
+    _heading_x = (
+        "Same metrics, restricted to runs where encode-time attr_x equals verify-time derive_x "
+        f"(full vector; runs × |V|={vocab_n} label decisions per included run)"
+    )
     if plain:
-        _print_plain_results(prompt_cases=prompt_cases, roll=roll, vocab_n=vocab_n)
+        _print_plain_results(
+            prompt_cases=prompt_cases,
+            roll=roll,
+            vocab_n=vocab_n,
+            table_heading=_heading_all,
+            print_legend=True,
+        )
+        _print_plain_results(
+            prompt_cases=prompt_cases,
+            roll=roll_xmatch,
+            vocab_n=vocab_n,
+            table_heading=_heading_x,
+            print_legend=False,
+        )
     else:
         _print_rich_results(
-            prompt_cases=prompt_cases, roll=roll, vocab_n=vocab_n, console=console
+            prompt_cases=prompt_cases,
+            roll=roll,
+            vocab_n=vocab_n,
+            console=console,
+            table_title=f"Per-prompt policy metrics (runs × |V|={vocab_n} label decisions per run)",
+            print_legend=True,
+        )
+        _print_rich_results(
+            prompt_cases=prompt_cases,
+            roll=roll_xmatch,
+            vocab_n=vocab_n,
+            console=console,
+            table_title=(
+                f"Per-prompt policy metrics — x matched only (runs × |V|={vocab_n} per included run)"
+            ),
+            print_legend=False,
         )
 
     if plain:
