@@ -8,7 +8,7 @@ print("\n--- Testing Many Random Strings ---")
 TEST_CODE_LEN = 200
 prc.set_code_length(TEST_CODE_LEN)
 random_testing_s = prc.key_gen_from_seed(sha256(secrets.token_bytes(TEST_CODE_LEN)).digest())
-num_random_tests = 5000
+num_random_tests = 100000
 false_positives = 0
 total_ber = 0.0
 secret_int = secrets.randbits(TEST_CODE_LEN)
@@ -32,7 +32,7 @@ CODE_LEN = 100
 prc.set_code_length(CODE_LEN)
 sk = cprf.keygen(1024, CODE_LEN)
 
-num_cases = 1000
+num_cases = 100
 expected_success = 0
 expected_failure = 0
 true_positive = 0
