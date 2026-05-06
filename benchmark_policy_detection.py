@@ -12,6 +12,10 @@ policy ``detect`` vs NLI-recovered attribute expectation, counts of which protoc
 CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, ``--wm-bit-redundancy``,
 optional ``--llm-model``, repeatable ``--prompt-case id:prompt``. Env: ``BENCHMARK_PLAIN_TABLE``, ``BENCHMARK_CONSOLE_*``
 (see ``make_benchmark_console`` / ``_use_plain_table``).
+
+For notebooks / plotting: ``run_benchmark_with_summary(..., quiet=True)`` returns a ``BenchmarkRunSummary``;
+``micro_fpr`` pools per-label policy FPR; ``prc_random_detect_positive_rate`` estimates PRC ``detect`` acceptance on
+random bits against a random PRC key (same spirit as ``testing.py``).
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import random
 import shutil
 import sys
 import time
@@ -220,6 +225,77 @@ class PromptRollup:
         self.timings.t_detect_open += timings.t_detect_open
         self.timings.t_detect_per_label += timings.t_detect_per_label
         self.timings.t_negative_control += timings.t_negative_control
+
+
+@dataclass(frozen=True)
+class BenchmarkRunSummary:
+    """Aggregates after ``run_benchmark_with_summary`` (rollups are read-only for callers)."""
+
+    roll: dict[str, PromptRollup]
+    roll_xmatch: dict[str, PromptRollup]
+    prompt_cases: tuple[tuple[str, str], ...]
+    vocab_n: int
+    code_length: int
+    wm_bit_redundancy: int
+    modulus: int
+    strict_protocol_ok: bool
+
+
+def sum_confusion_counts(
+    roll: dict[str, PromptRollup],
+    prompt_cases: Sequence[tuple[str, str]],
+) -> tuple[int, int, int, int]:
+    """Sum TP/FN/TN/FP over every prompt id (micro pool over runs × labels)."""
+    tp = fn = tn = fp = 0
+    for sid, _ in prompt_cases:
+        r = roll[sid]
+        tp += r.tp
+        fn += r.fn
+        tn += r.tn
+        fp += r.fp
+    return tp, fn, tn, fp
+
+
+def micro_fpr(
+    roll: dict[str, PromptRollup],
+    prompt_cases: Sequence[tuple[str, str]],
+) -> float:
+    """Micro-averaged false positive rate for policy ``detect`` vs NLI-active-set gold."""
+    tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
+    return _rates(tp, fn, tn, fp)[3]
+
+
+def prc_random_detect_positive_rate(
+    code_length: int,
+    n_trials: int,
+    *,
+    rng: random.Random | None = None,
+) -> tuple[float, int]:
+    """
+    Empirical positive rate of ``prc.detect`` on **pure randomness at both ends**: one fixed random
+    PRC user key ``s`` (from ``prc.key_gen_from_seed``), and each trial uses an independent length-``code_length``
+    bit vector with i.i.d. fair bits (same construction as ``testing.py``).
+
+    Returns ``(rate, false_positive_count)`` with ``rate = false_positive_count / n_trials``.
+    """
+    from hashlib import sha256
+
+    import prc
+
+    if code_length < 1:
+        raise ValueError("code_length must be >= 1")
+    if n_trials < 1:
+        raise ValueError("n_trials must be >= 1")
+    prng = rng if rng is not None else random.Random()
+    wm.set_prc_code_length(code_length)
+    s = prc.key_gen_from_seed(sha256(prng.randbytes(32)).digest())
+    fp = 0
+    for _ in range(n_trials):
+        ri = prng.getrandbits(code_length)
+        bits = [c == "1" for c in bin(ri)[2:].zfill(code_length)]
+        if prc.detect(s, bits):
+            fp += 1
+    return fp / n_trials, fp
 
 
 def _derive_x_verify(wm_text: str, modulus: int) -> list[int]:
@@ -664,7 +740,78 @@ def _print_rich_results(
         )
 
 
-def run_benchmark(
+def _strict_protocol_ok(
+    roll: dict[str, PromptRollup],
+    prompt_cases: Sequence[tuple[str, str]],
+) -> bool:
+    all_ok = True
+    for sid, _ in prompt_cases:
+        r = roll[sid]
+        n = r.runs
+        if n == 0:
+            continue
+        ok = (
+            r.master_good == n
+            and r.open_detect_good == n
+            and r.unconstrained_cprf_ok == n
+            and r.control_correct == n
+        )
+        all_ok = all_ok and ok
+    return all_ok
+
+
+def _print_protocol_failure_details(
+    *,
+    roll: dict[str, PromptRollup],
+    prompt_cases: Sequence[tuple[str, str]],
+    plain: bool,
+    console: Console,
+) -> None:
+    msg = (
+        "Protocol checks did not pass on every run (require: master_detect good, detect open, "
+        "unconstrained CPRF match, negative control rejects)."
+    )
+    if plain:
+        print()
+        print(msg)
+        for sid, _ in prompt_cases:
+            r = roll[sid]
+            n = r.runs
+            if n == 0:
+                continue
+            bad: list[str] = []
+            if r.master_good < n:
+                bad.append(f"master {r.master_good}/{n}")
+            if r.open_detect_good < n:
+                bad.append(f"open {r.open_detect_good}/{n}")
+            if r.unconstrained_cprf_ok < n:
+                bad.append(f"u_cprf {r.unconstrained_cprf_ok}/{n}")
+            if r.control_correct < n:
+                bad.append(f"control {r.control_correct}/{n}")
+            if bad:
+                print(f"  {sid}: " + ", ".join(bad))
+    else:
+        console.print()
+        console.print(f"[bold red]{msg}[/]")
+        for sid, _ in prompt_cases:
+            r = roll[sid]
+            n = r.runs
+            if n == 0:
+                continue
+            bad: list[str] = []
+            if r.master_good < n:
+                bad.append(f"master {r.master_good}/{n}")
+            if r.open_detect_good < n:
+                bad.append(f"open {r.open_detect_good}/{n}")
+            if r.unconstrained_cprf_ok < n:
+                bad.append(f"u_cprf {r.unconstrained_cprf_ok}/{n}")
+            if r.control_correct < n:
+                bad.append(f"control {r.control_correct}/{n}")
+            if bad:
+                console.print(f"  [yellow]{sid}:[/] " + ", ".join(bad))
+
+
+def run_benchmark_with_summary(
     *,
     prompt_cases: Sequence[tuple[str, str]],
     runs: int,
@@ -674,7 +821,8 @@ def run_benchmark(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
-) -> int:
+    quiet: bool = False,
+) -> tuple[int, BenchmarkRunSummary]:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
@@ -688,12 +836,13 @@ def run_benchmark(
     sk_shared: dict[str, Any] = {}
 
     vocab_n = len(VOCABULARY)
-    console.print(
-        f"code_length={wm.SECURITY_PARAM}  wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
-        f"channel_bits={wm.wm_channel_bits_length()}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
-        f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
-        f"llm={wm.MODEL_ID!r}"
-    )
+    if not quiet:
+        console.print(
+            f"code_length={wm.SECURITY_PARAM}  wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
+            f"channel_bits={wm.wm_channel_bits_length()}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
+            f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
+            f"llm={wm.MODEL_ID!r}"
+        )
 
     trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
     for _, sid, prompt in track(
@@ -701,6 +850,7 @@ def run_benchmark(
         description="Benchmark",
         console=console,
         transient=True,
+        disable=quiet,
     ):
         t_setup0 = time.perf_counter()
         if fresh_key_per_trial:
@@ -751,115 +901,100 @@ def run_benchmark(
                 timings=tt_inner,
             )
 
+    all_ok = _strict_protocol_ok(roll, prompt_cases)
+    summary = BenchmarkRunSummary(
+        roll=roll,
+        roll_xmatch=roll_xmatch,
+        prompt_cases=tuple((sid, p) for sid, p in prompt_cases),
+        vocab_n=vocab_n,
+        code_length=code_length,
+        wm_bit_redundancy=wm.WM_BIT_REDUNDANCY,
+        modulus=modulus,
+        strict_protocol_ok=all_ok,
+    )
+
     plain = _use_plain_table()
-    _heading_all = (
-        "Per-prompt aggregates: policy detection vs NLI attribute (counts over runs × labels="
-        + str(vocab_n)
-        + ")"
-    )
-    _heading_x = (
-        "Same metrics, restricted to runs where encode-time attr_x equals verify-time derive_x "
-        f"(full vector; runs × |V|={vocab_n} label decisions per included run)"
-    )
-    if plain:
-        _print_plain_results(
-            prompt_cases=prompt_cases,
-            roll=roll,
-            vocab_n=vocab_n,
-            table_heading=_heading_all,
-            print_legend=True,
+    if not quiet:
+        _heading_all = (
+            "Per-prompt aggregates: policy detection vs NLI attribute (counts over runs × labels="
+            + str(vocab_n)
+            + ")"
         )
-        _print_plain_results(
-            prompt_cases=prompt_cases,
-            roll=roll_xmatch,
-            vocab_n=vocab_n,
-            table_heading=_heading_x,
-            print_legend=False,
-        )
-    else:
-        _print_rich_results(
-            prompt_cases=prompt_cases,
-            roll=roll,
-            vocab_n=vocab_n,
-            console=console,
-            table_title=f"Per-prompt policy metrics (runs × |V|={vocab_n} label decisions per run)",
-            print_legend=True,
-        )
-        _print_rich_results(
-            prompt_cases=prompt_cases,
-            roll=roll_xmatch,
-            vocab_n=vocab_n,
-            console=console,
-            table_title=(
-                f"Per-prompt policy metrics — x matched only (runs × |V|={vocab_n} per included run)"
-            ),
-            print_legend=False,
-        )
-
-    if plain:
-        _print_timing_table_plain(roll, prompt_cases)
-    else:
-        _print_timing_rich_table(roll, prompt_cases, console)
-
-    all_ok = True
-    for sid, _ in prompt_cases:
-        r = roll[sid]
-        n = r.runs
-        if n == 0:
-            continue
-        ok = (
-            r.master_good == n
-            and r.open_detect_good == n
-            and r.unconstrained_cprf_ok == n
-            and r.control_correct == n
-        )
-        all_ok = all_ok and ok
-
-    if not all_ok:
-        msg = (
-            "Protocol checks did not pass on every run (require: master_detect good, detect open, "
-            "unconstrained CPRF match, negative control rejects)."
+        _heading_x = (
+            "Same metrics, restricted to runs where encode-time attr_x equals verify-time derive_x "
+            f"(full vector; runs × |V|={vocab_n} label decisions per included run)"
         )
         if plain:
-            print()
-            print(msg)
-            for sid, _ in prompt_cases:
-                r = roll[sid]
-                n = r.runs
-                if n == 0:
-                    continue
-                bad: list[str] = []
-                if r.master_good < n:
-                    bad.append(f"master {r.master_good}/{n}")
-                if r.open_detect_good < n:
-                    bad.append(f"open {r.open_detect_good}/{n}")
-                if r.unconstrained_cprf_ok < n:
-                    bad.append(f"u_cprf {r.unconstrained_cprf_ok}/{n}")
-                if r.control_correct < n:
-                    bad.append(f"control {r.control_correct}/{n}")
-                if bad:
-                    print(f"  {sid}: " + ", ".join(bad))
+            _print_plain_results(
+                prompt_cases=prompt_cases,
+                roll=roll,
+                vocab_n=vocab_n,
+                table_heading=_heading_all,
+                print_legend=True,
+            )
+            _print_plain_results(
+                prompt_cases=prompt_cases,
+                roll=roll_xmatch,
+                vocab_n=vocab_n,
+                table_heading=_heading_x,
+                print_legend=False,
+            )
         else:
-            console.print()
-            console.print(f"[bold red]{msg}[/]")
-            for sid, _ in prompt_cases:
-                r = roll[sid]
-                n = r.runs
-                if n == 0:
-                    continue
-                bad: list[str] = []
-                if r.master_good < n:
-                    bad.append(f"master {r.master_good}/{n}")
-                if r.open_detect_good < n:
-                    bad.append(f"open {r.open_detect_good}/{n}")
-                if r.unconstrained_cprf_ok < n:
-                    bad.append(f"u_cprf {r.unconstrained_cprf_ok}/{n}")
-                if r.control_correct < n:
-                    bad.append(f"control {r.control_correct}/{n}")
-                if bad:
-                    console.print(f"  [yellow]{sid}:[/] " + ", ".join(bad))
+            _print_rich_results(
+                prompt_cases=prompt_cases,
+                roll=roll,
+                vocab_n=vocab_n,
+                console=console,
+                table_title=f"Per-prompt policy metrics (runs × |V|={vocab_n} label decisions per run)",
+                print_legend=True,
+            )
+            _print_rich_results(
+                prompt_cases=prompt_cases,
+                roll=roll_xmatch,
+                vocab_n=vocab_n,
+                console=console,
+                table_title=(
+                    f"Per-prompt policy metrics — x matched only (runs × |V|={vocab_n} per included run)"
+                ),
+                print_legend=False,
+            )
 
-    return 0 if all_ok else 1
+        if plain:
+            _print_timing_table_plain(roll, prompt_cases)
+        else:
+            _print_timing_rich_table(roll, prompt_cases, console)
+
+        if not all_ok:
+            _print_protocol_failure_details(
+                roll=roll, prompt_cases=prompt_cases, plain=plain, console=console
+            )
+
+    return (0 if all_ok else 1, summary)
+
+
+def run_benchmark(
+    *,
+    prompt_cases: Sequence[tuple[str, str]],
+    runs: int,
+    modulus: int,
+    code_length: int,
+    fresh_key_per_trial: bool,
+    console: Console,
+    llm_model_id: str | None = None,
+    wm_bit_redundancy: int = 1,
+) -> int:
+    code, _ = run_benchmark_with_summary(
+        prompt_cases=prompt_cases,
+        runs=runs,
+        modulus=modulus,
+        code_length=code_length,
+        fresh_key_per_trial=fresh_key_per_trial,
+        console=console,
+        llm_model_id=llm_model_id,
+        wm_bit_redundancy=wm_bit_redundancy,
+        quiet=False,
+    )
+    return code
 
 
 def main() -> int:
