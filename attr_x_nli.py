@@ -24,7 +24,7 @@ _FIXED_TAIL_SEED = b"watermarking-for-llm/attr-x/fixed-tail/v1\x00"
 NLI_HYPOTHESIS_TEMPLATE = "A primary subject of this text is {}"
 
 # Per-label sigmoid scores when ``multi_label=True``; used as the active threshold for prefix bits.
-NLI_MULTI_LABEL_SCORE_CUTOFF = 0.9
+NLI_MULTI_LABEL_SCORE_CUTOFF = 0.99
 
 logger = logging.getLogger(__name__)
 
