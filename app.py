@@ -10,7 +10,8 @@ Optional **environment** overrides (e.g. Colab before ``runpy.run_path``): ``APP
 Plain text completion encoding (skip tokenizer chat template): ``APP_NO_CHAT_TEMPLATE`` or
 ``WATERMARK_NO_CHAT_TEMPLATE`` set to ``1``/``true``/``yes``, or CLI ``--no-chat-template``.
 Prompt-source testing: ``APP_USE_C4_SNIPPET`` / ``WATERMARK_USE_C4_SNIPPET`` or
-CLI ``--use-c4-snippet`` to draw one random snippet from ``allenai/c4`` ``realnewslike``.
+CLI ``--use-c4-snippet`` to draw a prompt from ``allenai/c4`` ``realnewslike`` (whitespace-collapsed
+text, **leading** ``N`` characters after a random row skip—not a random mid-document window).
 
 Run: ``uv run python app.py`` (optional: ``--no-chat-template`` / ``--use-c4-snippet``)
 """
@@ -88,7 +89,13 @@ def _sample_prompt_from_c4_realnewslike(
     seed: int | None,
     inter_sample_skip_max: int,
 ) -> str:
-    """Sample one prompt-sized snippet from ``allenai/c4`` ``realnewslike`` (streaming)."""
+    """
+    Take the **start** of one document from ``allenai/c4`` ``realnewslike`` (streaming).
+
+    After collapsing whitespace, if the text is longer than ``snippet_chars``, return the prefix
+    ``text[:snippet_chars]`` so sentence/paragraph openings stay intact (no random window).
+    Which **row** is used is still stochastic via ``inter_sample_skip_max`` and streaming order.
+    """
     if snippet_chars < 1:
         raise ValueError("C4 snippet_chars must be >= 1")
     if inter_sample_skip_max < 0:
@@ -111,8 +118,7 @@ def _sample_prompt_from_c4_realnewslike(
             continue
         if len(text) <= snippet_chars:
             return text
-        start = rng.randrange(len(text) - snippet_chars + 1)
-        return text[start : start + snippet_chars]
+        return text[:snippet_chars]
 
     raise RuntimeError("failed to sample non-empty C4 snippet after 200 attempts")
 
@@ -238,21 +244,26 @@ def main() -> int:
     ap.add_argument(
         "--use-c4-snippet",
         action="store_true",
-        help="Use one random snippet from allenai/c4 realnewslike as the prompt.",
+        help=(
+            "Use allenai/c4 realnewslike as the prompt: whitespace-collapsed leading N chars "
+            "(see --c4-snippet-chars), not a random substring."
+        ),
     )
     ap.add_argument(
         "--c4-snippet-chars",
         type=int,
         default=C4_SNIPPET_CHARS,
         metavar="N",
-        help=f"Snippet length for --use-c4-snippet (default: {C4_SNIPPET_CHARS}).",
+        help=(
+            f"Max characters from the start of each sampled C4 row (default: {C4_SNIPPET_CHARS})."
+        ),
     )
     ap.add_argument(
         "--c4-seed",
         type=int,
         default=C4_SEED,
         metavar="S",
-        help="Optional RNG seed for C4 sampling (default: env or nondeterministic).",
+        help="Optional RNG seed for C4 row skips / which row is taken (default: env or nondeterministic).",
     )
     ap.add_argument(
         "--c4-split",
@@ -289,7 +300,7 @@ def main() -> int:
             inter_sample_skip_max=args.c4_inter_sample_skip_max,
         )
         prompt_src = (
-            f"c4(realnewslike, split={split!r}, chars={args.c4_snippet_chars}, "
+            f"c4(realnewslike, split={split!r}, leading_chars={args.c4_snippet_chars}, "
             f"skip_max={args.c4_inter_sample_skip_max}, seed={args.c4_seed})"
         )
 

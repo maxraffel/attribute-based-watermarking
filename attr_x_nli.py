@@ -21,10 +21,10 @@ NLI_MODEL_ID = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
 _FIXED_TAIL_SEED = b"watermarking-for-llm/attr-x/fixed-tail/v1\x00"
 
 # Hugging Face ``hypothesis_template`` for zero-shot labels; ``{}`` is replaced by each candidate.
-NLI_HYPOTHESIS_TEMPLATE = "A primary subject of this text is {}"
+NLI_HYPOTHESIS_TEMPLATE = "The primary subject of this text is {}"
 
 # Per-label sigmoid scores when ``multi_label=True``; used as the active threshold for prefix bits.
-NLI_MULTI_LABEL_SCORE_CUTOFF = 0.9
+NLI_MULTI_LABEL_SCORE_CUTOFF = 0.75
 
 logger = logging.getLogger(__name__)
 

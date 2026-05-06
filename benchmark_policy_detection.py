@@ -12,7 +12,7 @@ policy ``detect`` vs NLI-recovered attribute expectation, counts of which protoc
 CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, ``--wm-bit-redundancy``,
 optional ``--llm-model``, ``--no-chat-template`` (plain text completion encoding),
 repeatable ``--prompt-case id:prompt``, or ``--c4-realnewslike`` to draw random ``allenai/c4``
-``realnewslike`` snippets (snippet length via ``--c4-snippet-chars``).
+``realnewslike`` prompts: **leading** excerpt of length ``--c4-snippet-chars`` per sampled row.
 Env: ``BENCHMARK_PLAIN_TABLE``, ``BENCHMARK_CONSOLE_*``
 (see ``make_benchmark_console`` / ``_use_plain_table``).
 """
@@ -110,10 +110,10 @@ def make_c4_realnewslike_prompt_sampler(
     inter_sample_skip_max: int = 256,
 ) -> tuple[Callable[[], str], str]:
     """
-    Random-window sampler over ``allenai/c4`` ``realnewslike`` documents (streaming).
+    Prefix sampler over ``allenai/c4`` ``realnewslike`` documents (streaming).
 
-    Each call returns ``snippet_chars`` characters from a whitespace-collapsed excerpt of a pseudo-
-    random row's ``text`` field (uniform random contiguous window when the document is longer).
+    Each call returns the first ``snippet_chars`` characters of a whitespace-collapsed row ``text``
+    (or the full row if shorter)—**no random mid-document window**, so openings stay intact.
     Before each draw, skip ``Uniform(0, inter_sample_skip_max)`` dataset rows (when > 0) so trials
     are not always consecutive RealNews-like documents.
     """
@@ -142,8 +142,7 @@ def make_c4_realnewslike_prompt_sampler(
                 continue
             if len(collapsed) <= snippet_chars:
                 return collapsed
-            start = rng.randrange(len(collapsed) - snippet_chars + 1)
-            return collapsed[start : start + snippet_chars]
+            return collapsed[:snippet_chars]
 
         raise RuntimeError(
             f"could not sample a non-empty snippet from {C4_HUB_ID} {C4_CONFIG_REALNEWSLIKE!r} "
@@ -992,8 +991,9 @@ def main() -> int:
         "--c4-realnewslike",
         action="store_true",
         help=(
-            "Use random snippets from Hugging Face ``allenai/c4`` ``realnewslike`` as prompts "
-            "(``--runs`` independent draws). Mutually exclusive with ``--prompt-case``."
+            "Use Hugging Face ``allenai/c4`` ``realnewslike`` as prompts: leading "
+            "``--c4-snippet-chars`` of each sampled row (``--runs`` independent draws). "
+            "Mutually exclusive with ``--prompt-case``."
         ),
     )
     p.add_argument(
@@ -1001,14 +1001,14 @@ def main() -> int:
         type=int,
         default=512,
         metavar="N",
-        help="Character length of each random C4 excerpt (default: 512).",
+        help="Character length from the start of each sampled C4 row (default: 512).",
     )
     p.add_argument(
         "--c4-seed",
         type=int,
         default=None,
         metavar="S",
-        help="Optional RNG seed for C4 window placement and row skips (default: nondeterministic).",
+        help="Optional RNG seed for C4 row skips between draws (default: nondeterministic).",
     )
     p.add_argument(
         "--c4-split",
