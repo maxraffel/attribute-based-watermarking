@@ -52,7 +52,7 @@ WM_BIT_REDUNDANCY = _env_int(
 # Hub id for the watermark causal LM; ``None`` keeps ``watermarking`` default / notebook ``set_llm_model_id``.
 LLM_MODEL_ID: str | None = None
 PROMPT = (
-            "Explain the economic nuance and impact of Drake Maye during his college football career at North Carolina."
+            "Explain how software has transformed the practice of medicine."
 )
 
 
