@@ -49,7 +49,7 @@ WM_BIT_REDUNDANCY = _env_int(
     "WATERMARK_WM_BIT_REDUNDANCY",
     default=3,
 )  # token-channel repeats per logical PRC bit; recovery = strict majority (tie → 0)
-# Hub id for the watermark causal LM; ``None`` keeps ``watermarking`` default / notebook ``set_llm_model_id``.
+# Hub id for the watermark LM; ``None`` keeps ``watermarking`` default / notebook ``set_llm_model_id``.
 LLM_MODEL_ID: str | None = None
 PROMPT = (
             "Explain how software has transformed the practice of medicine."

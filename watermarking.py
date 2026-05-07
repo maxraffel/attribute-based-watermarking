@@ -90,7 +90,7 @@ def _load_llm() -> None:
     global TOKENIZER, MODEL
     if MODEL is not None and TOKENIZER is not None:
         return
-    print(f"Loading causal LM {MODEL_ID!r} on {DEVICE}")
+    print(f"Loading LM {MODEL_ID!r} on {DEVICE}")
     TOKENIZER = AutoTokenizer.from_pretrained(MODEL_ID)
     MODEL = AutoModelForCausalLM.from_pretrained(MODEL_ID).to(DEVICE)
     for attr, value in GENERATION_SAMPLING_OVERRIDES.items():
@@ -106,7 +106,7 @@ def _ensure_llm() -> None:
 
 def set_llm_model_id(model_id: str) -> None:
     """
-    Select the Hugging Face hub id for the watermark causal LM.
+    Select the Hugging Face hub id for the watermark LM.
 
     Call before ``generate`` / ``detect`` / ``master_detect`` if you need a non-default model
     (e.g. from a notebook snippet). Reloads weights when ``model_id`` differs from the loaded id.
@@ -124,7 +124,7 @@ def set_llm_model_id(model_id: str) -> None:
     if mid == MODEL_ID:
         return
 
-    print(f"Switching causal LM {MODEL_ID!r} -> {mid!r}")
+    print(f"Switching LM {MODEL_ID!r} -> {mid!r}")
     MODEL_ID = mid
     MODEL = None
     TOKENIZER = None

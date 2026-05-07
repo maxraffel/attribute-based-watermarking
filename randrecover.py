@@ -60,7 +60,7 @@ def encode_prompt_for_generation(
     device: str | torch.device,
 ) -> Dict[str, torch.Tensor]:
     """
-    Build model inputs for causal generation: apply the tokenizer's ``chat_template``
+    Build model inputs for LM generation: apply the tokenizer's ``chat_template``
     (user turn + ``add_generation_prompt``) when defined, else plain ``tokenizer(...)``.
 
     ``prompt_len`` for slicing new tokens is ``input_ids.shape[1]`` of the returned batch

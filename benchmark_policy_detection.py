@@ -1470,7 +1470,7 @@ def main() -> int:
         dest="llm_model",
         metavar="HF_HUB_ID",
         default=None,
-        help="Hugging Face hub id for the causal LM (calls watermarking.set_llm_model_id).",
+        help="Hugging Face hub id for the LM (calls watermarking.set_llm_model_id).",
     )
     p.add_argument(
         "--wm-bit-redundancy",
