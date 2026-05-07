@@ -298,6 +298,10 @@ class PromptConditionedDetectionMatrix:
     - **cell:** trials are attributed only to the prompt id for that run; denominators count
       ``detect`` opportunities on trials that had at least one verify-time attributed label
       (same skip rule as ``run_benchmark_label_conditioned_matrix`` when the active set is empty).
+
+    ``numerators`` / ``denominators`` / ``rates`` pool **all** qualifying trials. The ``*_xmatch`` fields
+    mirror the same update rules but **only** on trials where encode-time ``attr_x`` equals verify-time
+    ``derive_x`` (full-vector match), like ``roll_xmatch`` in ``run_benchmark_with_summary``.
     """
 
     vocab: tuple[str, ...]
@@ -305,6 +309,9 @@ class PromptConditionedDetectionMatrix:
     numerators: dict[str, dict[str, int]]
     denominators: dict[str, dict[str, int]]
     rates: dict[str, dict[str, float]]
+    numerators_xmatch: dict[str, dict[str, int]]
+    denominators_xmatch: dict[str, dict[str, int]]
+    rates_xmatch: dict[str, dict[str, float]]
     prompt_cases: tuple[tuple[str, str], ...]
     runs_per_prompt: int
     code_length: int
@@ -598,6 +605,9 @@ def run_benchmark_prompt_conditioned_matrix(
 
     - **Denominator pass:** for column ``p`` only, ``den[r,p] += 1`` for every vocabulary row ``r``.
     - **Numerator pass:** for each row ``r`` with positive ``detect``, ``num[r,p] += 1``.
+
+    The returned matrix also includes ``*_xmatch`` tallies over the same rules but **only** for
+    trials where encode-time ``attr_x`` equals verify-time ``derive_x`` (full vector).
     """
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
@@ -618,6 +628,8 @@ def run_benchmark_prompt_conditioned_matrix(
     col_ids = tuple(str(sid) for sid, _ in prompt_cases)
     numerators: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
     denominators: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
+    numerators_xmatch: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
+    denominators_xmatch: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
     sk_shared: dict[str, Any] = {}
     sid_runs: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
     sid_master: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
@@ -650,7 +662,7 @@ def run_benchmark_prompt_conditioned_matrix(
 
         (
             word_stats,
-            _x_perfect,
+            x_perfect,
             master_ok,
             open_ok,
             _cprf_label_ok,
@@ -685,6 +697,14 @@ def run_benchmark_prompt_conditioned_matrix(
                 continue
             numerators[row][col_sid] += 1
 
+        if x_perfect:
+            for row in vocab:
+                denominators_xmatch[row][col_sid] += 1
+            for row in vocab:
+                if not got_by_row.get(row, False):
+                    continue
+                numerators_xmatch[row][col_sid] += 1
+
     all_ok = True
     for sid, _ in prompt_cases:
         n = sid_runs[sid]
@@ -699,11 +719,15 @@ def run_benchmark_prompt_conditioned_matrix(
         all_ok = all_ok and ok
 
     rates: dict[str, dict[str, float]] = {r: {} for r in vocab}
+    rates_xmatch: dict[str, dict[str, float]] = {r: {} for r in vocab}
     for r in vocab:
         for p in col_ids:
             d = denominators[r][p]
             n = numerators[r][p]
             rates[r][p] = (n / d) if d > 0 else -1.0
+            dx = denominators_xmatch[r][p]
+            nx = numerators_xmatch[r][p]
+            rates_xmatch[r][p] = (nx / dx) if dx > 0 else -1.0
 
     matrix = PromptConditionedDetectionMatrix(
         vocab=vocab,
@@ -711,6 +735,9 @@ def run_benchmark_prompt_conditioned_matrix(
         numerators=numerators,
         denominators=denominators,
         rates=rates,
+        numerators_xmatch=numerators_xmatch,
+        denominators_xmatch=denominators_xmatch,
+        rates_xmatch=rates_xmatch,
         prompt_cases=tuple((sid, p) for sid, p in prompt_cases),
         runs_per_prompt=runs,
         code_length=code_length,
