@@ -14,6 +14,7 @@ import sys
 for _name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
+import model
 import randrecover
 import watermarking as wm
 from attr_x_nli import derive_x
@@ -59,9 +60,9 @@ def main() -> int:
             "(from watermarked text); detect uses the latter.[/]"
         )
 
-    dk_open = wm.issue_unconstrained(sk)
-    dk_match = wm.issue_keyword_policy(sk, ["medicine"])
-    dk_wrong = wm.issue_keyword_policy(sk, ["finance"])
+    dk_open = wm.issue(sk, [])
+    dk_match = wm.issue(sk, ["medicine"])
+    dk_wrong = wm.issue(sk, ["finance"])
 
     f_zero = [0] * CPRF_ATTR_DIM
     f_match = f_for_required_keywords(["medicine"])
@@ -76,12 +77,13 @@ def main() -> int:
     rep.add_boolean("detect(matching policy)", dm, True)
     dw, _ = wm.detect(dk_wrong, text)
     rep.add_boolean("detect(wrong policy)", dw, False)
+    m, tok, device = model.load()
     wrong_tx = randrecover.negative_control_transcript_like(
         text,
-        wm.TOKENIZER,
-        wm.DEVICE,
-        n_bits=wm.wm_channel_bits_length(),
-        model=wm.MODEL,
+        tok,
+        device,
+        n_bits=wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY,
+        model=m,
     )
     mw, _ = wm.master_detect(sk, wrong_tx)
     rep.add_boolean("master_detect(wrong transcript)", mw, False)

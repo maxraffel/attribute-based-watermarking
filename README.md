@@ -56,18 +56,7 @@ This runs an end-to-end pass with Rich output: setup, generation, watermark chec
 uv run python app.py
 ```
 
-### Useful optional environment variables
-
-`app.py` supports these overrides:
-
-- `APP_CODE_LENGTH` (or `WATERMARK_CODE_LENGTH`)
-- `APP_WM_BIT_REDUNDANCY` (or `WATERMARK_WM_BIT_REDUNDANCY`)
-
-Example:
-
-```sh
-APP_CODE_LENGTH=300 APP_WM_BIT_REDUNDANCY=3 uv run python app.py
-```
+Edit constants at the top of `app.py`, or call `model.configure(...)` before running. For the LM hub id and sampling overrides (`temperature`, `top_p`, `top_k`), see `model.py`.
 
 ### Other scripts
 
@@ -107,6 +96,7 @@ Important behavior:
 ## Project Layout
 
 - `app.py` - Main end-to-end demo/check runner
+- `model.py` - Hugging Face LM hub id, sampling overrides, lazy loading
 - `watermarking.py` - Core API: setup/generate/detect/master_detect
 - `attr_x_nli.py` - NLI-based attribute derivation
 - `closed_vocab.py` - Vocabulary + attribute vector sizing helpers
@@ -144,9 +134,8 @@ For private repos, provide a `GITHUB_TOKEN` secret in Colab so the notebook can 
   - `NLI_HYPOTHESIS_TEMPLATE` in `attr_x_nli.py`
   - `VOCABULARY` in `closed_vocab.py`
 - Change attribute size by editing `ATTR_TAIL_DIM` in `closed_vocab.py`.
-- Change PRC code length with:
-  - `APP_CODE_LENGTH` / `WATERMARK_CODE_LENGTH`, or
-  - `set_prc_code_length(...)` in code.
+- Change PRC code length by setting `CODE_LENGTH` in `app.py` (or `wm.SECURITY_PARAM` + `prc.set_code_length(...)` in scripts).
+- Change the watermark LM or sampling: `model.configure(model_id=..., temperature=..., top_p=..., top_k=...)`.
 
 ---
 

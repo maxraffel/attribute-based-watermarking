@@ -5,21 +5,19 @@ per-step pass/fail. Issues one constrained CPRF key per closed-vocabulary label 
 ``detect`` to the expectation that the label is (or is not) in the verify-time recovered NLI
 attribute set. Tweak the constants below; this file does not import the benchmark module.
 
-Optional **environment** overrides (e.g. Colab before ``runpy.run_path``): ``APP_CODE_LENGTH``,
-``APP_WM_BIT_REDUNDANCY``, or aliases ``WATERMARK_CODE_LENGTH``, ``WATERMARK_WM_BIT_REDUNDANCY``.
-
 Run: ``uv run python app.py``
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import List, Sequence
 
 import attr_x_nli
+import model
 import randrecover
+import prc
 import watermarking as wm
 from rich.console import Console
 from rich.panel import Panel
@@ -33,24 +31,11 @@ from closed_vocab import (
 )
 
 
-def _env_int(*names: str, default: int) -> int:
-    for name in names:
-        v = os.environ.get(name, "").strip()
-        if v:
-            return int(v)
-    return default
-
-
-# --- customize here (env overrides: APP_* or WATERMARK_*; see module docstring) ---
+# --- customize here ---
 MODULUS = 1024
-CODE_LENGTH = _env_int("APP_CODE_LENGTH", "WATERMARK_CODE_LENGTH", default=100)
-WM_BIT_REDUNDANCY = _env_int(
-    "APP_WM_BIT_REDUNDANCY",
-    "WATERMARK_WM_BIT_REDUNDANCY",
-    default=3,
-)  # token-channel repeats per logical PRC bit; recovery = strict majority (tie → 0)
-# Hub id for the watermark LM; ``None`` keeps ``watermarking`` default / notebook ``set_llm_model_id``.
-LLM_MODEL_ID: str | None = None
+CODE_LENGTH = 100
+WM_BIT_REDUNDANCY = 3  # token-channel repeats per logical PRC bit; recovery = strict majority (tie → 0)
+MODEL_ID: str | None = None  # None → ``model.DEFAULT_MODEL_ID``
 PROMPT = (
             "Explain how software has transformed the practice of medicine."
 )
@@ -176,25 +161,29 @@ def main() -> int:
     n_prefix = len(VOCABULARY)
     all_ok = True
 
-    if LLM_MODEL_ID:
-        wm.set_llm_model_id(LLM_MODEL_ID.strip())
+    if MODEL_ID:
+        model.configure(model_id=MODEL_ID)
 
     c.print(
         Panel.fit(
             f"[bold]modulus[/] {MODULUS}  ·  [bold]code_length[/] {CODE_LENGTH}  ·  "
             f"[bold]wm_bit_redundancy[/] {WM_BIT_REDUNDANCY}  (channel {CODE_LENGTH * WM_BIT_REDUNDANCY} bits)\n"
-            f"[bold]LLM[/] {wm.MODEL_ID}\n"
+            f"[bold]LLM[/] {model.MODEL_ID}\n"
+            f"[bold]sampling[/] temperature={model.SAMPLING['temperature']}  "
+            f"top_p={model.SAMPLING['top_p']}  "
+            f"top_k={model.SAMPLING['top_k']}\n"
             f"[bold]vocab[/] |V|={n_prefix}  ·  [bold]NLI prefix[/] multi-label (cutoff={attr_x_nli.NLI_MULTI_LABEL_SCORE_CUTOFF:g})",
             title="app.py protocol run",
         )
     )
 
-    wm.set_prc_code_length(CODE_LENGTH)
-    wm.set_wm_bit_redundancy(WM_BIT_REDUNDANCY)
+    wm.SECURITY_PARAM = CODE_LENGTH
+    prc.set_code_length(CODE_LENGTH)
+    wm.WM_BIT_REDUNDANCY = WM_BIT_REDUNDANCY
     c.print(
         f"[dim]wm.SECURITY_PARAM =[/] {wm.SECURITY_PARAM}  "
         f"[dim]wm.WM_BIT_REDUNDANCY =[/] {wm.WM_BIT_REDUNDANCY}  "
-        f"[dim]wm.wm_channel_bits_length() =[/] {wm.wm_channel_bits_length()}"
+        f"[dim]channel bits =[/] {wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY}"
     )
 
     c.rule("1) CPRF setup", style="cyan")
@@ -255,9 +244,9 @@ def main() -> int:
 
     c.rule("4) Issue keys (unconstrained + one constrained key per vocab label)", style="cyan")
     t0 = time.perf_counter()
-    dk_open = wm.issue_unconstrained(sk)
+    dk_open = wm.issue(sk, [])
     active_set = set(active_wm)
-    dk_by_word = {w: wm.issue_keyword_policy(sk, [w]) for w in VOCABULARY}
+    dk_by_word = {w: wm.issue(sk, [w]) for w in VOCABULARY}
     c.print(
         f"  [bold]Verify-time NLI-active (recovered attribute):[/] "
         f"{sorted(active_wm) if active_wm else '(none)'}"
@@ -384,16 +373,17 @@ def main() -> int:
     c.print(sum_table)
 
     c.rule("7) Negative control (wrong transcript)", style="cyan")
+    m, tok, device = model.load()
     wrong = randrecover.negative_control_transcript_like(
         wm_text,
-        wm.TOKENIZER,
-        wm.DEVICE,
-        n_bits=wm.wm_channel_bits_length(),
-        model=wm.MODEL,
+        tok,
+        device,
+        n_bits=wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY,
+        model=m,
     )
     c.print(
         f"  [dim]decoy length: {len(wrong)} chars (watermarked ref: {len(wm_text)}), "
-        f"channel bit horizon {wm.wm_channel_bits_length()}[/]"
+        f"channel bit horizon {wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY}[/]"
     )
     _log_text(c, "Wrong transcript", wrong, max_chars=400)
     w_ok, w_bits = wm.master_detect(sk, wrong)

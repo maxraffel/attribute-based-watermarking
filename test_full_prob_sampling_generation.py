@@ -34,8 +34,8 @@ import logging
 import secrets
 import sys
 
+import model
 import randrecover
-import watermarking as wm
 
 LOG = logging.getLogger("test_full_prob_sampling")
 
@@ -67,11 +67,12 @@ def _recover_transcript_and_log_ber(
     ber_metric_name: str,
     partition_vocab_size: int | None,
 ) -> None:
+    m, tok, device = model.load()
     recovered, _ = randrecover.recover_bitstream_from_text(
         transcript,
-        wm.TOKENIZER,
-        wm.DEVICE,
-        model=wm.MODEL,
+        tok,
+        device,
+        model=m,
         partition_vocab_size=partition_vocab_size,
     )
     ber_pct, err_count = _ber_vs_secret(secret, recovered)
@@ -90,7 +91,7 @@ def main() -> int:
     parser.add_argument(
         "--model",
         default=None,
-        help="Hugging Face hub id (default: watermarking.MODEL_ID)",
+        help="Hugging Face hub id (default: model.DEFAULT_MODEL_ID)",
     )
     parser.add_argument(
         "--length",
@@ -107,19 +108,15 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    wm.set_prc_code_length(args.length)
     if args.model:
-        wm.set_llm_model_id(args.model.strip())
-    else:
-        wm.set_llm_model_id(wm.MODEL_ID)
-
-    assert wm.MODEL is not None and wm.TOKENIZER is not None
+        model.configure(model_id=args.model.strip())
+    m, tok, device = model.load()
     n = args.length
     bits = random_secret_bits(n)
 
     for line in randrecover.format_sampling_logits_debug_lines(
         randrecover.infer_sampling_logits_debug_for_prompt(
-            wm.MODEL, wm.TOKENIZER, args.prompt, n, wm.DEVICE
+            m, tok, args.prompt, n, device
         )
     ):
         LOG.info(line)
@@ -129,28 +126,28 @@ def main() -> int:
     )
 
     hf_generate_out = randrecover.generate_baseline(
-        wm.MODEL,
-        wm.TOKENIZER,
+        m,
+        tok,
         args.prompt,
         n,
-        wm.DEVICE,
+        device,
     )
 
     logits_processor_full_vocab = randrecover.generate_with_watermark_full_vocab_sample(
-        wm.MODEL,
-        wm.TOKENIZER,
+        m,
+        tok,
         args.prompt,
         bits,
-        wm.DEVICE,
+        device,
     )
     processor_only_text = logits_processor_full_vocab["generated_text_wm"]
 
     partition_wm = randrecover.generate_with_watermark(
-        wm.MODEL,
-        wm.TOKENIZER,
+        m,
+        tok,
         args.prompt,
         bits,
-        wm.DEVICE,
+        device,
     )
     partition_text = partition_wm["generated_text_wm"]
 
@@ -170,9 +167,9 @@ def main() -> int:
 
     randrecover.verify_partition_embed_recovery_sync(
         partition_wm,
-        wm.TOKENIZER,
-        wm.DEVICE,
-        model=wm.MODEL,
+        tok,
+        device,
+        model=m,
         recovery_partition_vocab_size=int(partition_wm["partition_vocab_dim"]),
         log=LOG.info,
     )

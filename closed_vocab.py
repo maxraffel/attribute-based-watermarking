@@ -29,11 +29,6 @@ def f_for_required_keywords(required: Sequence[str]) -> List[int]:
     return f
 
 
-def issue_constrained_key_for_keywords(sk, required: Sequence[str]):
-    """Constrained key: every listed (known) required label must be NLI-active on x's prefix (score cutoff)."""
-    return sk.constrain(f_for_required_keywords(required))
-
-
 def active_labels_from_verify_x(x_wm: Sequence[int], modulus: int) -> List[str]:
     """
     Vocabulary labels NLI marks **active** (multi-label score ≥ cutoff; see ``attr_x_nli``) on the

@@ -10,8 +10,7 @@ policy ``detect`` vs NLI-recovered attribute expectation, counts of which protoc
 ``derive_x`` (full vector); then mean wall time per pipeline stage.
 
 CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, ``--wm-bit-redundancy``,
-optional ``--llm-model``, repeatable ``--prompt-case id:prompt``. Env: ``BENCHMARK_PLAIN_TABLE``, ``BENCHMARK_CONSOLE_*``
-(see ``make_benchmark_console`` / ``_use_plain_table``).
+optional ``--llm-model``, repeatable ``--prompt-case id:prompt``.
 
 ``run_benchmark_label_conditioned_matrix`` builds a ``|V| × |V|`` matrix (columns = verify-time attributed
 labels); ``run_benchmark_prompt_conditioned_matrix`` builds ``|V| × |P|`` (columns = benchmark prompt ids).
@@ -28,7 +27,6 @@ from __future__ import annotations
 import argparse
 import logging
 import math
-import os
 import random
 import shutil
 import sys
@@ -41,33 +39,40 @@ from rich.progress import track
 from rich.table import Table
 
 import attr_x_nli
+import model
 import randrecover
+import prc
 import watermarking as wm
 from closed_vocab import VOCABULARY, active_labels_from_verify_x
 
 
+def _configure_benchmark(
+    *,
+    code_length: int,
+    wm_bit_redundancy: int = 1,
+    llm_model_id: str | None = None,
+) -> None:
+    wm.SECURITY_PARAM = code_length
+    prc.set_code_length(code_length)
+    wm.WM_BIT_REDUNDANCY = wm_bit_redundancy
+    if llm_model_id:
+        model.configure(model_id=llm_model_id)
+
+
 def make_benchmark_console() -> Console:
-    floor_w = int(os.environ.get("BENCHMARK_CONSOLE_WIDTH", "168"))
-    floor_h = int(os.environ.get("BENCHMARK_CONSOLE_HEIGHT", "120"))
     try:
         term = shutil.get_terminal_size()
         if sys.stdout.isatty():
             w = min(max(term.columns, 40), 240)
             h = min(max(term.lines, 10), 200)
         else:
-            w = floor_w
-            h = floor_h
+            w, h = 168, 120
     except OSError:
-        w, h = floor_w, floor_h
+        w, h = 168, 120
     return Console(highlight=False, width=w, height=h)
 
 
 def _use_plain_table() -> bool:
-    v = os.environ.get("BENCHMARK_PLAIN_TABLE", "").strip().lower()
-    if v in ("1", "true", "yes", "always"):
-        return True
-    if v in ("0", "false", "no", "never"):
-        return False
     return not sys.stdout.isatty()
 
 
@@ -424,7 +429,7 @@ def prc_random_detect_positive_rate(
     if n_trials < 1:
         raise ValueError("n_trials must be >= 1")
     prng = rng if rng is not None else random.Random()
-    wm.set_prc_code_length(code_length)
+    _configure_benchmark(code_length=code_length)
     s = prc.key_gen_from_seed(sha256(prng.randbytes(32)).digest())
     fp = 0
     for _ in range(n_trials):
@@ -453,13 +458,10 @@ def run_benchmark_label_conditioned_matrix(
     For each trial, let ``A`` be the active-label set from verify-time ``derive_x``.
     For every column label ``c in A`` and every row label ``r in VOCABULARY``:
       - denominator[r,c] += 1
-      - numerator[r,c] += 1 iff ``detect(issue_keyword_policy([r]), wm_text)`` is True.
+      - numerator[r,c] += 1 iff ``detect(issue([r]), wm_text)`` is True.
     """
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
-
-    if llm_model_id is not None and llm_model_id.strip():
-        wm.set_llm_model_id(llm_model_id.strip())
 
     if runs < 1:
         raise ValueError("runs must be >= 1")
@@ -468,8 +470,11 @@ def run_benchmark_label_conditioned_matrix(
     if wm_bit_redundancy < 1:
         raise ValueError("wm_bit_redundancy must be >= 1")
 
-    wm.set_prc_code_length(code_length)
-    wm.set_wm_bit_redundancy(wm_bit_redundancy)
+    _configure_benchmark(
+        code_length=code_length,
+        wm_bit_redundancy=wm_bit_redundancy,
+        llm_model_id=llm_model_id,
+    )
     vocab = tuple(VOCABULARY)
     numerators: dict[str, dict[str, int]] = {
         r: {c: 0 for c in vocab} for r in vocab
@@ -489,7 +494,7 @@ def run_benchmark_label_conditioned_matrix(
             f"matrix benchmark  code_length={wm.SECURITY_PARAM}  "
             f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  modulus={modulus}  runs={runs}  |V|={len(vocab)}  "
             f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
-            f"llm={wm.MODEL_ID!r}"
+            f"llm={model.MODEL_ID!r}"
         )
 
     trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
@@ -612,9 +617,6 @@ def run_benchmark_prompt_conditioned_matrix(
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    if llm_model_id is not None and llm_model_id.strip():
-        wm.set_llm_model_id(llm_model_id.strip())
-
     if runs < 1:
         raise ValueError("runs must be >= 1")
     if code_length < 1:
@@ -622,8 +624,11 @@ def run_benchmark_prompt_conditioned_matrix(
     if wm_bit_redundancy < 1:
         raise ValueError("wm_bit_redundancy must be >= 1")
 
-    wm.set_prc_code_length(code_length)
-    wm.set_wm_bit_redundancy(wm_bit_redundancy)
+    _configure_benchmark(
+        code_length=code_length,
+        wm_bit_redundancy=wm_bit_redundancy,
+        llm_model_id=llm_model_id,
+    )
     vocab = tuple(VOCABULARY)
     col_ids = tuple(str(sid) for sid, _ in prompt_cases)
     numerators: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
@@ -642,7 +647,7 @@ def run_benchmark_prompt_conditioned_matrix(
             f"prompt-matrix benchmark  code_length={wm.SECURITY_PARAM}  "
             f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  modulus={modulus}  runs={runs}  |V|={len(vocab)}  "
             f"|P|={len(col_ids)}  keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
-            f"llm={wm.MODEL_ID!r}"
+            f"llm={model.MODEL_ID!r}"
         )
 
     trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
@@ -799,8 +804,8 @@ def run_one_trial(
     x_perfect = x_encode == x_verify
 
     t_k0 = time.perf_counter()
-    dk_open = wm.issue_unconstrained(sk)
-    dk_by_word = {w: wm.issue_keyword_policy(sk, [w]) for w in VOCABULARY}
+    dk_open = wm.issue(sk, [])
+    dk_by_word = {w: wm.issue(sk, [w]) for w in VOCABULARY}
     tt.t_issue_keys = time.perf_counter() - t_k0
 
     xl = list(x_verify)
@@ -846,13 +851,13 @@ def run_one_trial(
     tt.t_detect_per_label = time.perf_counter() - t_pv0
 
     t_nc0 = time.perf_counter()
-    assert wm.TOKENIZER is not None and wm.MODEL is not None
+    m, tok, device = model.load()
     wrong = randrecover.negative_control_transcript_like(
         wm_text,
-        wm.TOKENIZER,
-        wm.DEVICE,
-        n_bits=wm.wm_channel_bits_length(),
-        model=wm.MODEL,
+        tok,
+        device,
+        n_bits=wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY,
+        model=m,
     )
     ctrl_ok_raw, _ = wm.master_detect(sk, wrong)
     control_ok = not bool(ctrl_ok_raw)
@@ -1276,11 +1281,11 @@ def run_benchmark_with_summary(
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    if llm_model_id is not None and llm_model_id.strip():
-        wm.set_llm_model_id(llm_model_id.strip())
-
-    wm.set_prc_code_length(code_length)
-    wm.set_wm_bit_redundancy(wm_bit_redundancy)
+    _configure_benchmark(
+        code_length=code_length,
+        wm_bit_redundancy=wm_bit_redundancy,
+        llm_model_id=llm_model_id,
+    )
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     roll_xmatch: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     sk_shared: dict[str, Any] = {}
@@ -1289,9 +1294,9 @@ def run_benchmark_with_summary(
     if not quiet:
         console.print(
             f"code_length={wm.SECURITY_PARAM}  wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
-            f"channel_bits={wm.wm_channel_bits_length()}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
+            f"channel_bits={wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
             f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
-            f"llm={wm.MODEL_ID!r}"
+            f"llm={model.MODEL_ID!r}"
         )
 
     trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
@@ -1470,7 +1475,7 @@ def main() -> int:
         dest="llm_model",
         metavar="HF_HUB_ID",
         default=None,
-        help="Hugging Face hub id for the LM (calls watermarking.set_llm_model_id).",
+        help="Hugging Face hub id for the LM (``model.configure`` before load).",
     )
     p.add_argument(
         "--wm-bit-redundancy",
