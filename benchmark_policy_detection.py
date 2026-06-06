@@ -1,13 +1,13 @@
 """
-Policy-detection benchmark: same end-to-end flow as ``app.py`` (generate → verify ``derive_x`` →
+Policy-detection benchmark: same end-to-end flow as ``app.py`` (generate → verify ``derive_attributes`` →
 issue unconstrained + one constrained key per closed-vocabulary label → CPRF seed checks →
 ``master_detect`` / ``detect`` on good transcript → negative-control ``master_detect`` on decoy).
 
 Runs many trials over configurable prompts and code length with a Rich **progress bar** (transient).
 Per-trial logging is minimal; results are **aggregated into tables**: per-prompt TPR/FNR/TNR/FPR for
-policy ``detect`` vs NLI-recovered attribute expectation, counts of which protocol stages matched;
-**the same policy table** computed only on runs where encode-time ``attr_x`` equals verify-time
-``derive_x`` (full vector); then mean wall time per pipeline stage.
+policy ``detect`` vs recovered active-label expectation, counts of which protocol stages matched;
+**the same policy table** computed only on runs where encode-time ``attributes`` equals verify-time
+``derive_attributes`` (full vector); then mean wall time per pipeline stage.
 
 CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, ``--wm-bit-redundancy``,
 optional ``--llm-model``, repeatable ``--prompt-case id:prompt``.
@@ -38,12 +38,12 @@ from rich.console import Console
 from rich.progress import track
 from rich.table import Table
 
-import attr_x_nli
+import text_attributes
 import model
 import randrecover
 import prc
 import watermarking as wm
-from closed_vocab import VOCABULARY, active_labels_from_verify_x
+from text_attributes import VOCABULARY, active_labels_from_attributes
 
 
 def _configure_benchmark(
@@ -145,7 +145,7 @@ class TimingTotals:
     t_setup: float = 0.0
     t_baseline_gen: float = 0.0
     t_wm_gen: float = 0.0
-    t_derive_verify: float = 0.0
+    t_derive_attributes: float = 0.0
     t_issue_keys: float = 0.0
     t_cprf_checks: float = 0.0
     t_master_good: float = 0.0
@@ -165,7 +165,7 @@ class PromptRollup:
     tn: int = 0
     fp: int = 0
 
-    x_perfect: int = 0
+    attributes_match: int = 0
     master_good: int = 0
     open_detect_good: int = 0
     unconstrained_cprf_ok: int = 0
@@ -190,7 +190,7 @@ class PromptRollup:
         self,
         *,
         word_stats: list[dict[str, Any]],
-        x_perfect: bool,
+        attributes_match: bool,
         master_ok: bool,
         open_ok: bool,
         unconstrained_cprf_ok: bool,
@@ -201,8 +201,8 @@ class PromptRollup:
         timings: TimingTotals,
     ) -> None:
         self.runs += 1
-        if x_perfect:
-            self.x_perfect += 1
+        if attributes_match:
+            self.attributes_match += 1
         if master_ok:
             self.master_good += 1
         if open_ok:
@@ -249,7 +249,7 @@ class PromptRollup:
         self.timings.t_setup += timings.t_setup
         self.timings.t_baseline_gen += timings.t_baseline_gen
         self.timings.t_wm_gen += timings.t_wm_gen
-        self.timings.t_derive_verify += timings.t_derive_verify
+        self.timings.t_derive_attributes += timings.t_derive_attributes
         self.timings.t_issue_keys += timings.t_issue_keys
         self.timings.t_cprf_checks += timings.t_cprf_checks
         self.timings.t_master_good += timings.t_master_good
@@ -263,7 +263,7 @@ class BenchmarkRunSummary:
     """Aggregates after ``run_benchmark_with_summary`` (rollups are read-only for callers)."""
 
     roll: dict[str, PromptRollup]
-    roll_xmatch: dict[str, PromptRollup]
+    roll_attributes_match: dict[str, PromptRollup]
     prompt_cases: tuple[tuple[str, str], ...]
     vocab_n: int
     code_length: int
@@ -304,9 +304,9 @@ class PromptConditionedDetectionMatrix:
       ``detect`` opportunities on trials that had at least one verify-time attributed label
       (same skip rule as ``run_benchmark_label_conditioned_matrix`` when the active set is empty).
 
-    ``numerators`` / ``denominators`` / ``rates`` pool **all** qualifying trials. The ``*_xmatch`` fields
-    mirror the same update rules but **only** on trials where encode-time ``attr_x`` equals verify-time
-    ``derive_x`` (full-vector match), like ``roll_xmatch`` in ``run_benchmark_with_summary``.
+    ``numerators`` / ``denominators`` / ``rates`` pool **all** qualifying trials. The ``*_attributes_match`` fields
+    mirror the same update rules but **only** on trials where encode-time ``attributes`` equals verify-time
+    ``derive_attributes`` (full-vector match), like ``roll_attributes_match`` in ``run_benchmark_with_summary``.
     """
 
     vocab: tuple[str, ...]
@@ -314,9 +314,9 @@ class PromptConditionedDetectionMatrix:
     numerators: dict[str, dict[str, int]]
     denominators: dict[str, dict[str, int]]
     rates: dict[str, dict[str, float]]
-    numerators_xmatch: dict[str, dict[str, int]]
-    denominators_xmatch: dict[str, dict[str, int]]
-    rates_xmatch: dict[str, dict[str, float]]
+    numerators_attributes_match: dict[str, dict[str, int]]
+    denominators_attributes_match: dict[str, dict[str, int]]
+    rates_attributes_match: dict[str, dict[str, float]]
     prompt_cases: tuple[tuple[str, str], ...]
     runs_per_prompt: int
     code_length: int
@@ -344,7 +344,7 @@ def micro_fpr(
     roll: dict[str, PromptRollup],
     prompt_cases: Sequence[tuple[str, str]],
 ) -> float:
-    """Micro-averaged false positive rate for policy ``detect`` vs NLI-active-set gold."""
+    """Micro-averaged false positive rate for policy ``detect`` vs active-label gold."""
     tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
     return _rates(tp, fn, tn, fp)[3]
 
@@ -353,7 +353,7 @@ def micro_tpr(
     roll: dict[str, PromptRollup],
     prompt_cases: Sequence[tuple[str, str]],
 ) -> float:
-    """Micro-averaged true positive rate for policy ``detect`` vs NLI-active-set gold."""
+    """Micro-averaged true positive rate for policy ``detect`` vs active-label gold."""
     tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
     return _rates(tp, fn, tn, fp)[0]
 
@@ -455,7 +455,7 @@ def run_benchmark_label_conditioned_matrix(
     """
     Build a ``|V| x |V|`` matrix conditioned on verify-time active labels.
 
-    For each trial, let ``A`` be the active-label set from verify-time ``derive_x``.
+    For each trial, let ``A`` be the active-label set from verify-time ``derive_attributes``.
     For every column label ``c in A`` and every row label ``r in VOCABULARY``:
       - denominator[r,c] += 1
       - numerator[r,c] += 1 iff ``detect(issue([r]), wm_text)`` is True.
@@ -514,7 +514,7 @@ def run_benchmark_label_conditioned_matrix(
 
         (
             word_stats,
-            _x_perfect,
+            _attributes_match,
             master_ok,
             open_ok,
             _cprf_label_ok,
@@ -611,8 +611,8 @@ def run_benchmark_prompt_conditioned_matrix(
     - **Denominator pass:** for column ``p`` only, ``den[r,p] += 1`` for every vocabulary row ``r``.
     - **Numerator pass:** for each row ``r`` with positive ``detect``, ``num[r,p] += 1``.
 
-    The returned matrix also includes ``*_xmatch`` tallies over the same rules but **only** for
-    trials where encode-time ``attr_x`` equals verify-time ``derive_x`` (full vector).
+    The returned matrix also includes ``*_attributes_match`` tallies over the same rules but **only** for
+    trials where encode-time ``attributes`` equals verify-time ``derive_attributes`` (full vector).
     """
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
@@ -633,8 +633,8 @@ def run_benchmark_prompt_conditioned_matrix(
     col_ids = tuple(str(sid) for sid, _ in prompt_cases)
     numerators: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
     denominators: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
-    numerators_xmatch: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
-    denominators_xmatch: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
+    numerators_attributes_match: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
+    denominators_attributes_match: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
     sk_shared: dict[str, Any] = {}
     sid_runs: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
     sid_master: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
@@ -667,7 +667,7 @@ def run_benchmark_prompt_conditioned_matrix(
 
         (
             word_stats,
-            x_perfect,
+            attributes_match,
             master_ok,
             open_ok,
             _cprf_label_ok,
@@ -702,13 +702,13 @@ def run_benchmark_prompt_conditioned_matrix(
                 continue
             numerators[row][col_sid] += 1
 
-        if x_perfect:
+        if attributes_match:
             for row in vocab:
-                denominators_xmatch[row][col_sid] += 1
+                denominators_attributes_match[row][col_sid] += 1
             for row in vocab:
                 if not got_by_row.get(row, False):
                     continue
-                numerators_xmatch[row][col_sid] += 1
+                numerators_attributes_match[row][col_sid] += 1
 
     all_ok = True
     for sid, _ in prompt_cases:
@@ -724,15 +724,15 @@ def run_benchmark_prompt_conditioned_matrix(
         all_ok = all_ok and ok
 
     rates: dict[str, dict[str, float]] = {r: {} for r in vocab}
-    rates_xmatch: dict[str, dict[str, float]] = {r: {} for r in vocab}
+    rates_attributes_match: dict[str, dict[str, float]] = {r: {} for r in vocab}
     for r in vocab:
         for p in col_ids:
             d = denominators[r][p]
             n = numerators[r][p]
             rates[r][p] = (n / d) if d > 0 else -1.0
-            dx = denominators_xmatch[r][p]
-            nx = numerators_xmatch[r][p]
-            rates_xmatch[r][p] = (nx / dx) if dx > 0 else -1.0
+            dx = denominators_attributes_match[r][p]
+            nx = numerators_attributes_match[r][p]
+            rates_attributes_match[r][p] = (nx / dx) if dx > 0 else -1.0
 
     matrix = PromptConditionedDetectionMatrix(
         vocab=vocab,
@@ -740,9 +740,9 @@ def run_benchmark_prompt_conditioned_matrix(
         numerators=numerators,
         denominators=denominators,
         rates=rates,
-        numerators_xmatch=numerators_xmatch,
-        denominators_xmatch=denominators_xmatch,
-        rates_xmatch=rates_xmatch,
+        numerators_attributes_match=numerators_attributes_match,
+        denominators_attributes_match=denominators_attributes_match,
+        rates_attributes_match=rates_attributes_match,
         prompt_cases=tuple((sid, p) for sid, p in prompt_cases),
         runs_per_prompt=runs,
         code_length=code_length,
@@ -753,16 +753,13 @@ def run_benchmark_prompt_conditioned_matrix(
     return (0 if all_ok else 1, matrix)
 
 
-def _derive_x_verify(wm_text: str, modulus: int) -> list[int]:
-    try:
-        return attr_x_nli.derive_x(
-            wm_text,
-            modulus,
-            log_nli_scores=False,
-            nli_scores_out={},
-        )
-    except TypeError:
-        return attr_x_nli.derive_x(wm_text, modulus)
+def derive_verify_attributes(wm_text: str, modulus: int) -> list[int]:
+    return text_attributes.derive_attributes(
+        wm_text,
+        modulus,
+        log_scores=False,
+        scores_out={},
+    )
 
 
 def run_one_trial(
@@ -788,7 +785,7 @@ def run_one_trial(
 
     out = wm.generate(sk, prompt)
     wm_text = out["generated_text_wm"]
-    x_encode = list(out["attr_x"])
+    encode_attributes = list(out["attributes"])
     secret = list(out["prc_secret_bits"])
     t_baseline = float(out["seconds_baseline_gen"])
     t_wm = float(out["seconds_watermarked_gen"])
@@ -796,22 +793,22 @@ def run_one_trial(
     tt.t_wm_gen = t_wm
 
     t_d0 = time.perf_counter()
-    x_verify = _derive_x_verify(wm_text, sk.modulus)
-    tt.t_derive_verify = time.perf_counter() - t_d0
+    verify_attributes = derive_verify_attributes(wm_text, sk.modulus)
+    tt.t_derive_attributes = time.perf_counter() - t_d0
 
-    active_wm = active_labels_from_verify_x(x_verify, sk.modulus)
+    active_wm = active_labels_from_attributes(verify_attributes, sk.modulus)
     active_set = set(active_wm)
-    x_perfect = x_encode == x_verify
+    attributes_match = encode_attributes == verify_attributes
 
     t_k0 = time.perf_counter()
     dk_open = wm.issue(sk, [])
     dk_by_word = {w: wm.issue(sk, [w]) for w in VOCABULARY}
     tt.t_issue_keys = time.perf_counter() - t_k0
 
-    xl = list(x_verify)
+    attrs = list(verify_attributes)
     t_c0 = time.perf_counter()
-    em_master = sk.eval(xl)
-    ec_open = dk_open.c_eval(xl)
+    em_master = sk.eval(attrs)
+    ec_open = dk_open.c_eval(attrs)
     em_open_m = em_master == ec_open
     cprf_per_label_ok = 0
     cprf_per_label_n = len(VOCABULARY)
@@ -819,7 +816,7 @@ def run_one_trial(
     for w in VOCABULARY:
         dk = dk_by_word[w]
         expect_sm = w in active_set
-        sm = em_master == dk.c_eval(xl)
+        sm = em_master == dk.c_eval(attrs)
         seed_match_by_word[w] = sm
         if sm == expect_sm:
             cprf_per_label_ok += 1
@@ -865,7 +862,7 @@ def run_one_trial(
 
     return (
         word_stats,
-        x_perfect,
+        attributes_match,
         bool(m_ok),
         bool(u_ok),
         cprf_per_label_ok,
@@ -886,7 +883,7 @@ def _mean_timings(r: PromptRollup) -> dict[str, float]:
         "t_setup",
         "t_baseline_gen",
         "t_wm_gen",
-        "t_derive_verify",
+        "t_derive_attributes",
         "t_issue_keys",
         "t_cprf_checks",
         "t_master_good",
@@ -907,7 +904,7 @@ def _aggregate_timing_means(
         "t_setup",
         "t_baseline_gen",
         "t_wm_gen",
-        "t_derive_verify",
+        "t_derive_attributes",
         "t_issue_keys",
         "t_cprf_checks",
         "t_master_good",
@@ -945,7 +942,7 @@ def _print_timing_table_plain(
             "setup",
             "baseline",
             "wm_gen",
-            "derive_x",
+            "derive_attributes",
             "issue_keys",
             "cprf",
             "m_good",
@@ -967,7 +964,7 @@ def _print_timing_table_plain(
             m.get("t_setup", 0),
             m["t_baseline_gen"],
             m["t_wm_gen"],
-            m["t_derive_verify"],
+            m["t_derive_attributes"],
             m["t_issue_keys"],
             m["t_cprf_checks"],
             m["t_master_good"],
@@ -985,7 +982,7 @@ def _print_timing_table_plain(
         + f"{gm['t_setup']:>{w}.4f}"
         + f"{gm['t_baseline_gen']:>{w}.4f}"
         + f"{gm['t_wm_gen']:>{w}.4f}"
-        + f"{gm['t_derive_verify']:>{w}.4f}"
+        + f"{gm['t_derive_attributes']:>{w}.4f}"
         + f"{gm['t_issue_keys']:>{w}.4f}"
         + f"{gm['t_cprf_checks']:>{w}.4f}"
         + f"{gm['t_master_good']:>{w}.4f}"
@@ -1010,7 +1007,7 @@ def _print_timing_rich_table(
         "setup",
         "baseline",
         "wm_gen",
-        "derive_x",
+        "derive_attributes",
         "issue_keys",
         "cprf",
         "m_good",
@@ -1030,7 +1027,7 @@ def _print_timing_rich_table(
             f"{m.get('t_setup', 0):.4f}",
             f"{m['t_baseline_gen']:.4f}",
             f"{m['t_wm_gen']:.4f}",
-            f"{m['t_derive_verify']:.4f}",
+            f"{m['t_derive_attributes']:.4f}",
             f"{m['t_issue_keys']:.4f}",
             f"{m['t_cprf_checks']:.4f}",
             f"{m['t_master_good']:.4f}",
@@ -1045,7 +1042,7 @@ def _print_timing_rich_table(
         f"{gm['t_setup']:.4f}",
         f"{gm['t_baseline_gen']:.4f}",
         f"{gm['t_wm_gen']:.4f}",
-        f"{gm['t_derive_verify']:.4f}",
+        f"{gm['t_derive_attributes']:.4f}",
         f"{gm['t_issue_keys']:.4f}",
         f"{gm['t_cprf_checks']:.4f}",
         f"{gm['t_master_good']:.4f}",
@@ -1070,7 +1067,7 @@ def _print_plain_results(
     w_sid = 22
     line = (
         f"{'id':<{w_sid}} {'runs':>5} {'TPR%':>7} {'FNR%':>7} {'TNR%':>7} {'FPR%':>7} "
-        f"{'x==':>7} {'mast':>6} {'open':>6} {'ucprf':>6} {'lcprf':>6} {'ctrl':>6} "
+        f"{'attr==':>7} {'mast':>6} {'open':>6} {'ucprf':>6} {'lcprf':>6} {'ctrl':>6} "
         f"{'BER':>8} {'mism':>5} {'m_cp':>4} {'FN_s':>4} {'FP_s':>4}"
     )
     print(line)
@@ -1101,7 +1098,7 @@ def _print_plain_results(
         print(
             f"{sid_disp:<{w_sid}} {n:5d} "
             f"{_fmt_rate(tpr):>7} {_fmt_rate(fnr):>7} {_fmt_rate(tnr):>7} {_fmt_rate(fpr):>7} "
-            f"{ratio(r.x_perfect, n):>7} "
+            f"{ratio(r.attributes_match, n):>7} "
             f"{ratio(r.master_good, n):>6} {ratio(r.open_detect_good, n):>6} "
             f"{ratio(r.unconstrained_cprf_ok, n):>6} {lcprf:>6} {ratio(r.control_correct, n):>6} "
             f"{r.ber_sum / n:8.2f} {mism:>5} {r.mismatch_cprf_heuristic_bad:>4} "
@@ -1111,7 +1108,7 @@ def _print_plain_results(
     if print_legend:
         print()
         print(
-            "Legend: TPR/FNR/TNR/FPR from per-(run, vocab label) gold = label in recovered NLI-active set; "
+            "Legend: TPR/FNR/TNR/FPR from per-(run, vocab label) gold = label in recovered active set; "
             "mast/open/ctrl = successes/runs; ucprf = unconstrained CPRF seed match; "
             "lcprf = fraction of per-label CPRF checks where sk.eval==dk.c_eval matched attribute-based expectation; "
             "mism = total attribute-vs-detect mismatches; m_cp = mismatches where CPRF seed equality disagreed "
@@ -1133,7 +1130,7 @@ def _print_rich_results(
     table = Table(title=table_title)
     table.add_column("prompt_id", style="dim")
     table.add_column("runs", justify="right")
-    for col in ("TPR", "FNR", "TNR", "FPR", "x==", "master", "open", "uCPRF", "lCPRF", "ctrl", "BER%", "mism", "ΔCP", "FN•", "FP•"):
+    for col in ("TPR", "FNR", "TNR", "FPR", "attr==", "master", "open", "uCPRF", "lCPRF", "ctrl", "BER%", "mism", "ΔCP", "FN•", "FP•"):
         table.add_column(col, justify="right")
 
     for sid, _ in prompt_cases:
@@ -1173,7 +1170,7 @@ def _print_rich_results(
             _fmt_rate(fnr),
             _fmt_rate(tnr),
             _fmt_rate(fpr),
-            f"{r.x_perfect}/{n}",
+            f"{r.attributes_match}/{n}",
             f"{r.master_good}/{n}",
             f"{r.open_detect_good}/{n}",
             f"{r.unconstrained_cprf_ok}/{n}",
@@ -1287,7 +1284,7 @@ def run_benchmark_with_summary(
         llm_model_id=llm_model_id,
     )
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
-    roll_xmatch: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
+    roll_attributes_match: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     sk_shared: dict[str, Any] = {}
 
     vocab_n = len(VOCABULARY)
@@ -1318,7 +1315,7 @@ def run_benchmark_with_summary(
 
         (
             word_stats,
-            x_perfect,
+            attributes_match,
             master_ok,
             open_ok,
             cprf_label_ok,
@@ -1332,7 +1329,7 @@ def run_benchmark_with_summary(
 
         roll[sid].add_run(
             word_stats=word_stats,
-            x_perfect=x_perfect,
+            attributes_match=attributes_match,
             master_ok=master_ok,
             open_ok=open_ok,
             unconstrained_cprf_ok=em_open_m,
@@ -1342,10 +1339,10 @@ def run_benchmark_with_summary(
             ber=ber,
             timings=tt_inner,
         )
-        if x_perfect:
-            roll_xmatch[sid].add_run(
+        if attributes_match:
+            roll_attributes_match[sid].add_run(
                 word_stats=word_stats,
-                x_perfect=True,
+                attributes_match=True,
                 master_ok=master_ok,
                 open_ok=open_ok,
                 unconstrained_cprf_ok=em_open_m,
@@ -1359,7 +1356,7 @@ def run_benchmark_with_summary(
     all_ok = _strict_protocol_ok(roll, prompt_cases)
     summary = BenchmarkRunSummary(
         roll=roll,
-        roll_xmatch=roll_xmatch,
+        roll_attributes_match=roll_attributes_match,
         prompt_cases=tuple((sid, p) for sid, p in prompt_cases),
         vocab_n=vocab_n,
         code_length=code_length,
@@ -1371,12 +1368,12 @@ def run_benchmark_with_summary(
     plain = _use_plain_table()
     if not quiet:
         _heading_all = (
-            "Per-prompt aggregates: policy detection vs NLI attribute (counts over runs × labels="
+            "Per-prompt aggregates: policy detection vs label classification (counts over runs × labels="
             + str(vocab_n)
             + ")"
         )
-        _heading_x = (
-            "Same metrics, restricted to runs where encode-time attr_x equals verify-time derive_x "
+        _heading_attributes_match = (
+            "Same metrics, restricted to runs where encode-time attributes equal verify-time attributes "
             f"(full vector; runs × |V|={vocab_n} label decisions per included run)"
         )
         if plain:
@@ -1389,9 +1386,9 @@ def run_benchmark_with_summary(
             )
             _print_plain_results(
                 prompt_cases=prompt_cases,
-                roll=roll_xmatch,
+                roll=roll_attributes_match,
                 vocab_n=vocab_n,
-                table_heading=_heading_x,
+                table_heading=_heading_attributes_match,
                 print_legend=False,
             )
         else:
@@ -1405,11 +1402,11 @@ def run_benchmark_with_summary(
             )
             _print_rich_results(
                 prompt_cases=prompt_cases,
-                roll=roll_xmatch,
+                roll=roll_attributes_match,
                 vocab_n=vocab_n,
                 console=console,
                 table_title=(
-                    f"Per-prompt policy metrics — x matched only (runs × |V|={vocab_n} per included run)"
+                    f"Per-prompt policy metrics — attributes matched only (runs × |V|={vocab_n} per included run)"
                 ),
                 print_legend=False,
             )

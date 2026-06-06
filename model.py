@@ -7,7 +7,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 MODEL_ID = DEFAULT_MODEL_ID
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAMPLING: dict[str, float | int] = {
     "temperature": 0.9,
     "top_p": 1.0,
@@ -16,6 +15,20 @@ SAMPLING: dict[str, float | int] = {
 
 _model: AutoModelForCausalLM | None = None
 _tokenizer: AutoTokenizer | None = None
+
+
+def require_cuda_device() -> str:
+    """Return ``\"cuda\"`` or raise if no CUDA GPU is available."""
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA GPU is required but not available. "
+            "Install a CUDA-enabled PyTorch build and ensure an NVIDIA driver is loaded."
+        )
+    return "cuda"
+
+
+# Kept for callers that read ``model.DEVICE``; never falls back to CPU.
+DEVICE = require_cuda_device()
 
 
 def configure(
@@ -49,11 +62,12 @@ def unload() -> None:
 
 def load() -> tuple[AutoModelForCausalLM, AutoTokenizer, str]:
     global _model, _tokenizer
+    device = require_cuda_device()
     if _model is None:
         _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-        _model = AutoModelForCausalLM.from_pretrained(MODEL_ID).to(DEVICE)
+        _model = AutoModelForCausalLM.from_pretrained(MODEL_ID).to(device)
         for attr, value in SAMPLING.items():
             setattr(_model.generation_config, attr, value)
         if not _model.config.is_encoder_decoder:
             _tokenizer.padding_side = "left"
-    return _model, _tokenizer, DEVICE
+    return _model, _tokenizer, device

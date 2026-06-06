@@ -6,7 +6,7 @@ This project implements text watermarking using:
 
 - **CPRF** (constrained pseudorandom function) to bind policy/attributes
 - **PRC** (pseudorandom code) to encode and detect watermark bits in generated text
-- A zero-shot attribute extractor (`attr_x_nli.py`) to derive an attribute vector from text
+- A label classifier (`text_attributes.py`) to derive an attribute vector from text
 
 The fastest way to get started is:
 
@@ -79,16 +79,16 @@ Edit constants at the top of `app.py`, or call `model.configure(...)` before run
 At a high level:
 
 1. Generate baseline text from a prompt.
-2. Derive attribute vector `x` from text (`attr_x_nli.py`):
-   - Prefix from zero-shot label scores over `VOCABULARY`
+2. Derive attribute vector from text (`text_attributes.derive_attributes`):
+   - Prefix from label classification scores over `VOCABULARY`
    - Fixed tail from project constants
-3. Use CPRF to compute a seed input (`sk.eval(x)` or constrained `dk.c_eval(x)`).
+3. Use CPRF to compute a seed input (`sk.eval(attributes)` or constrained `dk.c_eval(attributes)`).
 4. Hash that output into a PRC key and embed/detect watermark bits.
 
 Important behavior:
 
-- During generation, `x` is derived from the baseline text.
-- During detection, `x` is derived from the watermarked text.
+- During generation, attributes are derived from the baseline text.
+- During detection, attributes are derived from the watermarked text.
 - Detection is sensitive to whether those derived attributes match in the way the protocol expects.
 
 ---
@@ -98,8 +98,7 @@ Important behavior:
 - `app.py` - Main end-to-end demo/check runner
 - `model.py` - Hugging Face LM hub id, sampling overrides, lazy loading
 - `watermarking.py` - Core API: setup/generate/detect/master_detect
-- `attr_x_nli.py` - NLI-based attribute derivation
-- `closed_vocab.py` - Vocabulary + attribute vector sizing helpers
+- `text_attributes.py` - Closed vocabulary, label classification, and `derive_attributes`
 - `randrecover.py` - Watermark embedding/recovery channel logic
 - `benchmark_policy_detection.py` - Repeated benchmark runs
 - `test_attr_classification.py` - Attribute/CPRF focused checks
@@ -114,7 +113,7 @@ Important behavior:
 The first run downloads models from Hugging Face:
 
 - LM: `meta-llama/Llama-3.2-1B-Instruct`
-- Zero-shot model: `MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli`
+- Label classifier: `BAAI/bge-reranker-v2-m3` (GPU, bf16 weights)
 
 Make sure you have enough disk space (and VRAM if running on GPU).
 
@@ -131,9 +130,9 @@ For private repos, provide a `GITHUB_TOKEN` secret in Colab so the notebook can 
 ## Tuning Notes
 
 - Change subject behavior by editing:
-  - `NLI_HYPOTHESIS_TEMPLATE` in `attr_x_nli.py`
-  - `VOCABULARY` in `closed_vocab.py`
-- Change attribute size by editing `ATTR_TAIL_DIM` in `closed_vocab.py`.
+  - `LABEL_QUERY_TEMPLATE` in `text_attributes.py`
+  - `VOCABULARY` in `text_attributes.py`
+- Change attribute size by editing `ATTR_TAIL_DIM` in `text_attributes.py`.
 - Change PRC code length by setting `CODE_LENGTH` in `app.py` (or `wm.SECURITY_PARAM` + `prc.set_code_length(...)` in scripts).
 - Change the watermark LM or sampling: `model.configure(model_id=..., temperature=..., top_p=..., top_k=...)`.
 

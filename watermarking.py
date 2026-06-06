@@ -7,8 +7,7 @@ import prc
 import randrecover
 
 import model
-from attr_x_nli import derive_x
-from closed_vocab import CPRF_ATTR_DIM, VOCABULARY
+from text_attributes import derive_attributes, VOCABULARY, CPRF_ATTR_DIM
 
 SECURITY_PARAM = 300
 WM_BIT_REDUNDANCY = 1
@@ -35,9 +34,11 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     t0 = time.perf_counter()
     baseline = randrecover.generate_baseline(m, tok, prompt, n_channel, device)
     t1 = time.perf_counter()
-    baseline_nli: dict[str, float] = {}
-    x = derive_x(baseline, sk.modulus, log_nli_scores=False, nli_scores_out=baseline_nli)
-    r = sk.eval(x)
+    baseline_scores: dict[str, float] = {}
+    attributes = derive_attributes(
+        baseline, sk.modulus, log_scores=False, scores_out=baseline_scores
+    )
+    r = sk.eval(attributes)
     prc.set_code_length(SECURITY_PARAM)
     bits = [1 if b else 0 for b in prc.encode(prc.key_gen_from_seed(sha256(r).digest()))]
     channel_bits = [b for b in bits for _ in range(WM_BIT_REDUNDANCY)]
@@ -46,9 +47,9 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     t3 = time.perf_counter()
 
     # --- logging ---
-    out["attr_x"] = x
+    out["attributes"] = attributes
     out["baseline_text"] = baseline
-    out["nli_label_scores_baseline"] = dict(baseline_nli)
+    out["label_scores_baseline"] = dict(baseline_scores)
     out["seconds_baseline_gen"] = t1 - t0
     out["seconds_watermarked_gen"] = t3 - t2
     out["prc_secret_bits"] = list(bits)
@@ -59,9 +60,9 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
 
 def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[int]]:
     m, tok, device = model.load()
-    x = derive_x(watermarked_text, dk.modulus, log_nli_scores=False)
+    attributes = derive_attributes(watermarked_text, dk.modulus, log_scores=False)
     prc.set_code_length(SECURITY_PARAM)
-    recovered_s = prc.key_gen_from_seed(sha256(dk.c_eval(x)).digest())
+    recovered_s = prc.key_gen_from_seed(sha256(dk.c_eval(attributes)).digest())
     raw, _ = randrecover.recover_bitstream_from_text(
         watermarked_text, tok, device, model=m
     )
@@ -79,9 +80,9 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
 
 def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> Tuple[bool, List[int]]:
     m, tok, device = model.load()
-    x = derive_x(watermarked_text, sk.modulus, log_nli_scores=False)
+    attributes = derive_attributes(watermarked_text, sk.modulus, log_scores=False)
     prc.set_code_length(SECURITY_PARAM)
-    s = prc.key_gen_from_seed(sha256(sk.eval(x)).digest())
+    s = prc.key_gen_from_seed(sha256(sk.eval(attributes)).digest())
     raw, _ = randrecover.recover_bitstream_from_text(
         watermarked_text, tok, device, model=m
     )

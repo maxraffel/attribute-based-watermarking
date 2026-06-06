@@ -1,8 +1,8 @@
 """
 Single-run walkthrough of the same protocol shape as ``benchmark_policy_detection`` (one prompt),
-with verbose Rich logging: texts, NLI-derived classifications, timings, recovered bits / BER, and
+with verbose Rich logging: texts, label classifications, timings, recovered bits / BER, and
 per-step pass/fail. Issues one constrained CPRF key per closed-vocabulary label and compares
-``detect`` to the expectation that the label is (or is not) in the verify-time recovered NLI
+``detect`` to the expectation that the label is (or is not) in the verify-time recovered
 attribute set. Tweak the constants below; this file does not import the benchmark module.
 
 Run: ``uv run python app.py``
@@ -14,7 +14,7 @@ import logging
 import time
 from typing import List, Sequence
 
-import attr_x_nli
+import text_attributes
 import model
 import randrecover
 import prc
@@ -23,10 +23,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from closed_vocab import (
+from text_attributes import (
     CPRF_ATTR_DIM,
+    SCORE_CUTOFF,
     VOCABULARY,
-    active_labels_from_verify_x,
+    active_labels_from_attributes,
     f_for_required_keywords,
 )
 
@@ -73,57 +74,57 @@ def _step(c: Console, name: str, got: object, expected: bool) -> bool:
     return ok
 
 
-def _dot_mod(f: Sequence[int], x: Sequence[int], modulus: int) -> int:
-    """⟨f,x⟩ mod modulus over the overlapping prefix of f and x (CPRF dimension)."""
-    n = min(len(f), len(x))
-    return sum(int(f[i]) * int(x[i]) for i in range(n)) % modulus
+def _dot_mod(f: Sequence[int], attributes: Sequence[int], modulus: int) -> int:
+    """⟨f,attributes⟩ mod modulus over the overlapping prefix of f and attributes."""
+    n = min(len(f), len(attributes))
+    return sum(int(f[i]) * int(attributes[i]) for i in range(n)) % modulus
 
 
-def _log_f_dot_x_terms(
+def _log_f_dot_attributes_terms(
     c: Console,
     title: str,
     f: Sequence[int],
-    x: Sequence[int],
+    attributes: Sequence[int],
     modulus: int,
 ) -> None:
-    """Log ⟨f,x⟩ mod m and per-keyword contributions (algebraic diagnostic only)."""
-    dot = _dot_mod(f, x, modulus)
+    """Log ⟨f,attributes⟩ mod m and per-keyword contributions (algebraic diagnostic only)."""
+    dot = _dot_mod(f, attributes, modulus)
     c.print(
-        f"  [bold]{title}[/]  ⟨f,x⟩ mod m = [cyan]{dot}[/]"
-        "  [dim](see CPRF Δ·⟨f,x⟩ note below — ⟨f,x⟩ alone does not fix eval vs c_eval)[/]"
+        f"  [bold]{title}[/]  ⟨f,attributes⟩ mod m = [cyan]{dot}[/]"
+        "  [dim](see CPRF Δ·⟨f,attributes⟩ note below — inner product alone does not fix eval vs c_eval)[/]"
     )
-    n_pref = min(len(VOCABULARY), len(f), len(x))
+    n_pref = min(len(VOCABULARY), len(f), len(attributes))
     for i in range(n_pref):
         if int(f[i]) == 0:
             continue
         lab = VOCABULARY[i]
-        xi = int(x[i]) % modulus
-        term = (int(f[i]) * int(x[i])) % modulus
-        c.print(f"    [dim]prefix[/] {lab!r}: f[{i}]={int(f[i])}, x[{i}] mod m = {xi}, term mod m = {term}")
+        ai = int(attributes[i]) % modulus
+        term = (int(f[i]) * int(attributes[i])) % modulus
+        c.print(f"    [dim]prefix[/] {lab!r}: f[{i}]={int(f[i])}, attributes[{i}] mod m = {ai}, term mod m = {term}")
     if len(f) > n_pref and any(int(f[j]) != 0 for j in range(n_pref, len(f))):
-        tail_dot = sum(int(f[j]) * int(x[j]) for j in range(n_pref, min(len(f), len(x)))) % modulus
-        c.print(f"    [dim]non-prefix f·x mod m (tail):[/] {tail_dot}")
+        tail_dot = sum(int(f[j]) * int(attributes[j]) for j in range(n_pref, min(len(f), len(attributes)))) % modulus
+        c.print(f"    [dim]non-prefix f·attributes mod m (tail):[/] {tail_dot}")
 
 
 def _log_cprf_seed_agreement(
     c: Console,
     sk: object,
     dk: object,
-    x: Sequence[int],
+    attributes: Sequence[int],
     title: str,
     *,
     expect_seed_match: bool,
 ) -> tuple[bool, bool]:
     """
-    Ground truth for PRC: same PRF input iff sk.eval(x) == dk.c_eval(x).
+    Ground truth for PRC: same PRF input iff sk.eval(attributes) == dk.c_eval(attributes).
 
     For reject policies we expect ``expect_seed_match=False``. If the hashes still match,
-    Δ·⟨f,x⟩≡0 (mod m) for this key's random Δ (common when m is composite); detection may still pass.
+    Δ·⟨f,attributes⟩≡0 (mod m) for this key's random Δ (common when m is composite); detection may still pass.
     """
-    em = sk.eval(list(x))
-    ec = dk.c_eval(list(x))
+    em = sk.eval(list(attributes))
+    ec = dk.c_eval(list(attributes))
     match = em == ec
-    c.print(f"  [bold]{title}[/]  sk.eval(x) == dk.c_eval(x) → [cyan]{match}[/]")
+    c.print(f"  [bold]{title}[/]  sk.eval(attributes) == dk.c_eval(attributes) → [cyan]{match}[/]")
     c.print(f"    [dim]master SHA256-input layer…[/] {em.hex()[:24]}…")
     c.print(f"    [dim]c_eval …[/]                {ec.hex()[:24]}…")
     if match == expect_seed_match:
@@ -132,15 +133,15 @@ def _log_cprf_seed_agreement(
     if not expect_seed_match and match:
         c.print(
             "  [yellow]WARN[/]  Constrained key still matches master on this x: need "
-            "Δ·⟨f,x⟩≢0 (mod m) to separate seeds; ⟨f,x⟩≢0 alone is not enough on composite m (e.g. 1024)."
+            "Δ·⟨f,attributes⟩≢0 (mod m) to separate seeds; ⟨f,attributes⟩≢0 alone is not enough on composite m (e.g. 1024)."
         )
         c.print(
             "  [yellow]→[/]  PRC ``detect`` may still return True (same seed as watermark); "
-            "try again or use a prime modulus if you need ⟨f,x⟩≠0 to imply separation."
+            "try again or use a prime modulus if you need ⟨f,attributes⟩≠0 to imply separation."
         )
         return True, match
     c.print(
-        "  [bold red]FAIL[/]  Expected CPRF agreement but sk.eval(x) ≠ dk.c_eval(x) "
+        "  [bold red]FAIL[/]  Expected CPRF agreement but sk.eval(attributes) ≠ dk.c_eval(attributes) "
         f"(expected match={expect_seed_match})"
     )
     return False, match
@@ -150,7 +151,7 @@ def main() -> int:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
     # In notebooks, logging is often preconfigured so ``basicConfig`` is ignored.
-    # ``force=True`` guarantees INFO-level attr_x_nli tables appear consistently.
+    # ``force=True`` guarantees INFO-level label score tables appear consistently.
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
@@ -172,7 +173,7 @@ def main() -> int:
             f"[bold]sampling[/] temperature={model.SAMPLING['temperature']}  "
             f"top_p={model.SAMPLING['top_p']}  "
             f"top_k={model.SAMPLING['top_k']}\n"
-            f"[bold]vocab[/] |V|={n_prefix}  ·  [bold]NLI prefix[/] multi-label (cutoff={attr_x_nli.NLI_MULTI_LABEL_SCORE_CUTOFF:g})",
+            f"[bold]vocab[/] |V|={n_prefix}  ·  [bold]label prefix[/] multi-label (cutoff={SCORE_CUTOFF:g})",
             title="app.py protocol run",
         )
     )
@@ -190,11 +191,11 @@ def main() -> int:
     sk = wm.setup(MODULUS)
     c.print(f"  Master key OK (modulus={sk.modulus}).")
 
-    c.rule("2) Generate (baseline → attr_x → PRC → watermarked)", style="cyan")
+    c.rule("2) Generate (baseline → attributes → PRC → watermarked)", style="cyan")
     out = wm.generate(sk, PROMPT)
     baseline_text = out["baseline_text"]
     wm_text = out["generated_text_wm"]
-    x_encode: List[int] = list(out["attr_x"])
+    encode_attributes: List[int] = list(out["attributes"])
     secret: List[int] = list(out["prc_secret_bits"])
     t_bl = float(out["seconds_baseline_gen"])
     t_wm = float(out["seconds_watermarked_gen"])
@@ -204,42 +205,32 @@ def main() -> int:
         f"  [dim]seconds_baseline_gen[/]=[cyan]{t_bl:.4f}[/]  "
         f"[dim]seconds_watermarked_gen[/]=[cyan]{t_wm:.4f}[/]"
     )
-    c.print(f"  [dim]encode-time attr_x (len {len(x_encode)}), prefix:[/] {x_encode[:n_prefix]}")
+    c.print(f"  [dim]encode-time attributes (len {len(encode_attributes)}), prefix:[/] {encode_attributes[:n_prefix]}")
     c.print(f"  [dim]PRC secret bits (len {len(secret)}):[/] {_bits_preview(secret)}")
 
-    c.rule("3) Verify-time x and NLI-active labels (multi-label cutoff)", style="cyan")
-    wm_nli: dict[str, float] = {}
-    try:
-        x_verify = attr_x_nli.derive_x(
-            wm_text,
-            sk.modulus,
-            log_nli_scores=False,
-            nli_scores_out=wm_nli,
-        )
-    except TypeError:
-        # Older ``attr_x_nli`` (positional ``derive_x`` only); skip paired NLI log.
-        x_verify = attr_x_nli.derive_x(wm_text, sk.modulus)
-    bl_scores = out.get("nli_label_scores_baseline") or {}
-    if (
-        hasattr(attr_x_nli, "log_pair_zero_shot_scores")
-        and wm_nli
-        and bl_scores
-    ):
-        attr_x_nli.log_pair_zero_shot_scores(
+    c.rule("3) Verify-time attributes and active labels (multi-label cutoff)", style="cyan")
+    wm_scores: dict[str, float] = {}
+    verify_attributes = text_attributes.derive_attributes(
+        wm_text,
+        sk.modulus,
+        log_scores=False,
+        scores_out=wm_scores,
+    )
+    bl_scores = out.get("label_scores_baseline") or {}
+    if wm_scores and bl_scores:
+        text_attributes.log_paired_label_scores(
             baseline=bl_scores,
-            watermarked=wm_nli,
+            watermarked=wm_scores,
         )
-    active_wm = active_labels_from_verify_x(x_verify, sk.modulus)
-    # Encode-time x is derive_x(baseline); same NLI view as re-running on baseline_text.
-    active_bl = active_labels_from_verify_x(x_encode, sk.modulus)
-    c.print(f"  [bold]NLI-active (baseline text):[/] {active_bl or '(none)'}")
-    c.print(f"  [bold]NLI-active (watermarked text):[/] {active_wm or '(none)'}")
-    c.print(f"  [dim]derive_x(wm) prefix:[/] {x_verify[:n_prefix]}")
-    x_perfect = list(x_encode) == list(x_verify)
-    # Do not nest style tags (e.g. [cyan][bold]…[/][/]) — Rich parses that poorly and looks broken.
-    _xtag = "[bold green]yes[/]" if x_perfect else "[bold red]no[/]"
+    active_wm = active_labels_from_attributes(verify_attributes, sk.modulus)
+    active_bl = active_labels_from_attributes(encode_attributes, sk.modulus)
+    c.print(f"  [bold]Active labels (baseline text):[/] {active_bl or '(none)'}")
+    c.print(f"  [bold]Active labels (watermarked text):[/] {active_wm or '(none)'}")
+    c.print(f"  [dim]verify-time attributes prefix:[/] {verify_attributes[:n_prefix]}")
+    attributes_match = list(encode_attributes) == list(verify_attributes)
+    _xtag = "[bold green]yes[/]" if attributes_match else "[bold red]no[/]"
     c.print(
-        "  [dim]encode-time attr_x equals verify-time derive_x (full vector):[/] " + _xtag
+        "  [dim]encode-time attributes equal verify-time attributes (full vector):[/] " + _xtag
     )
 
     c.rule("4) Issue keys (unconstrained + one constrained key per vocab label)", style="cyan")
@@ -248,7 +239,7 @@ def main() -> int:
     active_set = set(active_wm)
     dk_by_word = {w: wm.issue(sk, [w]) for w in VOCABULARY}
     c.print(
-        f"  [bold]Verify-time NLI-active (recovered attribute):[/] "
+        f"  [bold]Verify-time active labels (recovered attribute):[/] "
         f"{sorted(active_wm) if active_wm else '(none)'}"
     )
     c.print(
@@ -258,22 +249,22 @@ def main() -> int:
     t_keys = time.perf_counter() - t0
     c.print(f"  [dim]issue_keys_seconds[/]=[cyan]{t_keys:.5f}[/]  ([cyan]{1 + len(VOCABULARY)}[/] keys)")
 
-    c.rule("4b) CPRF algebra + sk.eval(x) vs dk.c_eval(x) (same x = derive_x on WM text)", style="cyan")
+    c.rule("4b) CPRF algebra + sk.eval(attributes) vs dk.c_eval(attributes) (verify-time text)", style="cyan")
     m_sz = sk.modulus
     f_zero = [0] * CPRF_ATTR_DIM
     c.print(
-        "  [dim]Go CPRF: constrained z1 = z0 − f·Δ ⇒ inner-product term k_c = k_m − Δ·⟨f,x⟩ (mod m). "
-        "Hashes match iff Δ·⟨f,x⟩≡0 — not merely ⟨f,x⟩≡0. Composite m (e.g. 1024) allows ⟨f,x⟩≠0 with "
-        "Δ·⟨f,x⟩≡0, so match expectation uses byte equality below. For one-hot f on label w, "
-        "⟨f,x⟩≡0 when w is NLI-active (prefix coordinate ≡ 0 mod m).[/]"
+        "  [dim]Go CPRF: constrained z1 = z0 − f·Δ ⇒ inner-product term k_c = k_m − Δ·⟨f,attributes⟩ (mod m). "
+        "Hashes match iff Δ·⟨f,attributes⟩≡0 — not merely ⟨f,attributes⟩≡0. Composite m (e.g. 1024) allows ⟨f,attributes⟩≠0 with "
+        "Δ·⟨f,attributes⟩≡0, so match expectation uses byte equality below. For one-hot f on label w, "
+        "⟨f,attributes⟩≡0 when w is active (prefix coordinate ≡ 0 mod m).[/]"
     )
-    _log_f_dot_x_terms(c, "Unconstrained (f = 0)", f_zero, x_verify, m_sz)
+    _log_f_dot_attributes_terms(c, "Unconstrained (f = 0)", f_zero, verify_attributes, m_sz)
     ok_open, _ = _log_cprf_seed_agreement(
-        c, sk, dk_open, x_verify, "Unconstrained key", expect_seed_match=True
+        c, sk, dk_open, verify_attributes, "Unconstrained key", expect_seed_match=True
     )
     all_ok &= ok_open
 
-    policy_table = Table(show_header=True, header_style="bold", title="Per-label constrained keys (verify x)")
+    policy_table = Table(show_header=True, header_style="bold", title="Per-label constrained keys (verify attributes)")
     policy_table.add_column("required label")
     policy_table.add_column("in recovered attr", justify="center")
     policy_table.add_column("expect seed match", justify="center")
@@ -282,12 +273,12 @@ def main() -> int:
     for w in VOCABULARY:
         f_w = f_for_required_keywords([w])
         expect_match = w in active_set
-        _log_f_dot_x_terms(c, f"Policy requires [{w!r}]", f_w, x_verify, m_sz)
+        _log_f_dot_attributes_terms(c, f"Policy requires [{w!r}]", f_w, verify_attributes, m_sz)
         ok_w, sm = _log_cprf_seed_agreement(
             c,
             sk,
             dk_by_word[w],
-            x_verify,
+            verify_attributes,
             f"Constrained key (required: {w!r})",
             expect_seed_match=expect_match,
         )
@@ -365,7 +356,7 @@ def main() -> int:
     sum_table.add_column("metric")
     sum_table.add_column("value", justify="right")
     sum_table.add_row("BER% (master path vs embedded)", f"{ber:.3f}")
-    sum_table.add_row("x encode↔verify (full vector match)", "yes" if x_perfect else "no")
+    sum_table.add_row("attributes encode↔verify (full vector match)", "yes" if attributes_match else "no")
     sum_table.add_row("t_baseline_gen (s)", f"{t_bl:.4f}")
     sum_table.add_row("t_watermarked_gen (s)", f"{t_wm:.4f}")
     sum_table.add_row("t_issue_keys (s)", f"{t_keys:.5f}")

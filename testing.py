@@ -41,19 +41,19 @@ true_negative = 0
 false_positive = 0
 
 for i in range(num_cases):
-    # To test varying outcomes, we create random f and x vectors
-    x = [secrets.randbelow(10) for _ in range(CODE_LEN)]
+    # Random constraint vector f and attribute vector for CPRF inner-product tests.
+    attributes = [secrets.randbelow(10) for _ in range(CODE_LEN)]
     f = [secrets.randbelow(10) for _ in range(CODE_LEN)]
     
     # Force 50% of the cases to succeed by forcing inner product to be 0 mod 1024
     if i % 2 == 0:
         # Since 1024 = 2^10, any ODD number is coprime to 1024
-        x[-1] = secrets.randbelow(5) * 2 + 1 
-        current_sum = sum(f[j] * x[j] for j in range(CODE_LEN - 1))
-        inv = pow(x[-1], -1, 1024)
+        attributes[-1] = secrets.randbelow(5) * 2 + 1 
+        current_sum = sum(f[j] * attributes[j] for j in range(CODE_LEN - 1))
+        inv = pow(attributes[-1], -1, 1024)
         f[-1] = ( -current_sum * inv ) % 1024
     
-    inner_product = sum(f[j] * x[j] for j in range(CODE_LEN)) % 1024
+    inner_product = sum(f[j] * attributes[j] for j in range(CODE_LEN)) % 1024
     expected_to_succeed = (inner_product == 0)
     
     if expected_to_succeed:
@@ -63,14 +63,14 @@ for i in range(num_cases):
         
     dk = sk.constrain(f)
     
-    # Issue a real watermark for x
-    r = sk.eval(x)
+    # Issue a real watermark for these attributes
+    r = sk.eval(attributes)
     s = prc.key_gen_from_seed(sha256(r).digest())
     c = prc.encode(s)
     secret_bits = [bool(b) for b in c]
     
     # Attempt detect
-    recovered_r = dk.c_eval(x)
+    recovered_r = dk.c_eval(attributes)
     recovered_s = prc.key_gen_from_seed(sha256(recovered_r).digest())
     
     actually_succeeded = prc.detect(recovered_s, secret_bits)

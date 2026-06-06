@@ -6,15 +6,15 @@ from rich.console import Console
 from rich.panel import Panel
 
 
-def expect_cprf_ceval_ok(f: list[int], x: list[int], modulus: int) -> bool:
-    """True iff ⟨f,x⟩ ≡ 0 (mod modulus).
+def expect_cprf_ceval_ok(f: list[int], attributes: list[int], modulus: int) -> bool:
+    """True iff ⟨f,attributes⟩ ≡ 0 (mod modulus).
 
-    The Go CPRF uses ``k_c = k_m - Δ·⟨f,x⟩ (mod m)`` in the inner-product layer, so **master and
-    constrained outputs agree iff Δ·⟨f,x⟩ ≡ 0 (mod m)** for that key's Δ. Having ⟨f,x⟩≡0 is
-    sufficient, but ⟨f,x⟩≢0 does *not* imply disagreement on composite ``m`` (e.g. ``m=1024``).
-    Compare ``sk.eval(x)`` and ``dk.c_eval(x)`` for ground truth.
+    The Go CPRF uses ``k_c = k_m - Δ·⟨f,attributes⟩ (mod m)`` in the inner-product layer, so **master and
+    constrained outputs agree iff Δ·⟨f,attributes⟩ ≡ 0 (mod m)** for that key's Δ. Having ⟨f,attributes⟩≡0 is
+    sufficient, but ⟨f,attributes⟩≢0 does *not* imply disagreement on composite ``m`` (e.g. ``m=1024``).
+    Compare ``sk.eval(attributes)`` and ``dk.c_eval(attributes)`` for ground truth.
     """
-    return sum(f[i] * x[i] for i in range(len(x))) % modulus == 0
+    return sum(f[i] * attributes[i] for i in range(len(attributes))) % modulus == 0
 
 
 class CheckReporter:
