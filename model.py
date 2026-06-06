@@ -8,7 +8,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 MODEL_ID = DEFAULT_MODEL_ID
 SAMPLING: dict[str, float | int] = {
-    "temperature": 0.9,
+    "temperature": 0.7,
     "top_p": 1.0,
     "top_k": 0,
 }

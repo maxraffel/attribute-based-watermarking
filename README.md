@@ -66,6 +66,8 @@ Edit constants at the top of `app.py`, or call `model.configure(...)` before run
   uv run python test_attr_classification.py
   ```
 
+  Classifies a preset paragraph and prints label scores in a Rich table.
+
 - Policy detection benchmark:
 
   ```sh
@@ -101,7 +103,7 @@ Important behavior:
 - `text_attributes.py` - Closed vocabulary, label classification, and `derive_attributes`
 - `randrecover.py` - Watermark embedding/recovery channel logic
 - `benchmark_policy_detection.py` - Repeated benchmark runs
-- `test_attr_classification.py` - Attribute/CPRF focused checks
+- `test_attr_classification.py` - Simple label-classification demo on sample text
 - `cprf/` - CPRF shared library integration
 - `prc/` - PRC Rust extension
 - `colab.ipynb` - Notebook workflow

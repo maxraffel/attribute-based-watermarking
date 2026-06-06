@@ -24,10 +24,10 @@ ATTR_TAIL_DIM = 32
 CPRF_ATTR_DIM = len(VOCABULARY) + ATTR_TAIL_DIM
 
 # Multi-label activation threshold on normalized scores in [0, 1].
-SCORE_CUTOFF = 0.1
+SCORE_CUTOFF = 0.001
 
 # Query side of each (query, document) pair passed to the label scorer.
-LABEL_QUERY_TEMPLATE = "{label}"
+LABEL_QUERY_TEMPLATE = "Related to {label}"
 
 _FIXED_TAIL_SEED = b"watermarking-for-llm/attr-x/fixed-tail/v1\x00"
 _MAX_DOCUMENT_CHARS = 6000
