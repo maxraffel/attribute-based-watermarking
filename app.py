@@ -296,10 +296,6 @@ def main() -> int:
             _pass_cell(w_ok == expect_ok),
         )
 
-    c.print(det_table)
-    c.print(f"  [dim]detection total[/] {det_total:.3f}s")
-
-    c.rule("5) Negative control", style="cyan")
     m, tok, device = model.load()
     wrong = randrecover.negative_control_transcript_like(
         wm_text,
@@ -308,13 +304,24 @@ def main() -> int:
         n_bits=wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY,
         model=m,
     )
-    w_ok, _ = wm.master_detect(sk, wrong)
-    all_ok &= not bool(w_ok)
-    c.print(
-        f"  decoy transcript ({len(wrong)} chars)  "
-        f"master_detect={bool(w_ok)}  {_pass_cell(not bool(w_ok))}"
+    t0 = time.perf_counter()
+    neg_ok, _ = wm.master_detect(sk, wrong)
+    t_neg = time.perf_counter() - t0
+    neg_pass = not bool(neg_ok)
+    all_ok &= neg_pass
+    det_total += t_neg
+    det_table.add_row(
+        "master (decoy transcript)",
+        "—",
+        "False",
+        "True" if neg_ok else "False",
+        "—",
+        f"{t_neg:.3f}s",
+        _pass_cell(neg_pass),
     )
-    c.print(f"  [dim]excerpt:[/] {_excerpt(wrong, 200)}")
+
+    c.print(det_table)
+    c.print(f"  [dim]detection total[/] {det_total:.3f}s")
 
     c.print()
     if all_ok:
