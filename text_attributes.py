@@ -177,27 +177,12 @@ def pick_unrelated_keyword_for_policy(
 # --- score → attribute vector ---
 
 
-def _winner_index(score_by_label: Mapping[str, float]) -> int | None:
-    labels = list(VOCABULARY)
-    if not labels:
-        return None
-    scored = [float(score_by_label.get(w, 0.0)) for w in labels]
-    mx = max(scored)
-    return min(i for i, s in enumerate(scored) if s == mx)
-
-
 def _active_mask_from_scores(score_by_label: Mapping[str, float], cutoff: float) -> list[bool]:
     labels = list(VOCABULARY)
     if not labels:
         return []
     scored = [float(score_by_label.get(w, 0.0)) for w in labels]
-    active = [s >= cutoff for s in scored]
-    if not any(active):
-        win = _winner_index(score_by_label)
-        if win is not None:
-            active = [False] * len(labels)
-            active[win] = True
-    return active
+    return [s >= cutoff for s in scored]
 
 
 def _prefix_absence_bits_from_scores(score_by_label: Mapping[str, float], cutoff: float) -> List[int]:
@@ -297,6 +282,7 @@ def derive_attributes(
     Derive CPRF attribute vector from ``text``: prefix from label classification + fixed tail.
 
     Prefix coordinate ``i`` is **0** when label ``i`` is active (score ≥ cutoff), else **1**.
+    If no label meets the cutoff, all prefix coordinates are **1** (no active labels).
     """
     cutoff = SCORE_CUTOFF if score_cutoff is None else score_cutoff
     scorer = get_scorer()

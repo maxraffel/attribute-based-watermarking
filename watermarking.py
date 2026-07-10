@@ -27,13 +27,18 @@ def issue(sk: cprf.MasterKey, keywords: List[str]) -> cprf.ConstrainedKey:
     return sk.constrain(f)
 
 
-def generate(sk: cprf.MasterKey, prompt: str) -> dict:
+def generate(sk: cprf.MasterKey, prompt: str, *, baseline_text: str | None = None) -> dict:
     m, tok, device = model.load()
     n_channel = SECURITY_PARAM * WM_BIT_REDUNDANCY
 
-    t0 = time.perf_counter()
-    baseline = randrecover.generate_baseline(m, tok, prompt, n_channel, device)
-    t1 = time.perf_counter()
+    if baseline_text is None:
+        t0 = time.perf_counter()
+        baseline = randrecover.generate_baseline(m, tok, prompt, n_channel, device)
+        seconds_baseline_gen = time.perf_counter() - t0
+    else:
+        baseline = baseline_text
+        seconds_baseline_gen = 0.0
+
     baseline_scores: dict[str, float] = {}
     attributes = derive_attributes(
         baseline, sk.modulus, log_scores=False, scores_out=baseline_scores
@@ -44,14 +49,14 @@ def generate(sk: cprf.MasterKey, prompt: str) -> dict:
     channel_bits = [b for b in bits for _ in range(WM_BIT_REDUNDANCY)]
     t2 = time.perf_counter()
     out = randrecover.generate_with_watermark(m, tok, prompt, channel_bits, device)
-    t3 = time.perf_counter()
+    seconds_watermarked_gen = time.perf_counter() - t2
 
     # --- logging ---
     out["attributes"] = attributes
     out["baseline_text"] = baseline
     out["label_scores_baseline"] = dict(baseline_scores)
-    out["seconds_baseline_gen"] = t1 - t0
-    out["seconds_watermarked_gen"] = t3 - t2
+    out["seconds_baseline_gen"] = seconds_baseline_gen
+    out["seconds_watermarked_gen"] = seconds_watermarked_gen
     out["prc_secret_bits"] = list(bits)
     out["wm_bit_redundancy"] = WM_BIT_REDUNDANCY
     out["wm_channel_bits"] = list(channel_bits)

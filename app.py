@@ -34,11 +34,13 @@ from text_attributes import (
 
 # --- customize here ---
 MODULUS = 1024
-CODE_LENGTH = 100
-WM_BIT_REDUNDANCY = 3  # token-channel repeats per logical PRC bit; recovery = strict majority (tie → 0)
+CODE_LENGTH = 200
+WM_BIT_REDUNDANCY = 7  # token-channel repeats per logical PRC bit; recovery = strict majority (tie → 0)
 MODEL_ID: str | None = None  # None → ``model.DEFAULT_MODEL_ID``
 PROMPT = (
-    "Explain the economic nuance and impact of Drake Maye during his college football career at North Carolina."
+    # '''Explain the economic nuance and impact of Drake Maye during his college football career at North Carolina.'''
+    # "Write a program to reverse a linked list then provide an analysis of its time complexity."
+    "Explain how software has transformed the art world."
 )
 
 TEXT_EXCERPT_CHARS = 400
@@ -190,6 +192,11 @@ def main() -> int:
     wm_text = out["generated_text_wm"]
     encode_attributes: List[int] = list(out["attributes"])
     secret: List[int] = list(out["prc_secret_bits"])
+    sacrificed_bits = int(out.get("sacrificed_bits", 0))
+    natural_partition_choices = int(out.get("natural_partition_choices", 0))
+    recovery_stalls = int(out.get("recovery_stalls", 0))
+    retok_replacements = int(out.get("retok_replacements", 0))
+    recovery_ids_aligned = bool(out.get("recovery_ids_aligned", False))
     t_bl = float(out["seconds_baseline_gen"])
     t_wm = float(out["seconds_watermarked_gen"])
 
@@ -197,7 +204,10 @@ def main() -> int:
     _print_text(c, "Watermarked text", wm_text)
     c.print(
         f"  [dim]generate[/] baseline={t_bl:.3f}s  watermarked={t_wm:.3f}s  "
-        f"PRC payload={len(secret)} logical bits"
+        f"PRC payload={len(secret)} logical bits  "
+        f"sacrificed_bits={sacrificed_bits}  natural_partition={natural_partition_choices}  "
+        f"recovery_stalls={recovery_stalls}  retok_replacements={retok_replacements}  "
+        f"recovery_ids_aligned={'yes' if recovery_ids_aligned else 'no'}"
     )
 
     c.rule("2) Label classification", style="cyan")
@@ -246,6 +256,8 @@ def main() -> int:
     det_table.add_column("expect", justify="center")
     det_table.add_column("got", justify="center")
     det_table.add_column("BER%", justify="right")
+    det_table.add_column("sacrificed", justify="right")
+    det_table.add_column("natural_part", justify="right")
     det_table.add_column("time", justify="right")
     det_table.add_column("check", justify="center")
 
@@ -260,6 +272,8 @@ def main() -> int:
         "True",
         "True" if m_ok else "False",
         f"{ber:.2f}",
+        str(sacrificed_bits),
+        str(natural_partition_choices),
         f"{t_m:.3f}s",
         _pass_cell(m_ok),
     )
@@ -273,6 +287,8 @@ def main() -> int:
         "—",
         "True",
         "True" if u_ok else "False",
+        "—",
+        "—",
         "—",
         f"{t_u:.3f}s",
         _pass_cell(u_ok),
@@ -291,6 +307,8 @@ def main() -> int:
             "yes" if w in active_set else "no",
             "True" if expect_ok else "False",
             "True" if w_ok else "False",
+            "—",
+            "—",
             "—",
             f"{t_w:.3f}s",
             _pass_cell(w_ok == expect_ok),
@@ -315,6 +333,8 @@ def main() -> int:
         "—",
         "False",
         "True" if neg_ok else "False",
+        "—",
+        "—",
         "—",
         f"{t_neg:.3f}s",
         _pass_cell(neg_pass),

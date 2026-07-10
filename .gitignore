@@ -77,6 +77,9 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+results/
+benchmark_*.json
+benchmark_*.png
 
 # IPython
 profile_default/

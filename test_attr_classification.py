@@ -25,30 +25,28 @@ from text_attributes import (
 for _name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
-SAMPLE_PARAGRAPH1 = (
-    '''Drake Maye is a true college football star. Born on September 17, 1999, in Raleigh, North Carolina, Maye is an American football quarterback 
-who currently plays for the University of North Carolina Tar Heels. As a college football player, Maye's performance has garnered significant
-attention, and his economic impact extends beyond the football field. Here are some nuances and impacts of his college football career:      
+SAMPLE_PARAGRAPH = (
+    '''NFL Madden is a popular American football video game series developed by EA Sports (Electronic Arts). The series, which debuted in 1993, is
+known for its realistic and authentic football experience, with a focus on gameplay, strategy, and simulation.
 
-Economic Nuances:
+The game is based on the National Football League (NFL) and features current and retired players, as well as fictional characters created by 
+the developers. The series has undergone significant updates and improvements over the years, incorporating new technologies and features to 
+enhance gameplay and realism.
 
-1. **Increased Exposure**: As a prominent player, Maye attracts media attention, which boosts his visibility and increases his market value. 
-This exposure can lead to more endorsement opportunities, potentially leading to higher earning potential.
-2. **College Football Revenue**: The NCAA generates significant revenue from ticket sales, merchandise, and broadcasting rights. As a top    
-college football player, Maye's presence can increase the value of these revenue streams, potentially leading to increased profitability for 
-the university.
-3. **Sponsorships**: Maye's college football career can lead to new sponsorship opportunities, as teams and brands seek to associate
-themselves with top college athletes. This can increase his earning potential and create new revenue streams.
+Here are some key features and characteristics of NFL Madden:
 
-Impact:
-
-1. **Enhanced Brand Value**: Maye's success on the football field can enhance his personal brand, making him a more attractive prospect for  
-potential employers, sponsors, or investors.
-2. **Increased Social Media Following**: As a prominent college football player, Maye's social media following grows, providing an
-opportunity for him to promote products, services'''
+1. **Gameplay simulation**: The game is designed to simulate the gameplay and strategies of the NFL, including player movements, tackling,   
+throwing, and running.
+2. **Authentic player roster**: The game features a large roster of NFL players, including current and retired players, as well as players   
+from college and high school football.
+3. **Customization options**: Players can customize their players with various attributes, such as height, weight, speed, strength, and more.
+4. **Season modes**: The game features a variety of season modes, including regular seasons, playoffs, and preseason games.
+5. **Tactics and play calling**: Players can use various tactics and play calling options to gain an advantage over opponents.
+6. **Reputation system**: Players can build their reputation by winning games, which affects their standing with coaches and teammates.      
+7. **Realistic graphics and sound**: The game features detailed graphics and sound effects'''
 )
 
-SAMPLE_PARAGRAPH = '''
+SAMPLE_PARAGRAPH1 = '''
 Drake Maye is an American football quarterback who played college football at North Carolina. Here are the economic nuances and impact of his
 career during his time at the University of North Carolina:
 

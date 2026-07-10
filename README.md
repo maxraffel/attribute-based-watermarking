@@ -30,7 +30,16 @@ The fastest way to get started is:
 uv sync --extra dev
 ```
 
-### 3) Build PRC extension
+### 3) Hugging Face access (gated Llama models)
+
+The default LM is `meta-llama/Llama-3.2-3B-Instruct`, which is **gated** on Hugging Face.
+
+1. Accept the model license on its [model card](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct).
+2. Copy `.env.example` to `.env` and set `HF_TOKEN` (or run `huggingface-cli login`).
+
+Without a token, weight downloads can hang with no progress. `model.load()` now fails fast with a clear error instead.
+
+### 4) Build PRC extension
 
 Run this after cloning, and again any time `prc/` changes:
 
@@ -38,7 +47,7 @@ Run this after cloning, and again any time `prc/` changes:
 uv run maturin develop --release -m prc/Cargo.toml
 ```
 
-### 4) Run the main demo
+### 5) Run the main demo
 
 ```sh
 uv run python app.py
@@ -114,7 +123,7 @@ Important behavior:
 
 The first run downloads models from Hugging Face:
 
-- LM: `meta-llama/Llama-3.2-1B-Instruct`
+- LM: `meta-llama/Llama-3.2-3B-Instruct` (gated; requires HF token — see step 3 above)
 - Label classifier: `BAAI/bge-reranker-v2-m3` (GPU, bf16 weights)
 
 Make sure you have enough disk space (and VRAM if running on GPU).
