@@ -82,6 +82,14 @@ def inference_dtype_label(name: str | None = None) -> str:
 _UNSET = object()
 
 
+def _apply_sampling_to_generation_config() -> None:
+    """Push ``SAMPLING`` into the loaded model's ``generation_config`` (used by ``generate``)."""
+    if _model is None:
+        return
+    for attr, value in SAMPLING.items():
+        setattr(_model.generation_config, attr, value)
+
+
 def configure(
     *,
     model_id: str | None = None,
@@ -98,6 +106,8 @@ def configure(
         SAMPLING["top_p"] = top_p
     if top_k is not None:
         SAMPLING["top_k"] = top_k
+    if any(x is not None for x in (temperature, top_p, top_k)):
+        _apply_sampling_to_generation_config()
     if inference_dtype is not _UNSET:
         new_dtype = _normalize_inference_dtype(
             None if inference_dtype is None else str(inference_dtype)
@@ -187,8 +197,7 @@ def load() -> tuple[AutoModelForCausalLM, AutoTokenizer, str]:
             ).to(device)
         print(f"Model ready on {device}.", flush=True)
         _model.eval()
-        for attr, value in SAMPLING.items():
-            setattr(_model.generation_config, attr, value)
         if not _model.config.is_encoder_decoder:
             _tokenizer.padding_side = "left"
+    _apply_sampling_to_generation_config()
     return _model, _tokenizer, device
