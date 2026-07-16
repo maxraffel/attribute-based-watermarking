@@ -141,13 +141,7 @@ def _bit_errors(secret: Sequence[int], recovered: Sequence[int]) -> list[int]:
 
 
 def _logical_bits(raw: Sequence[int], code_length: int, redundancy: int) -> list[int]:
-    need = code_length * redundancy
-    padded = (list(raw) + [0] * need)[:need]
-    out: list[int] = []
-    for i in range(code_length):
-        chunk = padded[i * redundancy : (i + 1) * redundancy]
-        out.append(1 if 2 * sum(chunk) > redundancy else 0)
-    return out
+    return wm.majority_deinterleave(raw, code_length, redundancy)
 
 
 def _majority_vote_analysis(
@@ -165,15 +159,15 @@ def _majority_vote_analysis(
     need = code_length * redundancy
     padded = (list(raw) + [0] * need)[:need]
     for i in range(code_length):
-        chunk = padded[i * redundancy : (i + 1) * redundancy]
-        if 2 * sum(chunk) == redundancy:
+        votes = [int(padded[i + r * code_length]) for r in range(redundancy)]
+        if 2 * sum(votes) == redundancy:
             tie_votes += 1
         embedded = secret_logical[i]
         recovered = raw_logical[i]
         chunk_err = any(
-            int(channel_bits[i * redundancy + j]) != int(padded[i * redundancy + j])
-            for j in range(redundancy)
-            if i * redundancy + j < len(channel_bits)
+            (idx := i + r * code_length) < len(channel_bits)
+            and int(channel_bits[idx]) != int(padded[idx])
+            for r in range(redundancy)
         )
         if chunk_err and embedded == recovered:
             corrections += 1

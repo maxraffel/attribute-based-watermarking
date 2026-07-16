@@ -15,7 +15,7 @@ try:
 except ImportError:
     load_dotenv = None  # type: ignore[misc, assignment]
 
-DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct"
+DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 MODEL_ID = DEFAULT_MODEL_ID
 SAMPLING: dict[str, float | int] = {
     "temperature": 1.0,
@@ -27,7 +27,7 @@ SAMPLING: dict[str, float | int] = {
 # ``None`` / ``"fp32"`` — full float32 (default)
 # ``"fp16"`` — float16 weights/activations (fast; good on most NVIDIA GPUs)
 # ``"bf16"`` — bfloat16 (often best on Ampere+; wider exponent range than fp16)
-DEFAULT_INFERENCE_DTYPE: str | None = "fp16"
+DEFAULT_INFERENCE_DTYPE: str | None = None #"fp16"
 INFERENCE_DTYPE: str | None = DEFAULT_INFERENCE_DTYPE
 
 _model: AutoModelForCausalLM | None = None

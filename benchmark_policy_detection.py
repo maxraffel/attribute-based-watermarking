@@ -1684,7 +1684,7 @@ def main() -> int:
         type=int,
         default=1,
         metavar="R",
-        help="Repeat each logical PRC bit R times on the token channel; recovery uses strict majority (ties->0).",
+        help="Depth-interleave R replicas of each logical PRC bit on the token channel; recovery uses strict majority (ties->0).",
     )
     p.add_argument(
         "--output",

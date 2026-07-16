@@ -34,8 +34,8 @@ from text_attributes import (
 
 # --- customize here ---
 MODULUS = 1024
-CODE_LENGTH = 200
-WM_BIT_REDUNDANCY = 7  # token-channel repeats per logical PRC bit; recovery = strict majority (tie → 0)
+CODE_LENGTH = 100
+WM_BIT_REDUNDANCY = 5  # depth-interleaved token-channel repeats per PRC bit; recovery = strict majority (tie → 0)
 MODEL_ID: str | None = None  # None → ``model.DEFAULT_MODEL_ID``
 PROMPT = (
     # '''Explain the economic nuance and impact of Drake Maye during his college football career at North Carolina.'''

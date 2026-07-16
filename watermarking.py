@@ -1,6 +1,6 @@
 import time
 from hashlib import sha256
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import cprf
 import prc
@@ -11,6 +11,39 @@ from text_attributes import derive_attributes, VOCABULARY, CPRF_ATTR_DIM
 
 SECURITY_PARAM = 300
 WM_BIT_REDUNDANCY = 1
+
+
+def interleave_repetitions(bits: Sequence[int], redundancy: int) -> List[int]:
+    """Depth-interleave R replicas of a length-n codeword onto the token channel.
+
+    Emits R full passes of the codeword (``b0..bn-1`` repeated R times), so
+    replicas of logical bit ``i`` land at channel indices ``i, i+n, …, i+(R-1)n``.
+    That spacing matches the bursty error pattern of the randrecovery channel
+    (retokenization spans, sacrificed slots, local sampling correlation): a
+    contiguous error run corrupts at most one replica per logical bit instead
+    of wiping a consecutive repeat block.
+    """
+    if redundancy <= 1:
+        return [int(b) for b in bits]
+    out: List[int] = []
+    for _ in range(redundancy):
+        out.extend(int(b) for b in bits)
+    return out
+
+
+def majority_deinterleave(
+    raw: Sequence[int], code_length: int, redundancy: int
+) -> List[int]:
+    """Strict-majority vote over depth-interleaved replicas (tie → 0)."""
+    need = code_length * redundancy
+    padded = (list(raw) + [0] * need)[:need]
+    if redundancy <= 1:
+        return [int(padded[i]) for i in range(code_length)]
+    bits: List[int] = []
+    for i in range(code_length):
+        votes = sum(int(padded[i + r * code_length]) for r in range(redundancy))
+        bits.append(1 if 2 * votes > redundancy else 0)
+    return bits
 
 
 def setup(modulus: int) -> cprf.MasterKey:
@@ -46,7 +79,7 @@ def generate(sk: cprf.MasterKey, prompt: str, *, baseline_text: str | None = Non
     r = sk.eval(attributes)
     prc.set_code_length(SECURITY_PARAM)
     bits = [1 if b else 0 for b in prc.encode(prc.key_gen_from_seed(sha256(r).digest()))]
-    channel_bits = [b for b in bits for _ in range(WM_BIT_REDUNDANCY)]
+    channel_bits = interleave_repetitions(bits, WM_BIT_REDUNDANCY)
     t2 = time.perf_counter()
     out = randrecover.generate_with_watermark(m, tok, prompt, channel_bits, device)
     seconds_watermarked_gen = time.perf_counter() - t2
@@ -71,15 +104,8 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
     raw, _ = randrecover.recover_bitstream_from_text(
         watermarked_text, tok, device, model=m
     )
-    need = SECURITY_PARAM * WM_BIT_REDUNDANCY
-    raw = (raw + [0] * need)[:need]
-    r = WM_BIT_REDUNDANCY
-    bits = []
-    for i in range(SECURITY_PARAM):
-        chunk = raw[i * r : (i + 1) * r]
-        bits.append(1 if 2 * sum(chunk) > r else 0)
-    bits_int = [1 if b else 0 for b in bits]
-    ok = prc.detect(recovered_s, [bool(b) for b in bits])
+    bits_int = majority_deinterleave(raw, SECURITY_PARAM, WM_BIT_REDUNDANCY)
+    ok = prc.detect(recovered_s, [bool(b) for b in bits_int])
     return ok, bits_int
 
 
@@ -91,13 +117,6 @@ def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> Tuple[bool, List
     raw, _ = randrecover.recover_bitstream_from_text(
         watermarked_text, tok, device, model=m
     )
-    need = SECURITY_PARAM * WM_BIT_REDUNDANCY
-    raw = (raw + [0] * need)[:need]
-    r = WM_BIT_REDUNDANCY
-    bits = []
-    for i in range(SECURITY_PARAM):
-        chunk = raw[i * r : (i + 1) * r]
-        bits.append(1 if 2 * sum(chunk) > r else 0)
-    bits_int = [1 if b else 0 for b in bits]
-    ok = prc.detect(s, [bool(b) for b in bits])
+    bits_int = majority_deinterleave(raw, SECURITY_PARAM, WM_BIT_REDUNDANCY)
+    ok = prc.detect(s, [bool(b) for b in bits_int])
     return ok, bits_int
