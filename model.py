@@ -27,7 +27,7 @@ SAMPLING: dict[str, float | int] = {
 # ``None`` / ``"fp32"`` — full float32 (default)
 # ``"fp16"`` — float16 weights/activations (fast; good on most NVIDIA GPUs)
 # ``"bf16"`` — bfloat16 (often best on Ampere+; wider exponent range than fp16)
-DEFAULT_INFERENCE_DTYPE: str | None = None #"fp16"
+DEFAULT_INFERENCE_DTYPE: str | None = "fp16"
 INFERENCE_DTYPE: str | None = DEFAULT_INFERENCE_DTYPE
 
 _model: AutoModelForCausalLM | None = None

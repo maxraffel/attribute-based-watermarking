@@ -290,10 +290,20 @@ def diagnose_prompt(
 
     ids_suffix = out["input_ids_wm"][0].tolist()
     raw_from_ids, _ = randrecover.recover_bitstream(
-        ids_suffix, partition_dim, device, special_ids
+        ids_suffix,
+        partition_dim,
+        device,
+        special_ids,
+        tokenizer=tok,
+        tokenizer_id=model.MODEL_ID,
     )
     raw_from_text, _ = randrecover.recover_bitstream_from_text(
-        wm_text, tok, device, model=m, partition_vocab_size=partition_dim
+        wm_text,
+        tok,
+        device,
+        model=m,
+        partition_vocab_size=partition_dim,
+        tokenizer_id=model.MODEL_ID,
     )
 
     logical_from_text = _logical_bits(

@@ -160,6 +160,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Cached tokenizer unigram weights for watermark partitions
+.cache/
+
 # Spyder project settings
 .spyderproject
 .spyproject

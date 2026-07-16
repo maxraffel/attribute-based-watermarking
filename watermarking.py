@@ -81,7 +81,9 @@ def generate(sk: cprf.MasterKey, prompt: str, *, baseline_text: str | None = Non
     bits = [1 if b else 0 for b in prc.encode(prc.key_gen_from_seed(sha256(r).digest()))]
     channel_bits = interleave_repetitions(bits, WM_BIT_REDUNDANCY)
     t2 = time.perf_counter()
-    out = randrecover.generate_with_watermark(m, tok, prompt, channel_bits, device)
+    out = randrecover.generate_with_watermark(
+        m, tok, prompt, channel_bits, device, tokenizer_id=model.MODEL_ID
+    )
     seconds_watermarked_gen = time.perf_counter() - t2
 
     # --- logging ---
@@ -102,7 +104,7 @@ def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[i
     prc.set_code_length(SECURITY_PARAM)
     recovered_s = prc.key_gen_from_seed(sha256(dk.c_eval(attributes)).digest())
     raw, _ = randrecover.recover_bitstream_from_text(
-        watermarked_text, tok, device, model=m
+        watermarked_text, tok, device, model=m, tokenizer_id=model.MODEL_ID
     )
     bits_int = majority_deinterleave(raw, SECURITY_PARAM, WM_BIT_REDUNDANCY)
     ok = prc.detect(recovered_s, [bool(b) for b in bits_int])
@@ -115,7 +117,7 @@ def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> Tuple[bool, List
     prc.set_code_length(SECURITY_PARAM)
     s = prc.key_gen_from_seed(sha256(sk.eval(attributes)).digest())
     raw, _ = randrecover.recover_bitstream_from_text(
-        watermarked_text, tok, device, model=m
+        watermarked_text, tok, device, model=m, tokenizer_id=model.MODEL_ID
     )
     bits_int = majority_deinterleave(raw, SECURITY_PARAM, WM_BIT_REDUNDANCY)
     ok = prc.detect(s, [bool(b) for b in bits_int])

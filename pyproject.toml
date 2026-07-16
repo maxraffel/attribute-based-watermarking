@@ -20,6 +20,9 @@ research = [
     "matplotlib>=3.8",
     "pandas>=2.0",
 ]
+weights = [
+    "datasets>=2.14",
+]
 
 # CUDA 12.6 wheels (replaces torch==2.11.0+cu126 from PyPI default index)
 [[tool.uv.index]]
