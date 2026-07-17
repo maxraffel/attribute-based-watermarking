@@ -53,6 +53,9 @@ class BenchmarkConfig:
     model_id: str | None = None
     repeats_per_prompt: int = 1
     reuse_baseline: bool = True
+    #: ``None`` leaves ``model.TORCH_COMPILE`` unchanged (Colab shared settings).
+    torch_compile: bool | None = None
+    quiet: bool = False
 
 
 @dataclass
@@ -125,8 +128,13 @@ def _configure_watermarking(config: BenchmarkConfig) -> None:
     prc.set_code_length(config.code_length)
     wm.WM_BIT_REDUNDANCY = config.wm_bit_redundancy
     wm.BURN_IN_TOKENS = config.burn_in_tokens
+    kwargs: dict = {}
     if config.model_id:
-        model.configure(model_id=config.model_id)
+        kwargs["model_id"] = config.model_id
+    if config.torch_compile is not None:
+        kwargs["torch_compile"] = config.torch_compile
+    if kwargs:
+        model.configure(**kwargs)
 
 
 def _load_prompts(path: Path | None) -> list[str]:
@@ -263,29 +271,57 @@ def run_benchmark(
     dk_by_word = {w: wm.issue(sk, [w]) for w in VOCABULARY}
     neg_bundle = model.load()
 
-    baseline_by_prompt: dict[int, str] = {}
+    trials = [
+        (prompt_index, repeat_index, prompt)
+        for prompt_index, prompt in enumerate(prompts)
+        for repeat_index in range(cfg.repeats_per_prompt)
+    ]
+
+    if cfg.reuse_baseline:
+        # One baseline per prompt id, shared across repeats.
+        pregen = benchmark_io.pregenerate_baselines(
+            list(prompts),
+            quiet=cfg.quiet,
+            description="Baselines",
+        )
+        baseline_by_prompt = {i: pregen.texts[i] for i in range(len(prompts))}
+        trial_baselines = [
+            baseline_by_prompt[prompt_index] for prompt_index, _, _ in trials
+        ]
+    else:
+        # Independent baseline per trial (batched).
+        pregen = benchmark_io.pregenerate_baselines(
+            [prompt for _, _, prompt in trials],
+            quiet=cfg.quiet,
+            description="Baselines",
+        )
+        trial_baselines = list(pregen.texts)
+
+    # Amortize so sum of per-trial baseline times equals pregen wall time.
+    amortized = pregen.seconds / max(len(trials), 1)
+
     results: list[ProtocolRunResult] = []
-    for prompt_index, prompt in enumerate(prompts):
-        for repeat_index in range(cfg.repeats_per_prompt):
-            reuse = (
-                cfg.reuse_baseline
-                and repeat_index > 0
-                and prompt_index in baseline_by_prompt
-            )
-            baseline_text = baseline_by_prompt.get(prompt_index) if reuse else None
-            result = run_protocol_once(
-                sk,
-                dk_open,
-                dk_by_word,
-                prompt_index=prompt_index,
-                repeat_index=repeat_index,
-                prompt=prompt,
-                baseline_text=baseline_text,
-                neg_control_model_bundle=neg_bundle,
-            )
-            if prompt_index not in baseline_by_prompt:
-                baseline_by_prompt[prompt_index] = result.baseline_text
-            results.append(result)
+    for (prompt_index, repeat_index, prompt), baseline_text in zip(
+        benchmark_io.iter_with_progress(
+            trials,
+            description="Watermark benchmark",
+            disable=cfg.quiet,
+        ),
+        trial_baselines,
+    ):
+        result = run_protocol_once(
+            sk,
+            dk_open,
+            dk_by_word,
+            prompt_index=prompt_index,
+            repeat_index=repeat_index,
+            prompt=prompt,
+            baseline_text=baseline_text,
+            neg_control_model_bundle=neg_bundle,
+        )
+        # Amortize batched baseline wall time into per-run timing.
+        result.seconds_baseline_gen = amortized
+        results.append(result)
     return results
 
 
@@ -392,6 +428,10 @@ def _print_config_block(
     print(f"classifier: {text_attributes.get_scorer().model_id}")
     print(f"vocab |V|={len(VOCABULARY)}  score cutoff: {SCORE_CUTOFF:g}")
     print(f"reuse baseline: {'yes' if config.reuse_baseline else 'no'}")
+    print(
+        f"inference_dtype: {model.inference_dtype_label()}  "
+        f"torch_compile: {'yes' if model.TORCH_COMPILE else 'no'}"
+    )
 
 
 def _print_per_prompt_plain(
@@ -565,6 +605,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Re-sample baseline text on every repeat (slower, fully independent runs).",
     )
     p.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Apply torch.compile to the LM after load (first forwards are slower).",
+    )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Disable the progress bar.",
+    )
+    p.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -597,6 +647,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         model_id=args.model_id,
         repeats_per_prompt=args.repeats,
         reuse_baseline=not args.no_reuse_baseline,
+        torch_compile=True if args.torch_compile else None,
+        quiet=bool(args.quiet),
     )
 
     runs = run_benchmark(prompts, config)

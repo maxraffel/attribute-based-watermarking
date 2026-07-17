@@ -10,7 +10,7 @@ policy ``detect`` vs recovered active-label expectation, counts of which protoco
 ``derive_attributes`` (full vector); then mean wall time per pipeline stage.
 
 CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, ``--wm-bit-redundancy``,
-optional ``--llm-model``, repeatable ``--prompt-case id:prompt``.
+``--torch-compile``, optional ``--llm-model``, repeatable ``--prompt-case id:prompt``.
 
 ``run_benchmark_label_conditioned_matrix`` builds a ``|V| ├ù |V|`` matrix (columns = verify-time attributed
 labels); ``run_benchmark_prompt_conditioned_matrix`` builds ``|V| ├ù |P|`` (columns = benchmark prompt ids).
@@ -53,14 +53,20 @@ def _configure_benchmark(
     wm_bit_redundancy: int = 1,
     burn_in_tokens: int = 100,
     llm_model_id: str | None = None,
+    torch_compile: bool | None = None,
 ) -> None:
     benchmark_io.require_prc_extension()
     wm.SECURITY_PARAM = code_length
     prc.set_code_length(code_length)
     wm.WM_BIT_REDUNDANCY = wm_bit_redundancy
     wm.BURN_IN_TOKENS = burn_in_tokens
+    kwargs: dict = {}
     if llm_model_id:
-        model.configure(model_id=llm_model_id)
+        kwargs["model_id"] = llm_model_id
+    if torch_compile is not None:
+        kwargs["torch_compile"] = torch_compile
+    if kwargs:
+        model.configure(**kwargs)
 
 
 def _use_plain_table() -> bool:
@@ -393,6 +399,7 @@ def prc_random_detect_positive_rate(
     n_trials: int,
     *,
     rng: random.Random | None = None,
+    quiet: bool = False,
 ) -> tuple[float, int]:
     """
     Empirical positive rate of ``prc.detect`` on **pure randomness at both ends**: one fixed random
@@ -413,7 +420,11 @@ def prc_random_detect_positive_rate(
     _configure_benchmark(code_length=code_length)
     s = prc.key_gen_from_seed(sha256(prng.randbytes(32)).digest())
     fp = 0
-    for _ in range(n_trials):
+    for _ in benchmark_io.iter_with_progress(
+        range(n_trials),
+        description="PRC random detect",
+        disable=quiet,
+    ):
         ri = prng.getrandbits(code_length)
         bits = [c == "1" for c in bin(ri)[2:].zfill(code_length)]
         if prc.detect(s, bits):
@@ -433,6 +444,7 @@ def run_benchmark_label_conditioned_matrix(
     wm_bit_redundancy: int = 1,
     burn_in_tokens: int = 100,
     quiet: bool = False,
+    torch_compile: bool | None = None,
 ) -> tuple[int, LabelConditionedDetectionMatrix]:
     """
     Build a ``|V| x |V|`` matrix conditioned on verify-time active labels.
@@ -457,6 +469,7 @@ def run_benchmark_label_conditioned_matrix(
         wm_bit_redundancy=wm_bit_redundancy,
         burn_in_tokens=burn_in_tokens,
         llm_model_id=llm_model_id,
+        torch_compile=torch_compile,
     )
     vocab = tuple(VOCABULARY)
     numerators: dict[str, dict[str, int]] = {
@@ -481,11 +494,15 @@ def run_benchmark_label_conditioned_matrix(
             f"llm={model.MODEL_ID!r}"
         )
 
-    trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
-    for _, sid, prompt in benchmark_io.iter_with_progress(
-        trials,
-        description="Benchmark matrix",
-        disable=quiet):
+    trials, pregen = _prepare_trials_with_baselines(prompt_cases, runs, quiet=quiet)
+    amortized = pregen.amortized_seconds
+    for (_, sid, prompt), baseline in zip(
+        benchmark_io.iter_with_progress(
+            trials,
+            description="Benchmark matrix",
+            disable=quiet),
+        pregen.texts,
+    ):
         if fresh_key_per_trial:
             sk = wm.setup(modulus)
         else:
@@ -503,7 +520,12 @@ def run_benchmark_label_conditioned_matrix(
             control_ok,
             _ber,
             _tt_inner,
-            em_open_m) = run_one_trial(sk, prompt)
+            em_open_m) = run_one_trial(
+            sk,
+            prompt,
+            baseline_text=baseline,
+            baseline_gen_seconds=amortized,
+        )
         sid_runs[sid] += 1
         if master_ok:
             sid_master[sid] += 1
@@ -581,6 +603,7 @@ def run_benchmark_prompt_conditioned_matrix(
     wm_bit_redundancy: int = 1,
     burn_in_tokens: int = 100,
     quiet: bool = False,
+    torch_compile: bool | None = None,
 ) -> tuple[int, PromptConditionedDetectionMatrix]:
     """
     Build a ``|V| ├ù |P|`` matrix: rows are constrained-key labels, columns are benchmark prompt ids.
@@ -609,6 +632,7 @@ def run_benchmark_prompt_conditioned_matrix(
         wm_bit_redundancy=wm_bit_redundancy,
         burn_in_tokens=burn_in_tokens,
         llm_model_id=llm_model_id,
+        torch_compile=torch_compile,
     )
     vocab = tuple(VOCABULARY)
     col_ids = tuple(str(sid) for sid, _ in prompt_cases)
@@ -632,11 +656,15 @@ def run_benchmark_prompt_conditioned_matrix(
             f"llm={model.MODEL_ID!r}"
         )
 
-    trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
-    for _, sid, prompt in benchmark_io.iter_with_progress(
-        trials,
-        description="Benchmark prompt matrix",
-        disable=quiet):
+    trials, pregen = _prepare_trials_with_baselines(prompt_cases, runs, quiet=quiet)
+    amortized = pregen.amortized_seconds
+    for (_, sid, prompt), baseline in zip(
+        benchmark_io.iter_with_progress(
+            trials,
+            description="Benchmark prompt matrix",
+            disable=quiet),
+        pregen.texts,
+    ):
         if fresh_key_per_trial:
             sk = wm.setup(modulus)
         else:
@@ -654,7 +682,12 @@ def run_benchmark_prompt_conditioned_matrix(
             control_ok,
             _ber,
             _tt_inner,
-            em_open_m) = run_one_trial(sk, prompt)
+            em_open_m) = run_one_trial(
+            sk,
+            prompt,
+            baseline_text=baseline,
+            baseline_gen_seconds=amortized,
+        )
         sid_runs[sid] += 1
         if master_ok:
             sid_master[sid] += 1
@@ -738,9 +771,33 @@ def derive_verify_attributes(wm_text: str, modulus: int) -> list[int]:
         scores_out={})
 
 
+def _prepare_trials_with_baselines(
+    prompt_cases: Sequence[tuple[str, str]],
+    runs: int,
+    *,
+    quiet: bool,
+) -> tuple[list[tuple[int, str, str]], benchmark_io.BaselinePregenResult]:
+    """Build the trial grid and pregenerate one baseline per trial (order-matched)."""
+    trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
+    pregen = benchmark_io.pregenerate_baselines(
+        [prompt for _, _, prompt in trials],
+        quiet=quiet,
+        description="Baselines",
+    )
+    if len(pregen.texts) != len(trials):
+        raise RuntimeError(
+            f"baseline pregen length {len(pregen.texts)} != trials {len(trials)}"
+        )
+    return trials, pregen
+
+
 def run_one_trial(
     sk: Any,
-    prompt: str) -> tuple[
+    prompt: str,
+    *,
+    baseline_text: str | None = None,
+    baseline_gen_seconds: float | None = None,
+) -> tuple[
     list[dict[str, Any]],
     bool,
     bool,
@@ -755,14 +812,20 @@ def run_one_trial(
     """
     One full app.py-shaped trial. Returns word-level rows, flags, CPRF sub-counts, BER, timings,
     and whether unconstrained CPRF seeds matched.
+
+    Pass ``baseline_text`` from ``benchmark_io.pregenerate_baselines`` so trials share a
+    batched baseline phase. ``baseline_gen_seconds`` amortizes that phase into timings.
     """
     tt = TimingTotals()
 
-    out = wm.generate(sk, prompt)
+    out = wm.generate(sk, prompt, baseline_text=baseline_text)
     wm_text = out["generated_text_wm"]
     encode_attributes = list(out["attributes"])
     secret = list(out["prc_secret_bits"])
-    t_baseline = float(out["seconds_baseline_gen"])
+    if baseline_gen_seconds is not None:
+        t_baseline = float(baseline_gen_seconds)
+    else:
+        t_baseline = float(out["seconds_baseline_gen"])
     t_wm = float(out["seconds_watermarked_gen"])
     tt.t_baseline_gen = t_baseline
     tt.t_wm_gen = t_wm
@@ -1268,6 +1331,7 @@ def run_benchmark_with_summary(
     wm_bit_redundancy: int = 1,
     burn_in_tokens: int = 100,
     quiet: bool = False,
+    torch_compile: bool | None = None,
 ) -> tuple[int, BenchmarkRunSummary]:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3", "text_attributes"):
         logging.getLogger(name).setLevel(logging.WARNING)
@@ -1277,6 +1341,7 @@ def run_benchmark_with_summary(
         wm_bit_redundancy=wm_bit_redundancy,
         burn_in_tokens=burn_in_tokens,
         llm_model_id=llm_model_id,
+        torch_compile=torch_compile,
     )
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     roll_attributes_match: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
@@ -1288,14 +1353,19 @@ def run_benchmark_with_summary(
             f"code_length={wm.SECURITY_PARAM}  wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
             f"channel_bits={wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY}  burn_in={wm.BURN_IN_TOKENS}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
             f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
-            f"llm={model.MODEL_ID!r}"
+            f"llm={model.MODEL_ID!r}  dtype={model.inference_dtype_label()}  "
+            f"torch_compile={'on' if model.TORCH_COMPILE else 'off'}"
         )
 
-    trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
-    for _, sid, prompt in benchmark_io.iter_with_progress(
-        trials,
-        description="Benchmark",
-        disable=quiet):
+    trials, pregen = _prepare_trials_with_baselines(prompt_cases, runs, quiet=quiet)
+    amortized = pregen.amortized_seconds
+    for (_, sid, prompt), baseline in zip(
+        benchmark_io.iter_with_progress(
+            trials,
+            description="Benchmark",
+            disable=quiet),
+        pregen.texts,
+    ):
         t_setup0 = time.perf_counter()
         if fresh_key_per_trial:
             sk = wm.setup(modulus)
@@ -1315,7 +1385,12 @@ def run_benchmark_with_summary(
             control_ok,
             ber,
             tt_inner,
-            em_open_m) = run_one_trial(sk, prompt)
+            em_open_m) = run_one_trial(
+            sk,
+            prompt,
+            baseline_text=baseline,
+            baseline_gen_seconds=amortized,
+        )
         tt_inner.t_setup = t_setup
 
         roll[sid].add_run(
@@ -1394,6 +1469,7 @@ def run_benchmark(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
+    torch_compile: bool | None = None,
 ) -> int:
     code, _ = run_benchmark_with_summary(
         prompt_cases=prompt_cases,
@@ -1404,6 +1480,7 @@ def run_benchmark(
         console=console,
         llm_model_id=llm_model_id,
         wm_bit_redundancy=wm_bit_redundancy,
+        torch_compile=torch_compile,
         quiet=False)
     return code
 
@@ -1421,6 +1498,7 @@ def run_fpr_vs_code_length_sweep(
     prc_monte_carlo_trials: int = 100_000,
     rng: random.Random | None = None,
     quiet: bool = True,
+    torch_compile: bool | None = None,
 ) -> tuple[list[int], dict[str, list[float]], list[int]]:
     """
     Sweep logical ``code_length`` and return (lengths, metric dict, exit_codes).
@@ -1441,9 +1519,15 @@ def run_fpr_vs_code_length_sweep(
     prc_random_fpr_hi: list[float] = []
     exit_codes: list[int] = []
 
-    for length in code_lengths:
+    length_list = list(code_lengths)
+    show_outer = len(length_list) > 1 and quiet
+    for length in benchmark_io.iter_with_progress(
+        length_list,
+        description="FPR vs code_length",
+        disable=not show_outer,
+    ):
         r_rand, fp_mc = prc_random_detect_positive_rate(
-            int(length), int(prc_monte_carlo_trials), rng=prng
+            int(length), int(prc_monte_carlo_trials), rng=prng, quiet=True
         )
         prc_random_fpr.append(float(r_rand))
         pl, ph = wilson_score_interval(fp_mc, int(prc_monte_carlo_trials))
@@ -1459,7 +1543,8 @@ def run_fpr_vs_code_length_sweep(
             console=console,
             llm_model_id=llm_model_id,
             wm_bit_redundancy=int(wm_bit_redundancy),
-            quiet=quiet)
+            quiet=quiet,
+            torch_compile=torch_compile)
         lengths.append(int(length))
         exit_codes.append(int(ex))
 
@@ -1497,6 +1582,7 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
     console: Console,
     llm_model_id: str | None = None,
     quiet: bool = True,
+    torch_compile: bool | None = None,
 ) -> tuple[list[int], dict[str, list[float]], list[int]]:
     """Sweep ``wm_bit_redundancy`` at fixed logical ``code_length``."""
     redundancies: list[int] = []
@@ -1508,7 +1594,13 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
     tpr_xmatch_hi: list[float] = []
     exit_codes: list[int] = []
 
-    for redundancy in wm_bit_redundancy_values:
+    redundancy_list = list(wm_bit_redundancy_values)
+    show_outer = len(redundancy_list) > 1 and quiet
+    for redundancy in benchmark_io.iter_with_progress(
+        redundancy_list,
+        description="TPR vs wm_bit_redundancy",
+        disable=not show_outer,
+    ):
         ex, summary = run_benchmark_with_summary(
             prompt_cases=prompt_cases,
             runs=int(runs),
@@ -1518,7 +1610,8 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
             console=console,
             llm_model_id=llm_model_id,
             wm_bit_redundancy=int(redundancy),
-            quiet=quiet)
+            quiet=quiet,
+            torch_compile=torch_compile)
         redundancies.append(int(redundancy))
         exit_codes.append(int(ex))
 
@@ -1633,6 +1726,10 @@ def main() -> int:
         metavar="B",
         help="Unwatermarked warm-up tokens before the channel payload (default: 100).")
     p.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Apply torch.compile to the LM after load (first forwards are slower).")
+    p.add_argument(
         "--output",
         "-o",
         type=Path,
@@ -1666,6 +1763,7 @@ def main() -> int:
         llm_model_id=args.llm_model,
         wm_bit_redundancy=args.wm_bit_redundancy,
         burn_in_tokens=args.burn_in_tokens,
+        torch_compile=True if args.torch_compile else None,
         quiet=False,
     )
     if args.output is not None:

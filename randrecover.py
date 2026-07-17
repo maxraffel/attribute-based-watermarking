@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import os
 import random
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -127,6 +128,170 @@ def encode_prompt_for_generation(
             if "attention_mask" not in batch and "input_ids" in batch:
                 batch["attention_mask"] = torch.ones_like(batch["input_ids"], dtype=torch.long)
     return {k: v.to(dev) for k, v in batch.items()}
+
+
+def encode_prompts_for_generation(
+    tokenizer: AutoTokenizer,
+    prompts: Sequence[str],
+    device: str | torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Left-pad a batch of prompts for causal LM ``generate`` (same templates as single)."""
+    if not prompts:
+        raise ValueError("prompts must be non-empty")
+    dev = torch.device(device) if isinstance(device, str) else device
+    pad_id = _tokenizer_pad_token_id(tokenizer)
+    rows: List[torch.Tensor] = []
+    for prompt in prompts:
+        single = encode_prompt_for_generation(tokenizer, prompt, "cpu")
+        rows.append(single["input_ids"].squeeze(0).to(dtype=torch.long))
+    max_len = max(int(r.shape[0]) for r in rows)
+    input_rows: List[torch.Tensor] = []
+    attn_rows: List[torch.Tensor] = []
+    for row in rows:
+        pad = max_len - int(row.shape[0])
+        if pad > 0:
+            input_rows.append(
+                torch.cat([torch.full((pad,), pad_id, dtype=torch.long), row], dim=0)
+            )
+            attn_rows.append(
+                torch.cat(
+                    [torch.zeros(pad, dtype=torch.long), torch.ones(row.shape[0], dtype=torch.long)],
+                    dim=0,
+                )
+            )
+        else:
+            input_rows.append(row)
+            attn_rows.append(torch.ones(row.shape[0], dtype=torch.long))
+    return {
+        "input_ids": torch.stack(input_rows, dim=0).to(dev),
+        "attention_mask": torch.stack(attn_rows, dim=0).to(dev),
+    }
+
+
+def suggest_baseline_batch_size(
+    n_prompts: int,
+    *,
+    max_new_tokens: int,
+    max_input_tokens: int,
+    reserved_bytes: int = 512 * 1024 * 1024,
+) -> int:
+    """Heuristic max batch size from free VRAM (overridden by env / OOM backoff)."""
+    if n_prompts <= 0:
+        return 1
+    env = os.environ.get("BENCHMARK_BASELINE_BATCH_SIZE", "").strip()
+    if env:
+        return max(1, min(n_prompts, int(env)))
+    if not torch.cuda.is_available():
+        return 1
+    free_bytes, _total = torch.cuda.mem_get_info()
+    usable = max(int(free_bytes) - int(reserved_bytes), 0)
+    seq = max(int(max_input_tokens), 1) + max(int(max_new_tokens), 1)
+    # Conservative per-sequence budget for 1B–3B fp16 generate (KV + activations).
+    bytes_per_seq = seq * 48 * 1024
+    if bytes_per_seq <= 0:
+        return min(8, n_prompts)
+    return max(1, min(n_prompts, usable // bytes_per_seq))
+
+
+def _generate_baseline_batch(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    prompts: Sequence[str],
+    max_new_tokens: int,
+    device: str | torch.device,
+) -> List[str]:
+    inputs = encode_prompts_for_generation(tokenizer, prompts, device)
+    prompt_width = int(inputs["input_ids"].shape[1])
+    pad_id = _tokenizer_pad_token_id(tokenizer)
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            pad_token_id=pad_id,
+        )
+    texts: List[str] = []
+    for i in range(out.shape[0]):
+        gen_ids = out[i, prompt_width:]
+        texts.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
+    return texts
+
+
+def generate_baselines(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    prompts: Sequence[str],
+    max_new_tokens: int,
+    device: str = "cpu",
+    *,
+    batch_size: int | None = None,
+    on_batch_done: Any | None = None,
+) -> List[str]:
+    """Generate baseline texts for many prompts with adaptive GPU batching.
+
+    ``on_batch_done(n_completed_in_batch)`` is invoked after each successful
+    micro-batch (for progress bars). On CUDA OOM the batch size is halved and
+    the micro-batch is retried.
+    """
+    prompt_list = [str(p) for p in prompts]
+    n = len(prompt_list)
+    if n == 0:
+        return []
+    if max_new_tokens < 1:
+        raise ValueError(f"max_new_tokens must be >= 1, got {max_new_tokens}")
+
+    max_input = 1
+    for p in prompt_list:
+        enc = encode_prompt_for_generation(tokenizer, p, "cpu")
+        max_input = max(max_input, int(enc["input_ids"].shape[-1]))
+
+    if batch_size is None:
+        bs = suggest_baseline_batch_size(
+            n,
+            max_new_tokens=max_new_tokens,
+            max_input_tokens=max_input,
+        )
+    else:
+        bs = max(1, min(n, int(batch_size)))
+
+    out_texts: List[str] = [""] * n
+    i = 0
+    while i < n:
+        take = min(bs, n - i)
+        while True:
+            try:
+                chunk = _generate_baseline_batch(
+                    model,
+                    tokenizer,
+                    prompt_list[i : i + take],
+                    max_new_tokens,
+                    device,
+                )
+                break
+            except torch.cuda.OutOfMemoryError:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if take == 1:
+                    raise
+                take = max(1, take // 2)
+                bs = take
+        out_texts[i : i + take] = chunk
+        if on_batch_done is not None:
+            on_batch_done(take)
+        i += take
+    return out_texts
+
+
+def generate_baseline(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    max_new_tokens: int,
+    device: str = "cpu",
+) -> str:
+    return generate_baselines(
+        model, tokenizer, [prompt], max_new_tokens, device, batch_size=1
+    )[0]
 
 
 def _prepare_sampling_logits_processor_bundle(
@@ -306,6 +471,95 @@ def _init_prompt_free_decode_state(
     return input_ids, input_ids.clone(), model_kwargs, logits_processor
 
 
+def _prefill_prompt_free_tokens(
+    model: torch.nn.Module,
+    *,
+    input_ids: torch.Tensor,
+    model_kwargs: Dict[str, Any],
+    token_ids: Sequence[int],
+    device: str | torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any], torch.Tensor]:
+    """Teacher-force known tokens in one forward (burn-in prefill).
+
+    ``input_ids`` is the current prompt-free prefix (usually ``[[BOS]]``) with
+    no ``past_key_values`` yet. Returns updated ids / kwargs whose KV cache
+    covers ``prefix + token_ids``, plus ``logits`` at the last position
+    (``P(next | prefix + token_ids)``).
+    """
+    if not token_ids:
+        raise ValueError("token_ids must be non-empty for prefill")
+    if model_kwargs.get("past_key_values") is not None:
+        raise ValueError("prefill expects a cache-free prefix (no past_key_values)")
+
+    dev = torch.device(device) if isinstance(device, str) else device
+    extra = torch.tensor([list(token_ids)], dtype=input_ids.dtype, device=dev)
+    full_ids = torch.cat([input_ids, extra], dim=-1)
+    attn = torch.ones(
+        (1, full_ids.shape[1]),
+        dtype=(
+            model_kwargs["attention_mask"].dtype
+            if model_kwargs.get("attention_mask") is not None
+            else torch.long
+        ),
+        device=dev,
+    )
+    with torch.no_grad():
+        outputs = model(input_ids=full_ids, attention_mask=attn, use_cache=True)
+    new_kwargs: Dict[str, Any] = {
+        "use_cache": True,
+        "attention_mask": attn,
+        "past_key_values": outputs.past_key_values,
+    }
+    logits_last = outputs.logits[0, -1, :]
+    step_input_ids = full_ids[:, -1:]
+    return full_ids, step_input_ids, new_kwargs, logits_last
+
+
+def _warm_prompt_free_with_burn_in(
+    model: torch.nn.Module,
+    *,
+    input_ids: torch.Tensor,
+    step_input_ids: torch.Tensor,
+    model_kwargs: Dict[str, Any],
+    burn_in_ids: Sequence[int],
+    device: str | torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    """Advance prompt-free state through known burn-in tokens via prefill.
+
+    Matches the end state of the old token-by-token warmup: KV cache covers
+    ``BOS + burn_in[:-1]`` and ``step_input_ids`` is the last burn-in token
+    (consumed on the next watermark forward). Empty ``burn_in_ids`` is a no-op.
+    """
+    if not burn_in_ids:
+        return input_ids, step_input_ids, model_kwargs
+
+    prefix = list(burn_in_ids[:-1])
+    last = int(burn_in_ids[-1])
+    if prefix:
+        input_ids, step_input_ids, model_kwargs, _ = _prefill_prompt_free_tokens(
+            model,
+            input_ids=input_ids,
+            model_kwargs=model_kwargs,
+            token_ids=prefix,
+            device=device,
+        )
+    else:
+        with torch.no_grad():
+            outputs = model(input_ids=step_input_ids, **model_kwargs)
+            model_kwargs = dict(model_kwargs)
+            model_kwargs["past_key_values"] = outputs.past_key_values
+
+    next_tok = torch.tensor([last], dtype=input_ids.dtype, device=input_ids.device)
+    input_ids, step_input_ids = _append_generated_token(
+        input_ids=input_ids,
+        step_input_ids=step_input_ids,
+        next_token_id=next_tok,
+        model_kwargs=model_kwargs,
+        device=device,
+    )
+    return input_ids, step_input_ids, model_kwargs
+
+
 def generate_with_watermark(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
@@ -399,18 +653,14 @@ def generate_with_watermark(
         decode_horizon=max(len(burn_in_ids) + n_bits, 1),
         generation_extra=generation_extra,
     )
-    for tid in burn_in_ids:
-        with torch.no_grad():
-            outputs_part = model(input_ids=step_input_ids_part, **model_kwargs_part)
-            model_kwargs_part["past_key_values"] = outputs_part.past_key_values
-        next_tok = torch.tensor([int(tid)], dtype=torch.long, device=input_ids_part.device)
-        input_ids_part, step_input_ids_part = _append_generated_token(
-            input_ids=input_ids_part,
-            step_input_ids=step_input_ids_part,
-            next_token_id=next_tok,
-            model_kwargs=model_kwargs_part,
-            device=device,
-        )
+    input_ids_part, step_input_ids_part, model_kwargs_part = _warm_prompt_free_with_burn_in(
+        model,
+        input_ids=input_ids_part,
+        step_input_ids=step_input_ids_part,
+        model_kwargs=model_kwargs_part,
+        burn_in_ids=burn_in_ids,
+        device=device,
+    )
 
     # --- Phase 2: watermarked tokens (dual forward) ---
     for bit_idx in range(n_bits):
@@ -525,27 +775,6 @@ def generate_with_watermark(
     }
 
 
-def generate_baseline(
-    model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
-    prompt: str,
-    max_new_tokens: int,
-    device: str = "cpu",
-) -> str:
-    inputs = encode_prompt_for_generation(tokenizer, prompt, device)
-    prompt_len = int(inputs["input_ids"].shape[1])
-    pad_id = _tokenizer_pad_token_id(tokenizer)
-    with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            pad_token_id=pad_id,
-        )
-    gen_ids = out[0, prompt_len:]
-    return tokenizer.decode(gen_ids, skip_special_tokens=True)
-
-
 def recover_bitstream(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
@@ -559,7 +788,7 @@ def recover_bitstream(
     Prompt-free recovery of bits embedded by ``generate_with_watermark``.
 
     Replays ``token_ids`` from a BOS-only context (no original user prompt),
-    warms up through the first ``burn_in_tokens`` ids without extracting bits,
+    prefills the first ``burn_in_tokens`` ids in one forward (no bit extraction),
     then rebuilds balanced partitions for the remaining tokens with
     ``step_index = 0, 1, …``. Partition masks match generation's prompt-free
     partition state. Returns ``(bits, tokens, mass_gaps)``.
@@ -570,6 +799,9 @@ def recover_bitstream(
     ids = [int(t) for t in token_ids]
     n = len(ids)
     burn = min(int(burn_in_tokens), n)
+    if burn >= n:
+        return [], [], []
+
     (
         input_ids,
         step_input_ids,
@@ -587,26 +819,39 @@ def recover_bitstream(
     recovered_tokens: List[int] = []
     mass_gaps: List[float] = []
 
-    for t, token_id in enumerate(ids):
+    pending_logits: torch.Tensor | None = None
+    if burn > 0:
+        input_ids, step_input_ids, model_kwargs, pending_logits = _prefill_prompt_free_tokens(
+            model,
+            input_ids=input_ids,
+            model_kwargs=model_kwargs,
+            token_ids=ids[:burn],
+            device=device,
+        )
+
+    for t in range(burn, n):
         with torch.no_grad():
-            outputs = model(input_ids=step_input_ids, **model_kwargs)
-            logits = outputs.logits[0, -1, :]
-            model_kwargs["past_key_values"] = outputs.past_key_values
+            if pending_logits is not None:
+                logits = pending_logits
+                pending_logits = None
+            else:
+                outputs = model(input_ids=step_input_ids, **model_kwargs)
+                logits = outputs.logits[0, -1, :]
+                model_kwargs["past_key_values"] = outputs.past_key_values
             base_probs = _scores_to_next_token_probs(
                 logits, input_ids, logits_processor
             )
 
-            tid = int(token_id)
-            if t >= burn:
-                bit_idx = t - burn
-                mask_A = get_balanced_partition_from_probs(base_probs, bit_idx)
-                mass_a, mass_b = balanced_partition_masses(base_probs, mask_A)
-                mass_gaps.append(abs(mass_a - mass_b))
-                if tid < 0 or tid >= int(mask_A.numel()):
-                    recovered_bits.append(1)
-                else:
-                    recovered_bits.append(0 if bool(mask_A[tid].item()) else 1)
-                recovered_tokens.append(tid)
+            tid = int(ids[t])
+            bit_idx = t - burn
+            mask_A = get_balanced_partition_from_probs(base_probs, bit_idx)
+            mass_a, mass_b = balanced_partition_masses(base_probs, mask_A)
+            mass_gaps.append(abs(mass_a - mass_b))
+            if tid < 0 or tid >= int(mask_A.numel()):
+                recovered_bits.append(1)
+            else:
+                recovered_bits.append(0 if bool(mask_A[tid].item()) else 1)
+            recovered_tokens.append(tid)
 
         next_tok = torch.tensor([tid], dtype=input_ids.dtype, device=input_ids.device)
         input_ids, step_input_ids = _append_generated_token(
@@ -785,8 +1030,11 @@ __all__ = [
     "get_balanced_partition_from_probs",
     "balanced_partition_masses",
     "encode_prompt_for_generation",
+    "encode_prompts_for_generation",
+    "suggest_baseline_batch_size",
     "generate_with_watermark",
     "generate_baseline",
+    "generate_baselines",
     "recover_bitstream",
     "recover_bitstream_from_text",
     "recover_bitstream_from_generation",

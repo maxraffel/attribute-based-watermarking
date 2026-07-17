@@ -18,6 +18,7 @@ import model
 import randrecover
 import prc
 import watermarking as wm
+import benchmark_io
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -158,6 +159,8 @@ def _label_scores_table(
 def main() -> int:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3", "text_attributes"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    benchmark_io.require_prc_extension()
 
     c = Console(highlight=False)
     all_ok = True

@@ -50,6 +50,9 @@ class BerDiagConfig:
     wm_bit_redundancy: int = 3
     burn_in_tokens: int = 100
     model_id: str | None = None
+    #: ``None`` leaves ``model.TORCH_COMPILE`` unchanged (Colab shared settings).
+    torch_compile: bool | None = None
+    quiet: bool = False
 
 
 @dataclass
@@ -195,8 +198,13 @@ def _configure(cfg: BerDiagConfig) -> None:
     prc.set_code_length(cfg.code_length)
     wm.WM_BIT_REDUNDANCY = cfg.wm_bit_redundancy
     wm.BURN_IN_TOKENS = cfg.burn_in_tokens
+    kwargs: dict = {}
     if cfg.model_id:
-        model.configure(model_id=cfg.model_id)
+        kwargs["model_id"] = cfg.model_id
+    if cfg.torch_compile is not None:
+        kwargs["torch_compile"] = cfg.torch_compile
+    if kwargs:
+        model.configure(**kwargs)
 
 
 def _load_prompts(path: Path | None) -> list[str]:
@@ -275,9 +283,11 @@ def diagnose_prompt(
     prompt: str,
     index: int,
     cfg: BerDiagConfig,
+    *,
+    baseline_text: str | None = None,
 ) -> BerPromptDiagnostic:
     m, tok, device = model.load()
-    out = wm.generate(sk, prompt)
+    out = wm.generate(sk, prompt, baseline_text=baseline_text)
 
     encode_attributes = list(out["attributes"])
     wm_text = out["generated_text_wm"]
@@ -446,7 +456,24 @@ def run_ber_diagnostics(
     cfg = config or BerDiagConfig()
     _configure(cfg)
     sk = wm.setup(cfg.modulus)
-    results = [diagnose_prompt(sk, p, i, cfg) for i, p in enumerate(prompts)]
+    prompt_list = list(prompts)
+    pregen = benchmark_io.pregenerate_baselines(
+        prompt_list,
+        quiet=cfg.quiet,
+        description="Baselines",
+    )
+    results: list[BerPromptDiagnostic] = []
+    for (i, prompt), baseline in zip(
+        benchmark_io.iter_with_progress(
+            list(enumerate(prompt_list)),
+            description="BER diagnostics",
+            disable=cfg.quiet,
+        ),
+        pregen.texts,
+    ):
+        results.append(
+            diagnose_prompt(sk, prompt, i, cfg, baseline_text=baseline)
+        )
     return BerDiagnosticsSummary(config=cfg, results=results)
 
 
@@ -479,6 +506,10 @@ def print_ber_diagnostics(
     )
     print(f"LLM: {model.MODEL_ID}")
     print(f"classifier: {text_attributes.get_scorer().model_id}")
+    print(
+        f"inference_dtype: {model.inference_dtype_label()}  "
+        f"torch_compile: {'yes' if model.TORCH_COMPILE else 'no'}"
+    )
 
     print()
     print("-- Stage BER (averages) --")
@@ -639,6 +670,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--model-id", default=None)
     p.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Apply torch.compile to the LM after load (first forwards are slower).",
+    )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Disable the progress bar.",
+    )
+    p.add_argument(
         "--verbose",
         action="store_true",
         help="Print channel and logical bit error indices per prompt.",
@@ -664,6 +705,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         wm_bit_redundancy=args.wm_bit_redundancy,
         burn_in_tokens=args.burn_in_tokens,
         model_id=args.model_id,
+        torch_compile=True if args.torch_compile else None,
+        quiet=bool(args.quiet),
     )
     summary = run_ber_diagnostics(_load_prompts(args.prompts), cfg)
     print_ber_diagnostics(summary, verbose=args.verbose)

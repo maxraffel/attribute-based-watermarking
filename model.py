@@ -30,8 +30,14 @@ SAMPLING: dict[str, float | int] = {
 DEFAULT_INFERENCE_DTYPE: str | None = "fp16"
 INFERENCE_DTYPE: str | None = DEFAULT_INFERENCE_DTYPE
 
+# Optional ``torch.compile`` on the causal LM after load (first forward is slow).
+# Off by default — can change float noise slightly; validate rates if enabled for papers.
+DEFAULT_TORCH_COMPILE = False
+TORCH_COMPILE = DEFAULT_TORCH_COMPILE
+
 _model: AutoModelForCausalLM | None = None
 _tokenizer: AutoTokenizer | None = None
+_torch_compile_applied = False
 
 
 def require_cuda_device() -> str:
@@ -97,9 +103,10 @@ def configure(
     top_p: float | None = None,
     top_k: int | None = None,
     inference_dtype: str | None | object = _UNSET,
+    torch_compile: bool | None = None,
 ) -> None:
-    """Set hub id, sampling, and/or inference dtype; unloads weights when those change."""
-    global MODEL_ID, INFERENCE_DTYPE, _model, _tokenizer
+    """Set hub id, sampling, dtype, and/or ``torch.compile``; unloads weights when those change."""
+    global MODEL_ID, INFERENCE_DTYPE, TORCH_COMPILE, _model, _tokenizer, _torch_compile_applied
     if temperature is not None:
         SAMPLING["temperature"] = temperature
     if top_p is not None:
@@ -116,18 +123,29 @@ def configure(
             INFERENCE_DTYPE = new_dtype
             _model = None
             _tokenizer = None
+            _torch_compile_applied = False
+    if torch_compile is not None:
+        want = bool(torch_compile)
+        if want != TORCH_COMPILE:
+            TORCH_COMPILE = want
+            # Compiled graphs are bound to the loaded module; reload to toggle.
+            _model = None
+            _tokenizer = None
+            _torch_compile_applied = False
     if model_id is not None:
         mid = model_id.strip()
         if mid and mid != MODEL_ID:
             MODEL_ID = mid
             _model = None
             _tokenizer = None
+            _torch_compile_applied = False
 
 
 def unload() -> None:
-    global _model, _tokenizer
+    global _model, _tokenizer, _torch_compile_applied
     _model = None
     _tokenizer = None
+    _torch_compile_applied = False
 
 
 def _load_dotenv() -> None:
@@ -172,7 +190,7 @@ def _ensure_hf_auth(model_id: str) -> None:
 
 
 def load() -> tuple[AutoModelForCausalLM, AutoTokenizer, str]:
-    global _model, _tokenizer
+    global _model, _tokenizer, _torch_compile_applied
     device = require_cuda_device()
     if _model is None:
         _ensure_hf_auth(MODEL_ID)
@@ -199,5 +217,14 @@ def load() -> tuple[AutoModelForCausalLM, AutoTokenizer, str]:
         _model.eval()
         if not _model.config.is_encoder_decoder:
             _tokenizer.padding_side = "left"
+        _torch_compile_applied = False
+    if TORCH_COMPILE and not _torch_compile_applied:
+        print(
+            "Applying torch.compile to LM (first forwards may be slow)...",
+            flush=True,
+        )
+        _model = torch.compile(_model)  # type: ignore[assignment]
+        _torch_compile_applied = True
+        print("torch.compile ready.", flush=True)
     _apply_sampling_to_generation_config()
     return _model, _tokenizer, device

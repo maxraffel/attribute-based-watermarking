@@ -13,7 +13,8 @@ import os
 import shutil
 import statistics
 import sys
-from dataclasses import asdict, is_dataclass
+import time
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence, TypeVar
@@ -30,7 +31,9 @@ from rich.progress import (
 )
 
 import model
+import randrecover
 import text_attributes
+import watermarking as wm
 
 SCHEMA_VERSION = 2
 
@@ -260,6 +263,108 @@ def iter_with_progress(
             progress.advance(task_id)
 
 
+def baseline_max_new_tokens() -> int:
+    """Token budget for baselines: burn-in + channel (matches ``watermarking.generate``)."""
+    return int(wm.BURN_IN_TOKENS) + int(wm.SECURITY_PARAM) * int(wm.WM_BIT_REDUNDANCY)
+
+
+@dataclass(frozen=True)
+class BaselinePregenResult:
+    """Aligned baseline texts for a list of prompts (1:1 with the input sequence)."""
+
+    texts: tuple[str, ...]
+    seconds: float
+    batch_size: int
+    max_new_tokens: int
+
+    @property
+    def amortized_seconds(self) -> float:
+        n = len(self.texts)
+        return (self.seconds / n) if n else 0.0
+
+
+def pregenerate_baselines(
+    prompts: Sequence[str],
+    *,
+    max_new_tokens: int | None = None,
+    batch_size: int | None = None,
+    quiet: bool = False,
+    description: str = "Baselines",
+) -> BaselinePregenResult:
+    """
+    Prefetch baseline texts for every prompt in ``prompts`` (order-preserving).
+
+    Uses batched HF ``generate`` with VRAM-adaptive micro-batches (OOM backoff).
+    Progress advances by the number of baselines completed per micro-batch.
+    """
+    prompt_list = [str(p) for p in prompts]
+    n = len(prompt_list)
+    n_tokens = int(baseline_max_new_tokens() if max_new_tokens is None else max_new_tokens)
+    if n == 0:
+        return BaselinePregenResult(texts=(), seconds=0.0, batch_size=1, max_new_tokens=n_tokens)
+
+    m, tok, device = model.load()
+    t0 = time.perf_counter()
+
+    max_input = 1
+    sample_n = min(8, n)
+    for p in prompt_list[:sample_n]:
+        enc = randrecover.encode_prompt_for_generation(tok, p, "cpu")
+        max_input = max(max_input, int(enc["input_ids"].shape[-1]))
+    if batch_size is None:
+        eff_bs = randrecover.suggest_baseline_batch_size(
+            n, max_new_tokens=n_tokens, max_input_tokens=max_input
+        )
+    else:
+        eff_bs = max(1, min(n, int(batch_size)))
+
+    if quiet:
+        texts = randrecover.generate_baselines(
+            m, tok, prompt_list, n_tokens, device, batch_size=eff_bs
+        )
+    else:
+        progress_console = make_progress_console()
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=32),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(compact=True, elapsed_when_finished=False),
+            console=progress_console,
+            transient=True,
+            refresh_per_second=10,
+            expand=False,
+        ) as progress:
+            task_id = progress.add_task(description, total=n)
+
+            def _on_batch(k: int) -> None:
+                progress.advance(task_id, int(k))
+
+            texts = randrecover.generate_baselines(
+                m,
+                tok,
+                prompt_list,
+                n_tokens,
+                device,
+                batch_size=eff_bs,
+                on_batch_done=_on_batch,
+            )
+
+    elapsed = time.perf_counter() - t0
+    if not quiet:
+        print(
+            f"pregenerated {n} baselines in {elapsed:.2f}s "
+            f"(max_new_tokens={n_tokens}, batch_size≈{eff_bs})"
+        )
+    return BaselinePregenResult(
+        texts=tuple(texts),
+        seconds=float(elapsed),
+        batch_size=int(eff_bs),
+        max_new_tokens=n_tokens,
+    )
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -271,6 +376,8 @@ def runtime_metadata(*, llm_model_id: str | None = None) -> dict[str, Any]:
         "score_cutoff": text_attributes.SCORE_CUTOFF,
         "vocab": list(text_attributes.VOCABULARY),
         "sampling": dict(model.SAMPLING),
+        "inference_dtype": model.inference_dtype_label(),
+        "torch_compile": bool(model.TORCH_COMPILE),
     }
 
 
