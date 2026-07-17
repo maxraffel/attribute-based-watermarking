@@ -13,9 +13,12 @@ import sys
 from pathlib import Path
 from typing import Iterable, Sequence
 
+# Pure-Python modules only. Do NOT include ``prc`` / ``cprf``: they wrap a
+# PyO3 extension and a ctypes ``.so``. Dropping them from ``sys.modules`` and
+# re-importing breaks maturin's ``from .prc import *; __doc__ = prc.__doc__``
+# package init (NameError on the second load). Native rebuilds need a kernel
+# restart to pick up a new binary.
 _CORE_RELOAD_ORDER: tuple[str, ...] = (
-    "prc",
-    "cprf",
     "text_attributes",
     "randrecover",
     "watermarking",
@@ -30,6 +33,8 @@ _BENCHMARK_RELOAD_ORDER: tuple[str, ...] = (
     "benchmark_watermark",
     "benchmark_ber_diagnostics",
 )
+
+_NATIVE_MODULE_PREFIXES: tuple[str, ...] = ("prc", "cprf")
 
 # Back-compat alias for callers that referenced the full list.
 _RELOAD_ORDER: tuple[str, ...] = _CORE_RELOAD_ORDER + _BENCHMARK_RELOAD_ORDER
@@ -158,6 +163,10 @@ def unload_model() -> None:
         pass
 
 
+def _is_native_module(name: str) -> bool:
+    return any(name == p or name.startswith(p + ".") for p in _NATIVE_MODULE_PREFIXES)
+
+
 def reload_scheme(
     project_root: Path | str,
     *,
@@ -165,11 +174,12 @@ def reload_scheme(
     include_benchmarks: bool = True,
     extra_modules: Sequence[str] = (),
 ) -> list[str]:
-    """Evict cached scheme modules and import them fresh from ``project_root``.
+    """Evict cached pure-Python scheme modules and import them fresh.
 
-    Call this after ``git pull`` (and any native rebuild) so notebook cells pick up
-    changed ``.py`` files without a runtime restart. CPRF/PRC must be rebuilt
-    separately when their native sources change (see ``ensure_cprf`` / ``ensure_prc``).
+    Call this after ``git pull`` so notebook cells pick up changed ``.py`` files
+    without a runtime restart. Leaves ``prc`` / ``cprf`` (and submodules) alone —
+    those cannot be safely re-imported mid-session. If you rebuilt native code,
+    restart the kernel once so the new ``.so`` / wheel loads.
     """
     root = Path(project_root).resolve()
     root_str = str(root)
@@ -183,13 +193,18 @@ def reload_scheme(
     order = list(_CORE_RELOAD_ORDER)
     if include_benchmarks:
         order.extend(_BENCHMARK_RELOAD_ORDER)
-    order.extend(m for m in extra_modules if m not in order)
+    order.extend(m for m in extra_modules if m not in order and not _is_native_module(m))
+
     for name in order:
+        if _is_native_module(name):
+            continue
         sys.modules.pop(name, None)
 
     reloaded: list[str] = []
     skipped: list[str] = []
     for name in order:
+        if _is_native_module(name):
+            continue
         try:
             importlib.import_module(name)
             reloaded.append(name)
@@ -213,6 +228,11 @@ def sync_after_pull(
     rebuilt_cprf = ensure_cprf(root, go_exe=go_exe, force=force_native)
     rebuilt_prc = ensure_prc(root, python=python, force=force_native)
     reloaded = reload_scheme(root)
+    if rebuilt_cprf or rebuilt_prc:
+        print(
+            "Native CPRF/PRC was rebuilt. Restart the runtime once so the new "
+            "binary is loaded; pure-Python reloads alone cannot replace it."
+        )
     return {
         "head": head,
         "rebuilt_cprf": rebuilt_cprf,
