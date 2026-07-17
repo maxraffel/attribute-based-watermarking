@@ -140,6 +140,7 @@ For private repos, provide a `GITHUB_TOKEN` secret in Colab so the notebook can 
 
 ## Tuning Notes
 
+- Watermark channel: always **balanced** softmax vocab partitions and **depth** interleaving of PRC bit replicas (`WM_BIT_REDUNDANCY` full codeword passes).
 - Change subject behavior by editing:
   - `LABEL_QUERY_TEMPLATE` in `text_attributes.py`
   - `VOCABULARY` in `text_attributes.py`

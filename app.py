@@ -35,11 +35,7 @@ from text_attributes import (
 # --- customize here ---
 MODULUS = 1024
 CODE_LENGTH = 100
-WM_BIT_REDUNDANCY = 3  # token-channel repeats per PRC bit; recovery = strict majority (tie → 0)
-# ``static`` = original seeded partitions; ``balanced`` = per-step softmax-balanced masks
-PARTITION_MODE = "balanced"
-# ``depth`` = R interleaved codeword passes; ``block`` = each bit repeated R times contiguously
-REDUNDANCY_LAYOUT = "depth"
+WM_BIT_REDUNDANCY = 3  # depth-interleaved channel repeats per PRC bit; recovery = strict majority (tie → 0)
 MODEL_ID: str | None = None  # None → ``model.DEFAULT_MODEL_ID``
 PROMPT = (
     # '''Explain the economic nuance and impact of Drake Maye during his college football career at North Carolina.'''
@@ -172,9 +168,8 @@ def main() -> int:
         Panel.fit(
             f"[bold]modulus[/] {MODULUS}  ·  [bold]code_length[/] {CODE_LENGTH}  ·  "
             f"[bold]wm_bit_redundancy[/] {WM_BIT_REDUNDANCY}  "
-            f"(channel {CODE_LENGTH * WM_BIT_REDUNDANCY} bits)\n"
-            f"[bold]partition_mode[/] {PARTITION_MODE}  ·  "
-            f"[bold]redundancy_layout[/] {REDUNDANCY_LAYOUT}\n"
+            f"(channel {CODE_LENGTH * WM_BIT_REDUNDANCY} bits, depth-interleaved)\n"
+            f"[bold]partition[/] balanced softmax  ·  "
             f"[bold]LLM[/] {model.MODEL_ID}\n"
             f"[bold]sampling[/] temperature={model.SAMPLING['temperature']}  "
             f"top_p={model.SAMPLING['top_p']}  top_k={model.SAMPLING['top_k']}\n"
@@ -187,8 +182,6 @@ def main() -> int:
     wm.SECURITY_PARAM = CODE_LENGTH
     prc.set_code_length(CODE_LENGTH)
     wm.WM_BIT_REDUNDANCY = WM_BIT_REDUNDANCY
-    wm.set_partition_mode(PARTITION_MODE)
-    wm.set_redundancy_layout(REDUNDANCY_LAYOUT)
 
     c.rule("1) Setup & generate", style="cyan")
     sk = wm.setup(MODULUS)

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Policy-detection benchmark: same end-to-end flow as ``app.py`` (generate ΓåÆ verify ``derive_attributes`` ΓåÆ
 issue unconstrained + one constrained key per closed-vocabulary label ΓåÆ CPRF seed checks ΓåÆ
 ``master_detect`` / ``detect`` on good transcript ΓåÆ negative-control ``master_detect`` on decoy).
@@ -52,16 +52,12 @@ def _configure_benchmark(
     *,
     code_length: int,
     wm_bit_redundancy: int = 1,
-    partition_mode: str = "static",
-    redundancy_layout: str = "depth",
     llm_model_id: str | None = None,
 ) -> None:
     benchmark_io.require_prc_extension()
     wm.SECURITY_PARAM = code_length
     prc.set_code_length(code_length)
     wm.WM_BIT_REDUNDANCY = wm_bit_redundancy
-    wm.set_partition_mode(partition_mode)
-    wm.set_redundancy_layout(redundancy_layout)
     if llm_model_id:
         model.configure(model_id=llm_model_id)
 
@@ -73,36 +69,28 @@ def _use_plain_table() -> bool:
 DEFAULT_PROMPT_CASES: list[tuple[str, str]] = [
     (
         "medicine_stem_cell",
-        "Explain how stem cell therapy is being used in regenerative medicine.",
-    ),
+        "Explain how stem cell therapy is being used in regenerative medicine."),
     (
         "economics_min_wage",
-        "Explain the economic effects of raising the minimum wage on employment and businesses.",
-    ),
+        "Explain the economic effects of raising the minimum wage on employment and businesses."),
     (
         "art_surrealism",
-        "Explain how Surrealist artists used dream imagery to challenge reality and logic.",
-    ),
+        "Explain how Surrealist artists used dream imagery to challenge reality and logic."),
     (
         "software_breakthroughs",
-        "Break down the most influential software breakthroughs in history.",
-    ),
+        "Break down the most influential software breakthroughs in history."),
     (
         "sports_strategy_performance",
-        "Explain the role of strategy and teamwork in achieving success in sports.",
-    ),
+        "Explain the role of strategy and teamwork in achieving success in sports."),
     (
         "software_art_world",
-        "Explain how software has transformed the art world.",
-    ),
+        "Explain how software has transformed the art world."),
     (
         "sports_drake_maye",
-        "Explain the economic nuance and impact of Drake Maye during his college football career at North Carolina.",
-    ),
+        "Explain the economic nuance and impact of Drake Maye during his college football career at North Carolina."),
     (
         "medicine_software_practice",
-        "Explain how software has transformed the practice of medicine.",
-    ),
+        "Explain how software has transformed the practice of medicine."),
 ]
 
 # Alias kept for notebook cells that import this name explicitly.
@@ -205,8 +193,7 @@ class PromptRollup:
         cprf_per_label_n: int,
         control_ok: bool,
         ber: float,
-        timings: TimingTotals,
-    ) -> None:
+        timings: TimingTotals) -> None:
         self.runs += 1
         if attributes_match:
             self.attributes_match += 1
@@ -335,8 +322,7 @@ class PromptConditionedDetectionMatrix:
 
 def sum_confusion_counts(
     roll: dict[str, PromptRollup],
-    prompt_cases: Sequence[tuple[str, str]],
-) -> tuple[int, int, int, int]:
+    prompt_cases: Sequence[tuple[str, str]]) -> tuple[int, int, int, int]:
     """Sum TP/FN/TN/FP over every prompt id (micro pool over runs ├ù labels)."""
     tp = fn = tn = fp = 0
     for sid, _ in prompt_cases:
@@ -350,8 +336,7 @@ def sum_confusion_counts(
 
 def micro_fpr(
     roll: dict[str, PromptRollup],
-    prompt_cases: Sequence[tuple[str, str]],
-) -> float:
+    prompt_cases: Sequence[tuple[str, str]]) -> float:
     """Micro-averaged false positive rate for policy ``detect`` vs active-label gold."""
     tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
     return _rates(tp, fn, tn, fp)[3]
@@ -359,8 +344,7 @@ def micro_fpr(
 
 def micro_tpr(
     roll: dict[str, PromptRollup],
-    prompt_cases: Sequence[tuple[str, str]],
-) -> float:
+    prompt_cases: Sequence[tuple[str, str]]) -> float:
     """Micro-averaged true positive rate for policy ``detect`` vs active-label gold."""
     tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
     return _rates(tp, fn, tn, fp)[0]
@@ -370,8 +354,7 @@ def wilson_score_interval(
     k: int,
     n: int,
     *,
-    z: float = 1.96,
-) -> tuple[float, float]:
+    z: float = 1.96) -> tuple[float, float]:
     """Wilson score interval for binomial proportion ``k/n`` (default ``z`` = 1.96 Γëê two-sided 95%)."""
     if n < 0 or k < 0 or k > n:
         raise ValueError(f"invalid wilson_score_interval args: k={k}, n={n}")
@@ -389,8 +372,7 @@ def micro_fpr_wilson(
     roll: dict[str, PromptRollup],
     prompt_cases: Sequence[tuple[str, str]],
     *,
-    z: float = 1.96,
-) -> tuple[float, float, float]:
+    z: float = 1.96) -> tuple[float, float, float]:
     """Wilson-interval bounds on micro-FPR pooled over prompts (``FP / (TN+FP)``)."""
     tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
     n = tn + fp
@@ -404,8 +386,7 @@ def micro_tpr_wilson(
     roll: dict[str, PromptRollup],
     prompt_cases: Sequence[tuple[str, str]],
     *,
-    z: float = 1.96,
-) -> tuple[float, float, float]:
+    z: float = 1.96) -> tuple[float, float, float]:
     """Wilson-interval bounds on micro-TPR pooled over prompts (``TP / (TP+FN)``)."""
     tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
     n = tp + fn
@@ -458,8 +439,6 @@ def run_benchmark_label_conditioned_matrix(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
-    partition_mode: str = "static",
-    redundancy_layout: str = "depth",
     quiet: bool = False,
 ) -> tuple[int, LabelConditionedDetectionMatrix]:
     """
@@ -483,10 +462,7 @@ def run_benchmark_label_conditioned_matrix(
     _configure_benchmark(
         code_length=code_length,
         wm_bit_redundancy=wm_bit_redundancy,
-        partition_mode=partition_mode,
-        redundancy_layout=redundancy_layout,
-        llm_model_id=llm_model_id,
-    )
+        llm_model_id=llm_model_id)
     vocab = tuple(VOCABULARY)
     numerators: dict[str, dict[str, int]] = {
         r: {c: 0 for c in vocab} for r in vocab
@@ -504,8 +480,7 @@ def run_benchmark_label_conditioned_matrix(
     if not quiet:
         console.print(
             f"matrix benchmark  code_length={wm.SECURITY_PARAM}  "
-            f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  partition_mode={wm.PARTITION_MODE}  "
-            f"redundancy_layout={wm.REDUNDANCY_LAYOUT}  "
+            f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
             f"modulus={modulus}  runs={runs}  |V|={len(vocab)}  "
             f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
             f"llm={model.MODEL_ID!r}"
@@ -515,8 +490,7 @@ def run_benchmark_label_conditioned_matrix(
     for _, sid, prompt in benchmark_io.iter_with_progress(
         trials,
         description="Benchmark matrix",
-        disable=quiet,
-    ):
+        disable=quiet):
         if fresh_key_per_trial:
             sk = wm.setup(modulus)
         else:
@@ -534,8 +508,7 @@ def run_benchmark_label_conditioned_matrix(
             control_ok,
             _ber,
             _tt_inner,
-            em_open_m,
-        ) = run_one_trial(sk, prompt)
+            em_open_m) = run_one_trial(sk, prompt)
         sid_runs[sid] += 1
         if master_ok:
             sid_master[sid] += 1
@@ -597,8 +570,7 @@ def run_benchmark_label_conditioned_matrix(
         code_length=code_length,
         wm_bit_redundancy=wm.WM_BIT_REDUNDANCY,
         modulus=modulus,
-        strict_protocol_ok=all_ok,
-    )
+        strict_protocol_ok=all_ok)
     return (0 if all_ok else 1, matrix)
 
 
@@ -612,8 +584,6 @@ def run_benchmark_prompt_conditioned_matrix(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
-    partition_mode: str = "static",
-    redundancy_layout: str = "depth",
     quiet: bool = False,
 ) -> tuple[int, PromptConditionedDetectionMatrix]:
     """
@@ -641,10 +611,7 @@ def run_benchmark_prompt_conditioned_matrix(
     _configure_benchmark(
         code_length=code_length,
         wm_bit_redundancy=wm_bit_redundancy,
-        partition_mode=partition_mode,
-        redundancy_layout=redundancy_layout,
-        llm_model_id=llm_model_id,
-    )
+        llm_model_id=llm_model_id)
     vocab = tuple(VOCABULARY)
     col_ids = tuple(str(sid) for sid, _ in prompt_cases)
     numerators: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
@@ -661,8 +628,7 @@ def run_benchmark_prompt_conditioned_matrix(
     if not quiet:
         console.print(
             f"prompt-matrix benchmark  code_length={wm.SECURITY_PARAM}  "
-            f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  partition_mode={wm.PARTITION_MODE}  "
-            f"redundancy_layout={wm.REDUNDANCY_LAYOUT}  "
+            f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
             f"modulus={modulus}  runs={runs}  |V|={len(vocab)}  "
             f"|P|={len(col_ids)}  keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
             f"llm={model.MODEL_ID!r}"
@@ -672,8 +638,7 @@ def run_benchmark_prompt_conditioned_matrix(
     for _, sid, prompt in benchmark_io.iter_with_progress(
         trials,
         description="Benchmark prompt matrix",
-        disable=quiet,
-    ):
+        disable=quiet):
         if fresh_key_per_trial:
             sk = wm.setup(modulus)
         else:
@@ -691,8 +656,7 @@ def run_benchmark_prompt_conditioned_matrix(
             control_ok,
             _ber,
             _tt_inner,
-            em_open_m,
-        ) = run_one_trial(sk, prompt)
+            em_open_m) = run_one_trial(sk, prompt)
         sid_runs[sid] += 1
         if master_ok:
             sid_master[sid] += 1
@@ -764,8 +728,7 @@ def run_benchmark_prompt_conditioned_matrix(
         code_length=code_length,
         wm_bit_redundancy=wm.WM_BIT_REDUNDANCY,
         modulus=modulus,
-        strict_protocol_ok=all_ok,
-    )
+        strict_protocol_ok=all_ok)
     return (0 if all_ok else 1, matrix)
 
 
@@ -774,14 +737,12 @@ def derive_verify_attributes(wm_text: str, modulus: int) -> list[int]:
         wm_text,
         modulus,
         log_scores=False,
-        scores_out={},
-    )
+        scores_out={})
 
 
 def run_one_trial(
     sk: Any,
-    prompt: str,
-) -> tuple[
+    prompt: str) -> tuple[
     list[dict[str, Any]],
     bool,
     bool,
@@ -871,8 +832,7 @@ def run_one_trial(
         tok,
         device,
         n_bits=wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY,
-        model=m,
-    )
+        model=m)
     recovered_neg = wm.recover_channel_bits(wrong)
     ctrl_ok_raw, _ = wm.master_detect(sk, wrong, recovered_bits=recovered_neg)
     control_ok = not bool(ctrl_ok_raw)
@@ -888,8 +848,7 @@ def run_one_trial(
         control_ok,
         ber,
         tt,
-        em_open_m,
-    )
+        em_open_m)
 
 
 def _mean_timings(r: PromptRollup) -> dict[str, float]:
@@ -907,15 +866,13 @@ def _mean_timings(r: PromptRollup) -> dict[str, float]:
         "t_master_good",
         "t_detect_open",
         "t_detect_per_label",
-        "t_negative_control",
-    )
+        "t_negative_control")
     return {k: getattr(t, k) / n for k in keys}
 
 
 def _aggregate_timing_means(
     roll: dict[str, PromptRollup],
-    prompt_cases: Sequence[tuple[str, str]],
-) -> dict[str, float]:
+    prompt_cases: Sequence[tuple[str, str]]) -> dict[str, float]:
     """Grand mean over all runs (all prompts): sum component / total runs."""
     total_runs = 0
     acc = {k: 0.0 for k in (
@@ -928,8 +885,7 @@ def _aggregate_timing_means(
         "t_master_good",
         "t_detect_open",
         "t_detect_per_label",
-        "t_negative_control",
-    )}
+        "t_negative_control")}
     for sid, _ in prompt_cases:
         r = roll[sid]
         n = r.runs
@@ -955,8 +911,7 @@ def _sid_cell(sid: str, width: int = 22) -> str:
 
 def _print_timing_table_plain(
     roll: dict[str, PromptRollup],
-    prompt_cases: Sequence[tuple[str, str]],
-) -> None:
+    prompt_cases: Sequence[tuple[str, str]]) -> None:
     def _rows(keys: Sequence[str]) -> list[list[str]]:
         out: list[list[str]] = []
         for sid, _ in prompt_cases:
@@ -975,9 +930,7 @@ def _print_timing_table_plain(
         widths=[22, 8, 10, 10, 11],
         aligns=["<", ">", ">", ">", ">"],
         rows=_rows(
-            ("t_setup", "t_baseline_gen", "t_wm_gen", "t_derive_attributes"),
-        ),
-    )
+            ("t_setup", "t_baseline_gen", "t_wm_gen", "t_derive_attributes")))
     benchmark_io.print_plain_table(
         title="Mean wall time — keys & detection (seconds per run)",
         headers=["prompt_id", "issue", "cprf", "master", "open", "labels", "decoy"],
@@ -990,10 +943,7 @@ def _print_timing_table_plain(
                 "t_master_good",
                 "t_detect_open",
                 "t_detect_per_label",
-                "t_negative_control",
-            ),
-        ),
-    )
+                "t_negative_control")))
     gm = _aggregate_timing_means(roll, prompt_cases)
     print(f"Sum of all listed stage means (per run): {gm['t_grand_avg']:.4f} s")
 
@@ -1001,13 +951,11 @@ def _print_timing_table_plain(
 def _print_timing_rich_table(
     roll: dict[str, PromptRollup],
     prompt_cases: Sequence[tuple[str, str]],
-    console: Console,
-) -> None:
+    console: Console) -> None:
     console.print()
     table = Table(
         title="Mean wall time per pipeline stage (s; avg over runs)",
-        expand=True,
-    )
+        expand=True)
     table.add_column("prompt_id", style="dim", min_width=18, overflow="fold")
     for col in (
         "setup",
@@ -1019,8 +967,7 @@ def _print_timing_rich_table(
         "m_good",
         "det_open",
         "det_vocab",
-        "neg_ctrl",
-    ):
+        "neg_ctrl"):
         table.add_column(col, justify="right", min_width=8, no_wrap=True, overflow="fold")
 
     for sid, _ in prompt_cases:
@@ -1039,8 +986,7 @@ def _print_timing_rich_table(
             f"{m['t_master_good']:.4f}",
             f"{m['t_detect_open']:.4f}",
             f"{m['t_detect_per_label']:.4f}",
-            f"{m['t_negative_control']:.4f}",
-        )
+            f"{m['t_negative_control']:.4f}")
 
     gm = _aggregate_timing_means(roll, prompt_cases)
     table.add_row(
@@ -1054,8 +1000,7 @@ def _print_timing_rich_table(
         f"{gm['t_master_good']:.4f}",
         f"{gm['t_detect_open']:.4f}",
         f"{gm['t_detect_per_label']:.4f}",
-        f"{gm['t_negative_control']:.4f}",
-    )
+        f"{gm['t_negative_control']:.4f}")
     console.print(table)
     console.print(f"[dim]Sum of listed stage means per run:[/] {gm['t_grand_avg']:.4f} s")
 
@@ -1066,8 +1011,7 @@ def _print_plain_results(
     roll: dict[str, PromptRollup],
     vocab_n: int,
     table_heading: str,
-    print_legend: bool,
-) -> None:
+    print_legend: bool) -> None:
     def ratio(a: int, b: int) -> str:
         return f"{a}/{b}"
 
@@ -1119,8 +1063,7 @@ def _print_plain_results(
         headers=["prompt_id", "runs", "TPR", "FNR", "TNR", "FPR"],
         widths=[22, 5, 8, 8, 8, 8],
         aligns=["<", ">", ">", ">", ">", ">"],
-        rows=rate_rows,
-    )
+        rows=rate_rows)
     benchmark_io.print_plain_table(
         title="Protocol checks & mismatches",
         headers=[
@@ -1141,8 +1084,7 @@ def _print_plain_results(
         ],
         widths=[22, 5, 7, 7, 7, 7, 7, 7, 8, 8, 5, 4, 4, 4],
         aligns=["<", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">"],
-        rows=check_rows,
-    )
+        rows=check_rows)
 
     if print_legend:
         print()
@@ -1163,8 +1105,7 @@ def _print_rich_results(
     vocab_n: int,
     console: Console,
     table_title: str,
-    print_legend: bool,
-) -> None:
+    print_legend: bool) -> None:
     console.print()
     table = Table(title=table_title, expand=True)
     table.add_column("prompt_id", style="dim", min_width=18, overflow="fold")
@@ -1185,8 +1126,7 @@ def _print_rich_results(
         "mism",
         "dCP",
         "FN*",
-        "FP*",
-    ):
+        "FP*"):
         table.add_column(col, justify="right", min_width=7, no_wrap=True, overflow="fold")
 
     for sid, _ in prompt_cases:
@@ -1212,8 +1152,7 @@ def _print_rich_results(
                 "n/a",
                 "n/a",
                 "n/a",
-                "n/a",
-            )
+                "n/a")
             continue
         tpr, fnr, tnr, fpr = _rates(r.tp, r.fn, r.tn, r.fp)
         lcprf = (
@@ -1239,8 +1178,7 @@ def _print_rich_results(
             str(r.mismatch_total),
             str(r.mismatch_cprf_heuristic_bad),
             str(r.mismatch_fn_with_matching_seeds),
-            str(r.mismatch_fp_with_split_seeds),
-        )
+            str(r.mismatch_fp_with_split_seeds))
     console.print(table)
     if print_legend:
         console.print(
@@ -1253,8 +1191,7 @@ def _print_rich_results(
 
 def _strict_protocol_ok(
     roll: dict[str, PromptRollup],
-    prompt_cases: Sequence[tuple[str, str]],
-) -> bool:
+    prompt_cases: Sequence[tuple[str, str]]) -> bool:
     all_ok = True
     for sid, _ in prompt_cases:
         r = roll[sid]
@@ -1276,8 +1213,7 @@ def _print_protocol_failure_details(
     roll: dict[str, PromptRollup],
     prompt_cases: Sequence[tuple[str, str]],
     plain: bool,
-    console: Console,
-) -> None:
+    console: Console) -> None:
     msg = (
         "Protocol checks did not pass on every run (require: master_detect good, detect open, "
         "unconstrained CPRF match, negative control rejects)."
@@ -1332,8 +1268,6 @@ def run_benchmark_with_summary(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
-    partition_mode: str = "static",
-    redundancy_layout: str = "depth",
     quiet: bool = False,
 ) -> tuple[int, BenchmarkRunSummary]:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3", "text_attributes"):
@@ -1342,10 +1276,7 @@ def run_benchmark_with_summary(
     _configure_benchmark(
         code_length=code_length,
         wm_bit_redundancy=wm_bit_redundancy,
-        partition_mode=partition_mode,
-        redundancy_layout=redundancy_layout,
-        llm_model_id=llm_model_id,
-    )
+        llm_model_id=llm_model_id)
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     roll_attributes_match: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     sk_shared: dict[str, Any] = {}
@@ -1354,8 +1285,6 @@ def run_benchmark_with_summary(
     if not quiet:
         console.print(
             f"code_length={wm.SECURITY_PARAM}  wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
-            f"partition_mode={wm.PARTITION_MODE}  "
-            f"redundancy_layout={wm.REDUNDANCY_LAYOUT}  "
             f"channel_bits={wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
             f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
             f"llm={model.MODEL_ID!r}"
@@ -1365,8 +1294,7 @@ def run_benchmark_with_summary(
     for _, sid, prompt in benchmark_io.iter_with_progress(
         trials,
         description="Benchmark",
-        disable=quiet,
-    ):
+        disable=quiet):
         t_setup0 = time.perf_counter()
         if fresh_key_per_trial:
             sk = wm.setup(modulus)
@@ -1386,8 +1314,7 @@ def run_benchmark_with_summary(
             control_ok,
             ber,
             tt_inner,
-            em_open_m,
-        ) = run_one_trial(sk, prompt)
+            em_open_m) = run_one_trial(sk, prompt)
         tt_inner.t_setup = t_setup
 
         roll[sid].add_run(
@@ -1400,8 +1327,7 @@ def run_benchmark_with_summary(
             cprf_per_label_n=cprf_label_n,
             control_ok=control_ok,
             ber=ber,
-            timings=tt_inner,
-        )
+            timings=tt_inner)
         if attributes_match:
             roll_attributes_match[sid].add_run(
                 word_stats=word_stats,
@@ -1413,8 +1339,7 @@ def run_benchmark_with_summary(
                 cprf_per_label_n=cprf_label_n,
                 control_ok=control_ok,
                 ber=ber,
-                timings=tt_inner,
-            )
+                timings=tt_inner)
 
     all_ok = _strict_protocol_ok(roll, prompt_cases)
     summary = BenchmarkRunSummary(
@@ -1425,8 +1350,7 @@ def run_benchmark_with_summary(
         code_length=code_length,
         wm_bit_redundancy=wm.WM_BIT_REDUNDANCY,
         modulus=modulus,
-        strict_protocol_ok=all_ok,
-    )
+        strict_protocol_ok=all_ok)
 
     if not quiet:
         _heading_all = (
@@ -1442,15 +1366,13 @@ def run_benchmark_with_summary(
             roll=roll,
             vocab_n=vocab_n,
             table_heading=_heading_all,
-            print_legend=True,
-        )
+            print_legend=True)
         _print_plain_results(
             prompt_cases=prompt_cases,
             roll=roll_attributes_match,
             vocab_n=vocab_n,
             table_heading=_heading_attributes_match,
-            print_legend=False,
-        )
+            print_legend=False)
         _print_timing_table_plain(roll, prompt_cases)
 
         if not all_ok:
@@ -1471,8 +1393,6 @@ def run_benchmark(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
-    partition_mode: str = "static",
-    redundancy_layout: str = "depth",
 ) -> int:
     code, _ = run_benchmark_with_summary(
         prompt_cases=prompt_cases,
@@ -1483,10 +1403,7 @@ def run_benchmark(
         console=console,
         llm_model_id=llm_model_id,
         wm_bit_redundancy=wm_bit_redundancy,
-        partition_mode=partition_mode,
-        redundancy_layout=redundancy_layout,
-        quiet=False,
-    )
+        quiet=False)
     return code
 
 
@@ -1500,8 +1417,6 @@ def run_fpr_vs_code_length_sweep(
     fresh_key_per_trial: bool,
     console: Console,
     llm_model_id: str | None = None,
-    partition_mode: str = "static",
-    redundancy_layout: str = "depth",
     prc_monte_carlo_trials: int = 100_000,
     rng: random.Random | None = None,
     quiet: bool = True,
@@ -1543,10 +1458,7 @@ def run_fpr_vs_code_length_sweep(
             console=console,
             llm_model_id=llm_model_id,
             wm_bit_redundancy=int(wm_bit_redundancy),
-            partition_mode=partition_mode,
-            redundancy_layout=redundancy_layout,
-            quiet=quiet,
-        )
+            quiet=quiet)
         lengths.append(int(length))
         exit_codes.append(int(ex))
 
@@ -1583,8 +1495,6 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
     fresh_key_per_trial: bool,
     console: Console,
     llm_model_id: str | None = None,
-    partition_mode: str = "static",
-    redundancy_layout: str = "depth",
     quiet: bool = True,
 ) -> tuple[list[int], dict[str, list[float]], list[int]]:
     """Sweep ``wm_bit_redundancy`` at fixed logical ``code_length``."""
@@ -1607,10 +1517,7 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
             console=console,
             llm_model_id=llm_model_id,
             wm_bit_redundancy=int(redundancy),
-            partition_mode=partition_mode,
-            redundancy_layout=redundancy_layout,
-            quiet=quiet,
-        )
+            quiet=quiet)
         redundancies.append(int(redundancy))
         exit_codes.append(int(ex))
 
@@ -1699,48 +1606,31 @@ def main() -> int:
     p.add_argument(
         "--reuse-key",
         action="store_true",
-        help="Reuse one master key per prompt id across runs (default is fresh key every trial).",
-    )
+        help="Reuse one master key per prompt id across runs (default is fresh key every trial).")
     p.add_argument(
         "--prompt-case",
         action="append",
         dest="prompt_cases",
         metavar="ID:PROMPT",
-        help="Benchmark case (repeatable). First ':' separates id from prompt.",
-    )
+        help="Benchmark case (repeatable). First ':' separates id from prompt.")
     p.add_argument(
         "--llm-model",
         dest="llm_model",
         metavar="HF_HUB_ID",
         default=None,
-        help="Hugging Face hub id for the LM (``model.configure`` before load).",
-    )
+        help="Hugging Face hub id for the LM (``model.configure`` before load).")
     p.add_argument(
         "--wm-bit-redundancy",
         type=int,
         default=1,
         metavar="R",
-        help="Depth-interleave R replicas of each logical PRC bit on the token channel; recovery uses strict majority (ties->0).",
-    )
-    p.add_argument(
-        "--partition-mode",
-        choices=("static", "balanced"),
-        default="static",
-        help="Vocab partition scheme: static (original) or balanced (per-step softmax).",
-    )
-    p.add_argument(
-        "--redundancy-layout",
-        choices=("depth", "block"),
-        default="depth",
-        help="Channel replica layout: depth (interleaved passes) or block (contiguous).",
-    )
+        help="Depth-interleave R replicas of each logical PRC bit on the token channel; recovery uses strict majority (ties->0).")
     p.add_argument(
         "--output",
         "-o",
         type=Path,
         default=None,
-        help="Write JSON results to this path (for benchmark_plot.py).",
-    )
+        help="Write JSON results to this path (for benchmark_plot.py).")
     args = p.parse_args()
     if args.runs < 1 or args.code_length < 1:
         print("runs and code-length must be >= 1", file=sys.stderr)
@@ -1768,10 +1658,7 @@ def main() -> int:
         console=console,
         llm_model_id=args.llm_model,
         wm_bit_redundancy=args.wm_bit_redundancy,
-        partition_mode=args.partition_mode,
-        redundancy_layout=args.redundancy_layout,
-        quiet=False,
-    )
+        quiet=False)
     if args.output is not None:
         out = benchmark_io.save_policy_summary(
             args.output,
@@ -1779,8 +1666,7 @@ def main() -> int:
             exit_code=exit_code,
             runs=args.runs,
             fresh_key_per_trial=not args.reuse_key,
-            llm_model_id=args.llm_model,
-        )
+            llm_model_id=args.llm_model)
         console.print(f"[dim]Wrote[/] {out}")
     return exit_code
 
