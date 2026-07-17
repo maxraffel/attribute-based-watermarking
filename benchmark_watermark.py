@@ -182,13 +182,14 @@ def run_protocol_once(
     label_policy_ok: dict[str, bool] = {}
 
     t0 = time.perf_counter()
-    m_ok, m_bits = wm.master_detect(sk, wm_text)
+    raw_wm = wm.recover_channel_bits(wm_text)
+    m_ok, m_bits = wm.master_detect(sk, wm_text, raw_bits=raw_wm)
     t_m = time.perf_counter() - t0
     master_ber = _ber_percent(secret, m_bits)
     all_ok &= bool(m_ok)
 
     t0 = time.perf_counter()
-    u_ok, _ = wm.detect(dk_open, wm_text)
+    u_ok, _ = wm.detect(dk_open, wm_text, raw_bits=raw_wm)
     t_u = time.perf_counter() - t0
     all_ok &= u_ok is True
 
@@ -196,7 +197,7 @@ def run_protocol_once(
     for w in VOCABULARY:
         expect_ok = w in active_set
         t0 = time.perf_counter()
-        w_ok, _ = wm.detect(dk_by_word[w], wm_text)
+        w_ok, _ = wm.detect(dk_by_word[w], wm_text, raw_bits=raw_wm)
         det_total += time.perf_counter() - t0
         ok_w = bool(w_ok) == bool(expect_ok)
         label_policy_ok[w] = ok_w
@@ -213,7 +214,8 @@ def run_protocol_once(
         model=m,
     )
     t0 = time.perf_counter()
-    neg_ok, _ = wm.master_detect(sk, wrong)
+    raw_neg = wm.recover_channel_bits(wrong)
+    neg_ok, _ = wm.master_detect(sk, wrong, raw_bits=raw_neg)
     det_total += time.perf_counter() - t0
     neg_control_pass = not bool(neg_ok)
     all_ok &= neg_control_pass

@@ -98,27 +98,47 @@ def generate(sk: cprf.MasterKey, prompt: str, *, baseline_text: str | None = Non
     return out
 
 
-def detect(dk: cprf.ConstrainedKey, watermarked_text: str) -> Tuple[bool, List[int]]:
+def recover_channel_bits(watermarked_text: str) -> List[int]:
+    """Tokenize text once and recover the raw watermark channel bits."""
     m, tok, device = model.load()
-    attributes = derive_attributes(watermarked_text, dk.modulus, log_scores=False)
-    prc.set_code_length(SECURITY_PARAM)
-    recovered_s = prc.key_gen_from_seed(sha256(dk.c_eval(attributes)).digest())
     raw, _ = randrecover.recover_bitstream_from_text(
         watermarked_text, tok, device, model=m, tokenizer_id=model.MODEL_ID
     )
+    return list(raw)
+
+
+def detect(
+    dk: cprf.ConstrainedKey,
+    watermarked_text: str,
+    *,
+    raw_bits: Sequence[int] | None = None,
+) -> Tuple[bool, List[int]]:
+    """
+    Detect with a constrained key.
+
+    Pass ``raw_bits`` from ``recover_channel_bits`` when checking many keys on the
+    same text so partition recovery is not repeated.
+    """
+    attributes = derive_attributes(watermarked_text, dk.modulus, log_scores=False)
+    prc.set_code_length(SECURITY_PARAM)
+    recovered_s = prc.key_gen_from_seed(sha256(dk.c_eval(attributes)).digest())
+    raw = list(raw_bits) if raw_bits is not None else recover_channel_bits(watermarked_text)
     bits_int = majority_deinterleave(raw, SECURITY_PARAM, WM_BIT_REDUNDANCY)
     ok = prc.detect(recovered_s, [bool(b) for b in bits_int])
     return ok, bits_int
 
 
-def master_detect(sk: cprf.MasterKey, watermarked_text: str) -> Tuple[bool, List[int]]:
-    m, tok, device = model.load()
+def master_detect(
+    sk: cprf.MasterKey,
+    watermarked_text: str,
+    *,
+    raw_bits: Sequence[int] | None = None,
+) -> Tuple[bool, List[int]]:
+    """Master-key detect; see ``detect`` for ``raw_bits`` reuse."""
     attributes = derive_attributes(watermarked_text, sk.modulus, log_scores=False)
     prc.set_code_length(SECURITY_PARAM)
     s = prc.key_gen_from_seed(sha256(sk.eval(attributes)).digest())
-    raw, _ = randrecover.recover_bitstream_from_text(
-        watermarked_text, tok, device, model=m, tokenizer_id=model.MODEL_ID
-    )
+    raw = list(raw_bits) if raw_bits is not None else recover_channel_bits(watermarked_text)
     bits_int = majority_deinterleave(raw, SECURITY_PARAM, WM_BIT_REDUNDANCY)
     ok = prc.detect(s, [bool(b) for b in bits_int])
     return ok, bits_int

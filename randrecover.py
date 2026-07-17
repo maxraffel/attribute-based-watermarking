@@ -247,29 +247,22 @@ def ensure_partition_weights(
     )
 
 
-def get_vectorized_partition(vocab_size: int, device: str, seed_index: int) -> torch.BoolTensor:
-    """
-    Deterministic boolean mask over the vocabulary for one bit index.
-
-    Membership is a seeded random permutation of token ids; set A is the shortest
-    prefix of that order whose static unigram weight is at least half the total.
-    That keeps masks looking random while balancing estimated probability mass.
-    """
+def _partition_order_and_cutoff(
+    vocab_size: int, seed_index: int
+) -> Tuple[torch.Tensor, int]:
+    """Seeded random token order and inclusive cutoff index for set A."""
     v = int(vocab_size)
     weights = get_partition_weights(v)
     if weights is None:
         raise RuntimeError(
             "partition weights are not configured; call ensure_partition_weights(...) "
-            "before get_vectorized_partition (generate/recover paths do this automatically)"
+            "before building partitions (generate/recover paths do this automatically)"
         )
-
-    dev = torch.device(device) if isinstance(device, str) else device
     # randperm with a CUDA generator is unreliable across devices; permute on CPU.
     g = torch.Generator(device="cpu")
     g.manual_seed(_partition_seed(seed_index))
     order = torch.randperm(v, generator=g, device="cpu")
-    w = weights[order]
-    cum = torch.cumsum(w, dim=0)
+    cum = torch.cumsum(weights[order], dim=0)
     # Shortest prefix with mass >= half, then prefer the nearer of that prefix or
     # the one before it so a single heavy token cannot overshoot too far.
     half = 0.5 * float(cum[-1].item())
@@ -281,9 +274,38 @@ def get_vectorized_partition(vocab_size: int, device: str, seed_index: int) -> t
         under = half - float(cum[cutoff - 1].item())
         if over > under:
             cutoff -= 1
-    mask = torch.zeros(v, dtype=torch.bool, device="cpu")
+    return order, cutoff
+
+
+def get_vectorized_partition(vocab_size: int, device: str, seed_index: int) -> torch.BoolTensor:
+    """
+    Deterministic boolean mask over the vocabulary for one bit index.
+
+    Membership is a seeded random permutation of token ids; set A is the shortest
+    prefix of that order whose static unigram weight is at least half the total.
+    That keeps masks looking random while balancing estimated probability mass.
+    """
+    order, cutoff = _partition_order_and_cutoff(vocab_size, seed_index)
+    mask = torch.zeros(int(vocab_size), dtype=torch.bool, device="cpu")
     mask[order[: cutoff + 1]] = True
+    dev = torch.device(device) if isinstance(device, str) else device
     return mask.to(device=dev)
+
+
+def partition_bit_for_token(vocab_size: int, seed_index: int, token_id: int) -> int:
+    """
+    Recover the watermark bit implied by ``token_id`` at ``seed_index``.
+
+    Same partition as ``get_vectorized_partition``, but only answers membership for
+    one id (no full boolean mask allocation — used by detection).
+    """
+    v = int(vocab_size)
+    tid = int(token_id)
+    if tid < 0 or tid >= v:
+        return 1
+    order, cutoff = _partition_order_and_cutoff(v, seed_index)
+    pos = int((order == tid).nonzero(as_tuple=True)[0].item())
+    return 0 if pos <= cutoff else 1
 
 
 def resolve_partition_vocab_size_for_recovery(
@@ -670,16 +692,14 @@ def recover_bitstream(
     tokenizer: AutoTokenizer | None = None,
     tokenizer_id: str | None = None,
 ) -> Tuple[List[int], List[int]]:
+    del device  # partitions are built on CPU; kept for API compatibility
     ensure_partition_weights(int(vocab_size), tokenizer, tokenizer_id=tokenizer_id)
     recovered_bits, recovered_tokens = [], []
     filtered_ids = [tid for tid in full_sequence_ids if tid not in special_ids]
+    v = int(vocab_size)
 
     for bit_idx, actual_token_id in enumerate(filtered_ids):
-        mask_A = get_vectorized_partition(vocab_size, device, bit_idx)
-        if actual_token_id >= mask_A.shape[0]:
-            recovered_bits.append(1)
-        else:
-            recovered_bits.append(0 if mask_A[actual_token_id].item() else 1)
+        recovered_bits.append(partition_bit_for_token(v, bit_idx, int(actual_token_id)))
         recovered_tokens.append(actual_token_id)
 
     return recovered_bits, recovered_tokens
@@ -718,17 +738,26 @@ def negative_control_transcript_like(
     model: torch.nn.Module | None = None,
     phrase: str = "Unrelated decoy text used only as a negative control. ",
 ) -> str:
+    """Grow decoy text until it has enough non-special tokens (no partition work)."""
+    del device, model  # API compatibility with callers that pass LM/device
+    special_ids = set(getattr(tokenizer, "all_special_ids", []))
     ref_chars = max(len(reference_text), 1)
     s = ""
     while True:
         s += phrase
-        bits, _ = recover_bitstream_from_text(s, tokenizer, device, model=model)
-        if len(bits) >= n_bits and len(s) >= ref_chars:
+        if len(s) < ref_chars:
+            continue
+        ids = tokenizer(s, add_special_tokens=False)["input_ids"]
+        if ids and isinstance(ids[0], list):
+            ids = [t for row in ids for t in row]
+        n = sum(1 for t in ids if int(t) not in special_ids)
+        if n >= n_bits:
             return s
 
 
 __all__ = [
     "get_vectorized_partition",
+    "partition_bit_for_token",
     "configure_partition_weights",
     "clear_partition_weights",
     "get_partition_weights",

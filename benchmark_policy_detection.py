@@ -1,4 +1,4 @@
-﻿"""
+"""
 Policy-detection benchmark: same end-to-end flow as ``app.py`` (generate ΓåÆ verify ``derive_attributes`` ΓåÆ
 issue unconstrained + one constrained key per closed-vocabulary label ΓåÆ CPRF seed checks ΓåÆ
 ``master_detect`` / ``detect`` on good transcript ΓåÆ negative-control ``master_detect`` on decoy).
@@ -823,19 +823,20 @@ def run_one_trial(
     tt.t_cprf_checks = time.perf_counter() - t_c0
 
     t_m0 = time.perf_counter()
-    m_ok, m_bits = wm.master_detect(sk, wm_text)
+    raw_wm = wm.recover_channel_bits(wm_text)
+    m_ok, m_bits = wm.master_detect(sk, wm_text, raw_bits=raw_wm)
     tt.t_master_good = time.perf_counter() - t_m0
     ber = _ber_percent(secret, m_bits)
 
     t_u0 = time.perf_counter()
-    u_ok, _ = wm.detect(dk_open, wm_text)
+    u_ok, _ = wm.detect(dk_open, wm_text, raw_bits=raw_wm)
     tt.t_detect_open = time.perf_counter() - t_u0
 
     word_stats: list[dict[str, Any]] = []
     t_pv0 = time.perf_counter()
     for w in VOCABULARY:
         expect_detect = w in active_set
-        got, _ = wm.detect(dk_by_word[w], wm_text)
+        got, _ = wm.detect(dk_by_word[w], wm_text, raw_bits=raw_wm)
         word_stats.append(
             {
                 "word": w,
@@ -856,7 +857,8 @@ def run_one_trial(
         n_bits=wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY,
         model=m,
     )
-    ctrl_ok_raw, _ = wm.master_detect(sk, wrong)
+    raw_neg = wm.recover_channel_bits(wrong)
+    ctrl_ok_raw, _ = wm.master_detect(sk, wrong, raw_bits=raw_neg)
     control_ok = not bool(ctrl_ok_raw)
     tt.t_negative_control = time.perf_counter() - t_nc0
 
