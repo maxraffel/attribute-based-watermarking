@@ -35,7 +35,7 @@ from text_attributes import (
 # --- customize here ---
 MODULUS = 1024
 CODE_LENGTH = 100
-WM_BIT_REDUNDANCY = 5  # token-channel repeats per PRC bit; recovery = strict majority (tie → 0)
+WM_BIT_REDUNDANCY = 3  # token-channel repeats per PRC bit; recovery = strict majority (tie → 0)
 # ``static`` = original seeded partitions; ``balanced`` = per-step softmax-balanced masks
 PARTITION_MODE = "balanced"
 # ``depth`` = R interleaved codeword passes; ``block`` = each bit repeated R times contiguously
