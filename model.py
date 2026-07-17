@@ -197,22 +197,30 @@ def load() -> tuple[AutoModelForCausalLM, AutoTokenizer, str]:
         dtype_label = inference_dtype_label()
         print(f"Loading tokenizer for {MODEL_ID}...", flush=True)
         _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=True)
+        if _tokenizer.pad_token_id is None and _tokenizer.eos_token is not None:
+            _tokenizer.pad_token = _tokenizer.eos_token
         load_dtype = _torch_dtype_for_inference(INFERENCE_DTYPE)
         print(
             f"Downloading/loading weights for {MODEL_ID} ({dtype_label})...",
             flush=True,
         )
-        if load_dtype is None:
-            _model = AutoModelForCausalLM.from_pretrained(
-                MODEL_ID,
-                token=True,
-            ).to(device)
-        else:
-            _model = AutoModelForCausalLM.from_pretrained(
-                MODEL_ID,
-                dtype=load_dtype,
-                token=True,
-            ).to(device)
+        load_kwargs: dict = {"token": True, "device_map": device}
+        if load_dtype is not None:
+            load_kwargs["dtype"] = load_dtype
+        try:
+            _model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **load_kwargs)
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "device-side assert" in msg or "cuda error" in msg:
+                raise RuntimeError(
+                    "CUDA reported a device-side assert while loading the LM. "
+                    "This is usually a poisoned GPU context from an earlier failed "
+                    "kernel (the stack at `.to` / load is often misleading). "
+                    "Restart the Colab/Jupyter runtime, then re-run setup. "
+                    "To locate the first fault, set CUDA_LAUNCH_BLOCKING=1 before "
+                    "importing torch and re-run once after a clean restart."
+                ) from exc
+            raise
         print(f"Model ready on {device}.", flush=True)
         _model.eval()
         if not _model.config.is_encoder_decoder:
@@ -223,7 +231,19 @@ def load() -> tuple[AutoModelForCausalLM, AutoTokenizer, str]:
             "Applying torch.compile to LM (first forwards may be slow)...",
             flush=True,
         )
-        _model = torch.compile(_model)  # type: ignore[assignment]
+        # Prefer TF32 on Ampere+ (silences inductor's float32 matmul warning; tiny
+        # numeric change vs strict IEEE fp32 — fine for sampling workloads).
+        torch.set_float32_matmul_precision("high")
+        try:
+            import torch._inductor.config as inductor_config
+
+            # L4 / smaller GPUs lack SM count for max_autotune_gemm; disable to
+            # avoid the noisy fallback warning (compile still proceeds).
+            if hasattr(inductor_config, "max_autotune_gemm"):
+                inductor_config.max_autotune_gemm = False
+        except Exception:
+            pass
+        _model = torch.compile(_model, mode="default")  # type: ignore[assignment]
         _torch_compile_applied = True
         print("torch.compile ready.", flush=True)
     _apply_sampling_to_generation_config()

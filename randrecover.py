@@ -289,9 +289,19 @@ def generate_baseline(
     max_new_tokens: int,
     device: str = "cpu",
 ) -> str:
-    return generate_baselines(
-        model, tokenizer, [prompt], max_new_tokens, device, batch_size=1
-    )[0]
+    """Single-prompt baseline (same path as before batching was added)."""
+    inputs = encode_prompt_for_generation(tokenizer, prompt, device)
+    prompt_len = int(inputs["input_ids"].shape[1])
+    pad_id = _tokenizer_pad_token_id(tokenizer)
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            pad_token_id=pad_id,
+        )
+    gen_ids = out[0, prompt_len:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True)
 
 
 def _prepare_sampling_logits_processor_bundle(
@@ -441,6 +451,123 @@ def _tokenize_text_fragment(tokenizer: AutoTokenizer, text: str) -> List[int]:
     return [int(t) for t in ids]
 
 
+def _fit_text_to_token_count(
+    tokenizer: AutoTokenizer,
+    text: str,
+    n_tokens: int,
+) -> Tuple[str, List[int]]:
+    """Return a prefix of ``text`` whose retokenization has exactly ``n_tokens`` ids.
+
+    Uses a char-prefix search on ``text``, then stabilizes decode↔encode drift.
+    Raises ``ValueError`` if ``text`` cannot cover ``n_tokens`` tokens.
+    """
+    if n_tokens < 0:
+        raise ValueError(f"n_tokens must be >= 0, got {n_tokens}")
+    if n_tokens == 0:
+        return "", []
+
+    full_ids = _tokenize_text_fragment(tokenizer, text)
+    if len(full_ids) < n_tokens:
+        raise ValueError(
+            f"text retokenizes to {len(full_ids)} tokens, need at least {n_tokens}"
+        )
+
+    # Longest char prefix with <= n_tokens, then grow to exactly n_tokens.
+    lo, hi = 0, len(text)
+    best_len = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        k = len(_tokenize_text_fragment(tokenizer, text[:mid]))
+        if k <= n_tokens:
+            best_len = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    prefix = text[:best_len]
+    while (
+        len(prefix) < len(text)
+        and len(_tokenize_text_fragment(tokenizer, prefix)) < n_tokens
+    ):
+        prefix = text[: len(prefix) + 1]
+
+    got = _tokenize_text_fragment(tokenizer, prefix)
+    if len(got) != n_tokens:
+        # Fallback: decode the first n source tokens and re-stabilize.
+        prefix = tokenizer.decode(full_ids[:n_tokens], skip_special_tokens=True)
+        got = _tokenize_text_fragment(tokenizer, prefix)
+
+    # Decode/encode can drift; iterate toward a fixed point with exact length.
+    for _ in range(16):
+        if len(got) == n_tokens:
+            roundtrip = tokenizer.decode(got, skip_special_tokens=True)
+            got2 = _tokenize_text_fragment(tokenizer, roundtrip)
+            if got2 == got:
+                return roundtrip, got
+            if len(got2) == n_tokens:
+                got = got2
+                continue
+        if len(got) > n_tokens:
+            got = got[:n_tokens]
+            prefix = tokenizer.decode(got, skip_special_tokens=True)
+            got = _tokenize_text_fragment(tokenizer, prefix)
+        elif len(got) < n_tokens:
+            need = n_tokens - len(got)
+            # Extend from full_ids beyond what we have.
+            merged = got + full_ids[len(got) : len(got) + need]
+            if len(merged) < n_tokens:
+                raise ValueError(
+                    f"cannot stabilize burn-in to {n_tokens} tokens "
+                    f"(stuck at {len(got)})"
+                )
+            got = merged[:n_tokens]
+            prefix = tokenizer.decode(got, skip_special_tokens=True)
+            got = _tokenize_text_fragment(tokenizer, prefix)
+        else:
+            break
+
+    got = _tokenize_text_fragment(tokenizer, prefix)
+    if len(got) != n_tokens:
+        raise ValueError(
+            f"burn-in stabilize failed: retok length {len(got)} != {n_tokens}"
+        )
+    return prefix, got
+
+
+def _sample_next_token_id(
+    model: torch.nn.Module,
+    *,
+    input_ids: torch.Tensor,
+    step_input_ids: torch.Tensor,
+    model_kwargs: Dict[str, Any],
+    logits_processor: LogitsProcessorList,
+    device: str | torch.device,
+    partition_vocab_dim: int | None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """One unwatermarked multinomial step. Returns ids, step_ids, token, vocab_dim."""
+    with torch.no_grad():
+        outputs = model(input_ids=step_input_ids, **model_kwargs)
+        logits = outputs.logits[0, -1, :]
+        d_logits = int(logits.shape[-1])
+        if partition_vocab_dim is None:
+            partition_vocab_dim = d_logits
+        elif partition_vocab_dim != d_logits:
+            raise RuntimeError(
+                f"logits vocab width changed mid-decode ({d_logits} vs {partition_vocab_dim})"
+            )
+        model_kwargs["past_key_values"] = outputs.past_key_values
+        sample_probs = _scores_to_next_token_probs(logits, input_ids, logits_processor)
+        next_token_id = torch.multinomial(sample_probs, num_samples=1)
+    input_ids, step_input_ids = _append_generated_token(
+        input_ids=input_ids,
+        step_input_ids=step_input_ids,
+        next_token_id=next_token_id,
+        model_kwargs=model_kwargs,
+        device=device,
+    )
+    return input_ids, step_input_ids, next_token_id, int(partition_vocab_dim)
+
+
 def _init_prompt_free_decode_state(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
@@ -572,18 +699,23 @@ def generate_with_watermark(
 ) -> Dict:
     """Watermark after a free burn-in prefix using softmax-balanced vocab splits.
 
-    The first ``burn_in_tokens`` model tokens are sampled without watermarking
-    under the real prompt. During the watermarked phase, two LM contexts run in
-    parallel:
+    The first ``burn_in_tokens`` **retokenized** prefix tokens are free (no
+    watermark). Raw model burn-in may be longer/shorter after decode↔encode; we
+    grow free sampling until the decoded prefix covers at least
+    ``burn_in_tokens`` retokenized ids, then publish a stabilized prefix whose
+    retokenization has **exactly** that length. Prompt-free partitions are warmed
+    on those retokenized ids (matching integrity recovery). Channel bit indices
+    are offset by ``len(retok_prefix) - burn_in_tokens`` (normally 0) so recovery
+    that skips the first ``burn_in_tokens`` tokens of the full retokenized
+    transcript lines up with generation.
+
+    During the watermarked phase, two LM contexts run in parallel:
 
     - **Sampling state** (prompt-conditioned): provides next-token probabilities
       used for soft watermarking and multinomial sampling.
-    - **Partition state** (prompt-free, BOS + generated tokens): provides the
-      distribution used to build balanced masks — the same context recovery uses.
-
-    Published text is ``decode(burn_in) + decode(wm)`` (separate decodes). That
-    character split is the retokenization barrier: prefix retokenization cannot
-    shift watermarked-token indices.
+    - **Partition state** (prompt-free, BOS + retokenized burn-in + wm tokens):
+      provides the distribution used to build balanced masks — the same context
+      recovery uses.
     """
     if burn_in_tokens < 0:
         raise ValueError(f"burn_in_tokens must be >= 0, got {burn_in_tokens}")
@@ -595,12 +727,13 @@ def generate_with_watermark(
     attn_mask = inputs.get("attention_mask", None)
 
     n_bits = len(secret_bitstream)
-    total_new = int(burn_in_tokens) + n_bits
+    # Horizon: raw burn-in may exceed scheme length when retok shrinks.
+    decode_horizon = max(int(burn_in_tokens) + n_bits + 64, 1)
     _, logits_processor_sample = _prepare_sampling_logits_processor_bundle(
         model,
         tokenizer,
         inputs,
-        decode_horizon=max(total_new, 1),
+        decode_horizon=decode_horizon,
         generation_extra=generation_extra,
     )
     natural_partition_choices = 0
@@ -611,36 +744,56 @@ def generate_with_watermark(
         model_kwargs_sample["attention_mask"] = attn_mask
     step_input_ids_sample = input_ids_wm
 
-    # --- Phase 1: free burn-in under the prompt (sampling only) ---
-    for _ in range(int(burn_in_tokens)):
-        with torch.no_grad():
-            outputs = model(input_ids=step_input_ids_sample, **model_kwargs_sample)
-            logits_wm = outputs.logits[0, -1, :]
-            d_logits = int(logits_wm.shape[-1])
-            if partition_vocab_dim is None:
-                partition_vocab_dim = d_logits
-            elif partition_vocab_dim != d_logits:
-                raise RuntimeError(
-                    f"logits vocab width changed mid-decode ({d_logits} vs {partition_vocab_dim})"
-                )
-            model_kwargs_sample["past_key_values"] = outputs.past_key_values
-            sample_probs = _scores_to_next_token_probs(
-                logits_wm, input_ids_wm, logits_processor_sample
+    # --- Phase 1: free burn-in until retokenized prefix covers scheme length ---
+    max_burn_raw = max(int(burn_in_tokens) * 4, int(burn_in_tokens) + 64)
+    while True:
+        burn_in_ids = input_ids_wm[0, prompt_len:].tolist()
+        prefix_raw_text = tokenizer.decode(burn_in_ids, skip_special_tokens=True)
+        retok_len = len(_tokenize_text_fragment(tokenizer, prefix_raw_text))
+        if retok_len >= int(burn_in_tokens):
+            break
+        if len(burn_in_ids) >= max_burn_raw:
+            raise RuntimeError(
+                f"burn-in retokenization stayed at {retok_len} tokens after "
+                f"{len(burn_in_ids)} raw tokens (need {burn_in_tokens})"
             )
-            next_token_id_wm = torch.multinomial(sample_probs, num_samples=1)
-        input_ids_wm, step_input_ids_sample = _append_generated_token(
+        (
+            input_ids_wm,
+            step_input_ids_sample,
+            _tid,
+            partition_vocab_dim,
+        ) = _sample_next_token_id(
+            model,
             input_ids=input_ids_wm,
             step_input_ids=step_input_ids_sample,
-            next_token_id=next_token_id_wm,
             model_kwargs=model_kwargs_sample,
+            logits_processor=logits_processor_sample,
             device=device,
+            partition_vocab_dim=partition_vocab_dim,
         )
 
     burn_in_ids = input_ids_wm[0, prompt_len:].tolist()
-    prefix_text = tokenizer.decode(burn_in_ids, skip_special_tokens=True)
-    burn_in_char_len = len(prefix_text)
+    prefix_raw_text = tokenizer.decode(burn_in_ids, skip_special_tokens=True)
+    if int(burn_in_tokens) == 0:
+        prefix_text = ""
+        retok_burn_ids: List[int] = []
+        retok_replacements = 0
+    else:
+        prefix_text, retok_burn_ids = _fit_text_to_token_count(
+            tokenizer, prefix_raw_text, int(burn_in_tokens)
+        )
+        # Count how far raw retok drifted from the scheme cut.
+        raw_retok = _tokenize_text_fragment(tokenizer, prefix_raw_text)
+        retok_replacements = abs(len(raw_retok) - int(burn_in_tokens)) + (
+            0 if raw_retok[: int(burn_in_tokens)] == retok_burn_ids else 1
+        )
 
-    # Warm the prompt-free partition state to BOS + burn-in (same as recovery).
+    burn_in_char_len = len(prefix_text)
+    # Integrity recovery skips the first burn_in_tokens of the full retokenized
+    # transcript. If stabilize left a residual length delta, shift bit indices.
+    bit_index_offset = len(retok_burn_ids) - int(burn_in_tokens)
+
+    # Warm the prompt-free partition state on the *retokenized* burn-in (recovery).
     (
         input_ids_part,
         step_input_ids_part,
@@ -650,7 +803,7 @@ def generate_with_watermark(
         model,
         tokenizer,
         device,
-        decode_horizon=max(len(burn_in_ids) + n_bits, 1),
+        decode_horizon=max(len(retok_burn_ids) + n_bits, 1),
         generation_extra=generation_extra,
     )
     input_ids_part, step_input_ids_part, model_kwargs_part = _warm_prompt_free_with_burn_in(
@@ -658,12 +811,13 @@ def generate_with_watermark(
         input_ids=input_ids_part,
         step_input_ids=step_input_ids_part,
         model_kwargs=model_kwargs_part,
-        burn_in_ids=burn_in_ids,
+        burn_in_ids=retok_burn_ids,
         device=device,
     )
 
     # --- Phase 2: watermarked tokens (dual forward) ---
     for bit_idx in range(n_bits):
+        partition_step = int(bit_idx) + int(bit_index_offset)
         with torch.no_grad():
             outputs_sample = model(
                 input_ids=step_input_ids_sample, **model_kwargs_sample
@@ -694,7 +848,7 @@ def generate_with_watermark(
             )
 
             # Masks must match recovery: built from prompt-free probs only.
-            mask_A = get_balanced_partition_from_probs(partition_probs, bit_idx)
+            mask_A = get_balanced_partition_from_probs(partition_probs, partition_step)
             mass_a, mass_b = balanced_partition_masses(partition_probs, mask_A)
             partition_mass_gaps.append(abs(mass_a - mass_b))
 
@@ -736,14 +890,15 @@ def generate_with_watermark(
     wm_token_texts = [tokenizer.decode([tid], skip_special_tokens=True) for tid in wm_ids]
     wm_token_char_lens = [len(piece) for piece in wm_token_texts]
     wm_text = "".join(wm_token_texts)
-    # Separate decode + concat: retokenizing the prefix cannot rewrite wm token ids.
-    # Per-token payload spans keep a retokenization change local to that token.
+    # Publish stabilized burn-in (exact scheme token length) + wm payload text.
     generated_text_wm = prefix_text + wm_text
     recovery_input_ids = tokenizer(generated_text_wm, return_tensors="pt")["input_ids"]
+    full_retok = _tokenize_text_fragment(tokenizer, generated_text_wm)
+    recovery_ids_aligned = full_retok[: int(burn_in_tokens)] == retok_burn_ids
     gap_mean = (
         sum(partition_mass_gaps) / len(partition_mass_gaps) if partition_mass_gaps else 0.0
     )
-    suffix_ids = burn_in_ids + wm_ids
+    suffix_ids = list(retok_burn_ids) + list(wm_ids)
 
     return {
         "prompt_text": prompt,
@@ -753,6 +908,8 @@ def generate_with_watermark(
         "burn_in_tokens": int(burn_in_tokens),
         "burn_in_char_len": int(burn_in_char_len),
         "burn_in_ids": list(burn_in_ids),
+        "burn_in_retok_ids": list(retok_burn_ids),
+        "burn_in_bit_index_offset": int(bit_index_offset),
         "wm_suffix_ids": list(wm_ids),
         "wm_token_char_lens": list(wm_token_char_lens),
         "input_ids_wm": recovery_input_ids,
@@ -760,18 +917,14 @@ def generate_with_watermark(
         "prompt_len": prompt_len,
         "model_suffix_ids": suffix_ids,
         "secret_bitstream": secret_bitstream,
-        "sacrificed_bits": 0,
         "natural_partition_choices": natural_partition_choices,
-        "recovery_stalls": 0,
-        "retok_replacements": 0,
-        "recovery_ids_aligned": True,
+        "retok_replacements": int(retok_replacements),
+        "recovery_ids_aligned": bool(recovery_ids_aligned),
         "recovery_slots_committed": n_bits,
-        "incremental_ids_aligned": True,
         "partition_vocab_dim": partition_vocab_dim,
         "partition_mass_gap_mean": gap_mean,
         "partition_mass_gap_max": max(partition_mass_gaps) if partition_mass_gaps else 0.0,
         "special_ids_in_suffix": sum(1 for t in suffix_ids if t in special_ids),
-        "dual_context_partition": True,
     }
 
 
@@ -787,63 +940,173 @@ def recover_bitstream(
     """
     Prompt-free recovery of bits embedded by ``generate_with_watermark``.
 
-    Replays ``token_ids`` from a BOS-only context (no original user prompt),
-    prefills the first ``burn_in_tokens`` ids in one forward (no bit extraction),
-    then rebuilds balanced partitions for the remaining tokens with
-    ``step_index = 0, 1, …``. Partition masks match generation's prompt-free
-    partition state. Returns ``(bits, tokens, mass_gaps)``.
+    Teacher-forces ``token_ids`` from a BOS-only context in **one** forward
+    (full prefill), then rebuilds balanced partitions for tokens after
+    ``burn_in_tokens`` with ``step_index = 0, 1, …``. Returns
+    ``(bits, tokens, mass_gaps)``.
+    """
+    results = recover_bitstreams_batched(
+        model,
+        tokenizer,
+        [token_ids],
+        device,
+        burn_in_tokens=burn_in_tokens,
+        generation_extra=generation_extra,
+    )
+    return results[0]
+
+
+def recover_bitstreams_batched(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    token_id_seqs: Sequence[Sequence[int]],
+    device: str = "cpu",
+    *,
+    burn_in_tokens: int = 100,
+    generation_extra: Dict[str, Any] | None = None,
+    batch_size: int | None = None,
+    on_batch_done: Any | None = None,
+) -> List[Tuple[List[int], List[int], List[float]]]:
+    """
+    Batched prompt-free recovery via full-prefill teacher forcing.
+
+    Each sequence is independent. Sequences may differ in length; the batch is
+    left-padded. ``burn_in_tokens`` is the scheme warm-up length (same for all).
     """
     if burn_in_tokens < 0:
         raise ValueError(f"burn_in_tokens must be >= 0, got {burn_in_tokens}")
 
-    ids = [int(t) for t in token_ids]
-    n = len(ids)
-    burn = min(int(burn_in_tokens), n)
-    if burn >= n:
-        return [], [], []
+    seqs = [[int(t) for t in seq] for seq in token_id_seqs]
+    n = len(seqs)
+    if n == 0:
+        return []
 
-    (
-        input_ids,
-        step_input_ids,
-        model_kwargs,
-        logits_processor,
-    ) = _init_prompt_free_decode_state(
+    if batch_size is None:
+        max_len = max((len(s) for s in seqs), default=1) + 1  # +BOS
+        bs = suggest_baseline_batch_size(
+            n,
+            max_new_tokens=0,
+            max_input_tokens=max_len,
+        )
+    else:
+        bs = max(1, min(n, int(batch_size)))
+
+    out: List[Tuple[List[int], List[int], List[float]]] = [
+        ([], [], []) for _ in range(n)
+    ]
+    i = 0
+    while i < n:
+        take = min(bs, n - i)
+        while True:
+            try:
+                chunk = _recover_bitstreams_batch(
+                    model,
+                    tokenizer,
+                    seqs[i : i + take],
+                    device,
+                    burn_in_tokens=burn_in_tokens,
+                    generation_extra=generation_extra,
+                )
+                break
+            except torch.cuda.OutOfMemoryError:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if take == 1:
+                    raise
+                take = max(1, take // 2)
+                bs = take
+        out[i : i + take] = chunk
+        if on_batch_done is not None:
+            on_batch_done(take)
+        i += take
+    return out
+
+
+def _recover_bitstreams_batch(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    seqs: List[List[int]],
+    device: str | torch.device,
+    *,
+    burn_in_tokens: int,
+    generation_extra: Dict[str, Any] | None,
+) -> List[Tuple[List[int], List[int], List[float]]]:
+    """One micro-batch full-prefill recover (left-padded)."""
+    dev = torch.device(device) if isinstance(device, str) else device
+    bos = _seed_token_id(tokenizer)
+    pad_id = _tokenizer_pad_token_id(tokenizer)
+    burn = int(burn_in_tokens)
+
+    # Empty / burn-only sequences: no payload bits.
+    results: List[Tuple[List[int], List[int], List[float]] | None] = [None] * len(seqs)
+    active_idx: List[int] = []
+    active_seqs: List[List[int]] = []
+    for i, ids in enumerate(seqs):
+        if min(burn, len(ids)) >= len(ids):
+            results[i] = ([], [], [])
+        else:
+            active_idx.append(i)
+            active_seqs.append(ids)
+
+    if not active_seqs:
+        return [r if r is not None else ([], [], []) for r in results]
+
+    # full_row = [PAD…] + [BOS] + ids
+    full_rows: List[List[int]] = [[bos] + ids for ids in active_seqs]
+    max_len = max(len(r) for r in full_rows)
+    input_rows: List[torch.Tensor] = []
+    attn_rows: List[torch.Tensor] = []
+    pad_lens: List[int] = []
+    for row in full_rows:
+        pad = max_len - len(row)
+        pad_lens.append(pad)
+        if pad > 0:
+            input_rows.append(
+                torch.tensor([pad_id] * pad + row, dtype=torch.long, device=dev)
+            )
+            attn_rows.append(
+                torch.tensor([0] * pad + [1] * len(row), dtype=torch.long, device=dev)
+            )
+        else:
+            input_rows.append(torch.tensor(row, dtype=torch.long, device=dev))
+            attn_rows.append(torch.ones(len(row), dtype=torch.long, device=dev))
+
+    input_ids = torch.stack(input_rows, dim=0)
+    attention_mask = torch.stack(attn_rows, dim=0)
+
+    # Logits processor from a BOS-only template (sampling config only).
+    seed_inputs = {
+        "input_ids": torch.tensor([[bos]], dtype=torch.long, device=dev),
+        "attention_mask": torch.ones((1, 1), dtype=torch.long, device=dev),
+    }
+    _, logits_processor = _prepare_sampling_logits_processor_bundle(
         model,
         tokenizer,
-        device,
-        decode_horizon=max(n, 1),
+        seed_inputs,
+        decode_horizon=max(max_len, 1),
         generation_extra=generation_extra,
     )
 
-    recovered_bits: List[int] = []
-    recovered_tokens: List[int] = []
-    mass_gaps: List[float] = []
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        all_logits = outputs.logits  # [B, T, V]
 
-    pending_logits: torch.Tensor | None = None
-    if burn > 0:
-        input_ids, step_input_ids, model_kwargs, pending_logits = _prefill_prompt_free_tokens(
-            model,
-            input_ids=input_ids,
-            model_kwargs=model_kwargs,
-            token_ids=ids[:burn],
-            device=device,
-        )
-
-    for t in range(burn, n):
-        with torch.no_grad():
-            if pending_logits is not None:
-                logits = pending_logits
-                pending_logits = None
-            else:
-                outputs = model(input_ids=step_input_ids, **model_kwargs)
-                logits = outputs.logits[0, -1, :]
-                model_kwargs["past_key_values"] = outputs.past_key_values
-            base_probs = _scores_to_next_token_probs(
-                logits, input_ids, logits_processor
-            )
-
+    for local_i, (ids, pad) in enumerate(zip(active_seqs, pad_lens)):
+        n = len(ids)
+        b = min(burn, n)
+        recovered_bits: List[int] = []
+        recovered_tokens: List[int] = []
+        mass_gaps: List[float] = []
+        for t in range(b, n):
+            # logits index after seeing BOS + ids[:t] in the unpadded full row.
+            # full = [BOS]+ids; position t is BOS+ids[:t] (length t+1); index = t.
+            # With left pad: index = pad + t.
+            logit_idx = pad + t
+            logits_t = all_logits[local_i, logit_idx, :]
+            prefix = torch.tensor([[bos] + ids[:t]], dtype=torch.long, device=dev)
+            base_probs = _scores_to_next_token_probs(logits_t, prefix, logits_processor)
             tid = int(ids[t])
-            bit_idx = t - burn
+            bit_idx = t - b
             mask_A = get_balanced_partition_from_probs(base_probs, bit_idx)
             mass_a, mass_b = balanced_partition_masses(base_probs, mask_A)
             mass_gaps.append(abs(mass_a - mass_b))
@@ -852,17 +1115,72 @@ def recover_bitstream(
             else:
                 recovered_bits.append(0 if bool(mask_A[tid].item()) else 1)
             recovered_tokens.append(tid)
+        results[active_idx[local_i]] = (recovered_bits, recovered_tokens, mass_gaps)
 
-        next_tok = torch.tensor([tid], dtype=input_ids.dtype, device=input_ids.device)
-        input_ids, step_input_ids = _append_generated_token(
-            input_ids=input_ids,
-            step_input_ids=step_input_ids,
-            next_token_id=next_tok,
-            model_kwargs=model_kwargs,
-            device=device,
-        )
+    return [r if r is not None else ([], [], []) for r in results]
 
-    return recovered_bits, recovered_tokens, mass_gaps
+
+def recover_bitstream_from_watermarked_text(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    text: str,
+    device: str = "cpu",
+    *,
+    burn_in_tokens: int,
+    n_channel_bits: int | None = None,
+    generation_extra: Dict[str, Any] | None = None,
+) -> Tuple[List[int], List[int], List[float]]:
+    """Integrity-preserving recovery: watermarked text + scheme params only.
+
+    Tokenizes ``text`` with no specials, treats the first ``burn_in_tokens`` as
+    warm-up, and extracts channel bits from the remainder (optionally truncated
+    to ``n_channel_bits``). Does **not** use generation metadata (char splits,
+    token ids, etc.).
+    """
+    bits_list = recover_bitstreams_from_watermarked_texts(
+        model,
+        tokenizer,
+        [text],
+        device,
+        burn_in_tokens=burn_in_tokens,
+        n_channel_bits=n_channel_bits,
+        generation_extra=generation_extra,
+    )
+    return bits_list[0]
+
+
+def recover_bitstreams_from_watermarked_texts(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    texts: Sequence[str],
+    device: str = "cpu",
+    *,
+    burn_in_tokens: int,
+    n_channel_bits: int | None = None,
+    generation_extra: Dict[str, Any] | None = None,
+    batch_size: int | None = None,
+    on_batch_done: Any | None = None,
+) -> List[Tuple[List[int], List[int], List[float]]]:
+    """Batched integrity-preserving recovery from watermarked texts only."""
+    if burn_in_tokens < 0:
+        raise ValueError(f"burn_in_tokens must be >= 0, got {burn_in_tokens}")
+    token_seqs: List[List[int]] = []
+    for text in texts:
+        ids = _tokenize_text_fragment(tokenizer, text)
+        if n_channel_bits is not None:
+            need = int(burn_in_tokens) + int(n_channel_bits)
+            ids = ids[:need]
+        token_seqs.append(ids)
+    return recover_bitstreams_batched(
+        model,
+        tokenizer,
+        token_seqs,
+        device,
+        burn_in_tokens=burn_in_tokens,
+        generation_extra=generation_extra,
+        batch_size=batch_size,
+        on_batch_done=on_batch_done,
+    )
 
 
 def recover_bitstream_from_text(
@@ -985,14 +1303,13 @@ def uncorrelated_bits_from_text(
 ) -> List[int]:
     """Deterministic pseudo-random bits for negative-control / text-only detect.
 
-    Decoys without ``generation_out`` / ``burn_in_char_len`` have no recoverable
-    channel; callers only need an uncorrelated bit string of length ``n_bits``
-    so PRC detection rejects.
+    Decoys without a recoverable channel need an uncorrelated bit string of
+    length ``n_bits`` so PRC detection rejects.
     """
+    del tokenizer  # API compat with callers that already have a tokenizer
     digest = hashlib.sha256(text.encode("utf-8")).digest()
     seed = int.from_bytes(digest[:8], "little")
     rng = random.Random(seed)
-    _ = tokenizer(text, add_special_tokens=False)
     return [rng.randint(0, 1) for _ in range(int(n_bits))]
 
 
@@ -1036,6 +1353,9 @@ __all__ = [
     "generate_baseline",
     "generate_baselines",
     "recover_bitstream",
+    "recover_bitstreams_batched",
+    "recover_bitstream_from_watermarked_text",
+    "recover_bitstreams_from_watermarked_texts",
     "recover_bitstream_from_text",
     "recover_bitstream_from_generation",
     "uncorrelated_bits_from_text",

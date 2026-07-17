@@ -56,18 +56,6 @@ class BerDiagConfig:
 
 
 @dataclass
-class PartitionErrorBreakdown:
-    """Mutually exclusive primary causes for text-recovery vs embedded channel mismatches."""
-
-    total_text_channel_errors: int
-    retokenization_mismatch: int
-    stochastic_p_roll: int
-    fallback_sampling: int
-    enforced_anomaly: int
-    stochastic_rolls_total: int
-    stochastic_rolls_wrong_half: int
-
-
 @dataclass
 class BerPromptDiagnostic:
     index: int
@@ -79,6 +67,7 @@ class BerPromptDiagnostic:
     channel_ber_from_ids: float
     channel_ber_from_text: float
     retokenization_extra_ber: float
+    retokenization_mismatch_count: int
     logical_ber: float
     attributes_match: bool
     cprf_seed_match: bool
@@ -89,12 +78,6 @@ class BerPromptDiagnostic:
     detect_oracle_key: bool
     detect_oracle_bits: bool
     detect_actual_master: bool
-    partition_masks_match: bool
-    channel_errors_at_generation: int
-    channel_errors_at_recovery: int
-    partition_error_breakdown: PartitionErrorBreakdown
-    mapping_mismatches: int
-    partition_cell_mismatches: int
     truncated_recovery: bool
     majority_vote_corrections: int
     majority_vote_regressions: int
@@ -223,59 +206,21 @@ def _bit_at(raw: Sequence[int], k: int) -> int | None:
     return int(raw[k])
 
 
-def _analyze_partition_error_causes(
+def _retokenization_mismatch_count(
     channel_bits: Sequence[int],
     raw_from_ids: Sequence[int],
     raw_from_text: Sequence[int],
-    channel_steps: Sequence[randrecover.WatermarkChannelStep],
-) -> PartitionErrorBreakdown:
-    """
-    Classify each text-recovery channel error by primary cause.
-
-    - ``retokenization_mismatch``: generation ids recover the embedded bit, but text does not
-    - ``stochastic_p_roll``: generation already wrong because the ``2q`` roll followed mass ``p``
-      instead of enforcing the secret bit
-    - ``fallback_sampling``: generation used unmasked full-vocab fallback sampling
-    - ``enforced_anomaly``: generation wrong despite enforcing the secret bit (unexpected)
-    """
-    steps_by_index = {s.bit_index: s for s in channel_steps}
-    retok = stochastic = fallback = anomaly = 0
-    stochastic_rolls_total = stochastic_rolls_wrong = 0
-
-    for s in channel_steps:
-        if not s.used_enforce_branch:
-            stochastic_rolls_total += 1
-            if s.bit_implied_by_token is not None and s.bit_implied_by_token != s.secret_bit:
-                stochastic_rolls_wrong += 1
-
-    text_errors = 0
+) -> int:
+    """Count channel positions where ids recovery is correct but text recovery is not."""
+    n = 0
     for k, embedded in enumerate(channel_bits):
         ids_bit = _bit_at(raw_from_ids, k)
         text_bit = _bit_at(raw_from_text, k)
         if text_bit is None or int(text_bit) == int(embedded):
             continue
-        text_errors += 1
-        ids_ok = ids_bit is not None and int(ids_bit) == int(embedded)
-        if ids_ok:
-            retok += 1
-            continue
-        step = steps_by_index.get(k)
-        if step is not None and step.used_fallback:
-            fallback += 1
-        elif step is not None and not step.used_enforce_branch:
-            stochastic += 1
-        else:
-            anomaly += 1
-
-    return PartitionErrorBreakdown(
-        total_text_channel_errors=text_errors,
-        retokenization_mismatch=retok,
-        stochastic_p_roll=stochastic,
-        fallback_sampling=fallback,
-        enforced_anomaly=anomaly,
-        stochastic_rolls_total=stochastic_rolls_total,
-        stochastic_rolls_wrong_half=stochastic_rolls_wrong,
-    )
+        if ids_bit is not None and int(ids_bit) == int(embedded):
+            n += 1
+    return n
 
 
 def diagnose_prompt(
@@ -308,7 +253,6 @@ def diagnose_prompt(
     raw_from_ids, _, _ = randrecover.recover_bitstream_from_generation(
         m, tok, out, device, prefer_text_split=False
     )
-    # Cascade-isolated text path: split at burn_in_char_len, tokenize parts independently.
     raw_from_text, _, _ = randrecover.recover_bitstream_from_text(
         m,
         tok,
@@ -320,31 +264,8 @@ def diagnose_prompt(
     logical_from_text = _logical_bits(
         raw_from_text, cfg.code_length, cfg.wm_bit_redundancy
     )
-
-    audit = None
-    audit_rows = []
-    gen_errs = rec_errs = map_mismatches = cell_mismatches = 0
-    if hasattr(randrecover, "audit_partition_replication_tokenwise"):
-        audit = randrecover.audit_partition_replication_tokenwise(out, tok, device, model=m)
-        audit_rows = list(audit.rows)
-        for row in audit_rows:
-            k = row.bit_index
-            if k < len(channel_bits):
-                emb = int(channel_bits[k])
-                if (
-                    row.bit_implied_by_generation_mask is not None
-                    and row.bit_implied_by_generation_mask != emb
-                ):
-                    gen_errs += 1
-                if row.bit_from_recovery_pipeline is not None and row.bit_from_recovery_pipeline != emb:
-                    rec_errs += 1
-            if row.mapping_entry_agrees_with_token_id is False:
-                map_mismatches += 1
-            cell_mismatches += row.num_vocab_cells_mismatched
-
-    channel_steps: list = list(out.get("channel_steps") or [])
-    partition_breakdown = _analyze_partition_error_causes(
-        channel_bits, raw_from_ids, raw_from_text, channel_steps
+    retok_mismatches = _retokenization_mismatch_count(
+        channel_bits, raw_from_ids, raw_from_text
     )
 
     vote_corr, vote_reg, tie_votes = _majority_vote_analysis(
@@ -376,29 +297,10 @@ def diagnose_prompt(
             f"Retokenization adds {ch_text - ch_ids:.1f}% channel BER "
             f"({ch_ids:.1f}% ids -> {ch_text:.1f}% text)"
         )
-    partitions_match = True
-    n_payload_tokens = len(raw_from_ids)
-    if audit is not None:
-        partitions_match = bool(audit.all_partitions_recreated)
-        n_payload_tokens = int(audit.num_payload_tokens)
-        if not partitions_match:
-            notes.append("Generation vs recovery partition masks differ (vocab dim mismatch?)")
-    if gen_errs > 0:
+    if retok_mismatches > 0:
         notes.append(
-            f"{gen_errs} tokens landed outside secret half at generation "
-            f"(p-roll={partition_breakdown.stochastic_p_roll}, "
-            f"fallback={partition_breakdown.fallback_sampling}, "
-            f"anomaly={partition_breakdown.enforced_anomaly})"
-        )
-    if partition_breakdown.retokenization_mismatch > 0:
-        notes.append(
-            f"{partition_breakdown.retokenization_mismatch} channel errors from retokenization "
+            f"{retok_mismatches} channel errors from retokenization "
             f"(ids recovery correct, text recovery wrong)"
-        )
-    if partition_breakdown.stochastic_rolls_total > 0:
-        notes.append(
-            f"{partition_breakdown.stochastic_rolls_total} generation steps used follow-mass roll "
-            f"({partition_breakdown.stochastic_rolls_wrong_half} landed on wrong half)"
         )
     if prefix_diff > 0:
         notes.append(f"{prefix_diff} prefix attribute coords differ (encode vs verify)")
@@ -417,10 +319,11 @@ def diagnose_prompt(
         n_channel_embedded=len(channel_bits),
         n_channel_from_ids=len(raw_from_ids),
         n_channel_from_text=len(raw_from_text),
-        n_payload_tokens=n_payload_tokens,
+        n_payload_tokens=len(raw_from_ids),
         channel_ber_from_ids=ch_ids,
         channel_ber_from_text=ch_text,
         retokenization_extra_ber=max(0.0, ch_text - ch_ids),
+        retokenization_mismatch_count=retok_mismatches,
         logical_ber=_ber_percent(secret, logical_from_text),
         attributes_match=encode_attributes == verify_attributes,
         cprf_seed_match=r_enc == r_ver,
@@ -431,12 +334,6 @@ def diagnose_prompt(
         detect_oracle_key=detect_oracle_key,
         detect_oracle_bits=detect_oracle_bits,
         detect_actual_master=bool(master_ok),
-        partition_masks_match=partitions_match,
-        channel_errors_at_generation=gen_errs,
-        channel_errors_at_recovery=rec_errs,
-        partition_error_breakdown=partition_breakdown,
-        mapping_mismatches=map_mismatches,
-        partition_cell_mismatches=cell_mismatches,
         truncated_recovery=len(raw_from_text) < len(channel_bits),
         majority_vote_corrections=vote_corr,
         majority_vote_regressions=vote_reg,
@@ -490,10 +387,8 @@ def _yn(ok: bool) -> str:
 def print_ber_diagnostics(
     summary: BerDiagnosticsSummary,
     *,
-    console: object | None = None,
     verbose: bool = False,
 ) -> None:
-    del console
     cfg = summary.config
 
     print()
@@ -521,48 +416,13 @@ def print_ber_diagnostics(
     print(f"  2. Logical PRC payload: {summary._avg('logical_ber'):.2f}%")
     print(f"  3. End-to-end (master path): {summary._avg('end_to_end_ber_master'):.2f}%")
 
-    print()
-    print("-- Partition error causes (text recovery vs embedded) --")
-    print(
-        f"  total text channel errors: "
-        f"{sum(r.partition_error_breakdown.total_text_channel_errors for r in summary.results)}"
-    )
-    print(
-        f"  retokenization mismatch (ids OK, text wrong): "
-        f"{sum(r.partition_error_breakdown.retokenization_mismatch for r in summary.results)}"
-    )
-    print(
-        f"  stochastic p-roll: "
-        f"{sum(r.partition_error_breakdown.stochastic_p_roll for r in summary.results)}"
-    )
-    print(
-        f"  fallback sampling: "
-        f"{sum(r.partition_error_breakdown.fallback_sampling for r in summary.results)}"
-    )
-    print(
-        f"  enforced anomaly: "
-        f"{sum(r.partition_error_breakdown.enforced_anomaly for r in summary.results)}"
-    )
-    print(
-        f"  follow-mass steps: "
-        f"{sum(r.partition_error_breakdown.stochastic_rolls_total for r in summary.results)}  "
-        f"wrong half: "
-        f"{sum(r.partition_error_breakdown.stochastic_rolls_wrong_half for r in summary.results)}"
-    )
-
+    n = summary.n or 1
     print()
     print("-- Error sources --")
-    n = summary.n or 1
     print(
-        f"  generation half-space misses: "
-        f"{sum(r.channel_errors_at_generation for r in summary.results)} tokens"
+        f"  retokenization mismatches (ids OK, text wrong): "
+        f"{sum(r.retokenization_mismatch_count for r in summary.results)}"
     )
-    print(
-        f"  recovery bit mismatches: "
-        f"{sum(r.channel_errors_at_recovery for r in summary.results)} tokens"
-    )
-    print(f"  retokenization mapping mismatches: {sum(r.mapping_mismatches for r in summary.results)}")
-    print(f"  partition mask cell mismatches: {sum(r.partition_cell_mismatches for r in summary.results)}")
     print(
         f"  truncated recovery: "
         f"{sum(1 for r in summary.results if r.truncated_recovery)}/{summary.n}"
@@ -590,9 +450,7 @@ def print_ber_diagnostics(
     )
 
     ber_rows: list[list[str]] = []
-    err_rows: list[list[str]] = []
     for r in summary.results:
-        pb = r.partition_error_breakdown
         ber_rows.append(
             [
                 str(r.index + 1),
@@ -601,36 +459,20 @@ def print_ber_diagnostics(
                 f"{r.channel_ber_from_text:.1f}",
                 f"{r.logical_ber:.1f}",
                 f"{r.end_to_end_ber_master:.1f}",
+                str(r.retokenization_mismatch_count),
                 _yn(r.attributes_match),
                 _yn(r.cprf_seed_match),
                 _yn(r.detect_oracle_key),
                 _yn(r.detect_actual_master),
             ]
         )
-        err_rows.append(
-            [
-                str(r.index + 1),
-                _prompt_preview(r.prompt, 36),
-                str(pb.stochastic_p_roll),
-                str(pb.retokenization_mismatch),
-                str(r.channel_errors_at_generation),
-                str(r.channel_errors_at_recovery),
-            ]
-        )
 
     benchmark_io.print_plain_table(
         title="Per-prompt BER and detect flags",
-        headers=["#", "prompt", "ch_ids", "ch_txt", "logic", "e2e", "attrs", "seed", "o_key", "actual"],
-        widths=[3, 36, 7, 7, 7, 7, 6, 5, 6, 7],
-        aligns=[">", "<", ">", ">", ">", ">", ">", ">", ">", ">"],
+        headers=["#", "prompt", "ch_ids", "ch_txt", "logic", "e2e", "retok", "attrs", "seed", "o_key", "actual"],
+        widths=[3, 36, 7, 7, 7, 7, 6, 6, 5, 6, 7],
+        aligns=[">", "<", ">", ">", ">", ">", ">", ">", ">", ">", ">"],
         rows=ber_rows,
-    )
-    benchmark_io.print_plain_table(
-        title="Per-prompt error counts",
-        headers=["#", "prompt", "p_roll", "retok", "gen_err", "rec_err"],
-        widths=[3, 36, 7, 7, 8, 8],
-        aligns=[">", "<", ">", ">", ">", ">"],
-        rows=err_rows,
     )
 
     flagged = [r for r in summary.results if r.notes]
@@ -654,7 +496,6 @@ def print_ber_diagnostics(
                 f"     logical[{len(r.logical_error_indices)}]: "
                 f"{r.logical_error_indices[:24]}"
             )
-
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Decompose watermark BER by error source.")

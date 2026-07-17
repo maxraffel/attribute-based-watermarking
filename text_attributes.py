@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Mapping, MutableMapping, Optional, Sequence, Set
+from typing import List, Mapping, MutableMapping, Optional, Sequence
 
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -113,12 +113,6 @@ def get_scorer() -> LabelScorer:
     return _default_scorer
 
 
-def configure_scorer(scorer: LabelScorer) -> None:
-    """Replace the default label scorer (e.g. for tests or alternate backends)."""
-    global _default_scorer
-    _default_scorer = scorer
-
-
 # --- CPRF vocabulary helpers ---
 
 
@@ -146,32 +140,6 @@ def active_labels_from_attributes(attributes: Sequence[int], modulus: int) -> Li
         if int(attributes[i]) % modulus == 0:
             out.append(w)
     return out
-
-
-def pick_unrelated_keyword_for_policy(
-    attributes: Sequence[int],
-    modulus: int,
-    exclude: Set[str] | Sequence[str],
-) -> str:
-    """Pick one vocabulary label not in ``exclude`` for a negative single-label policy test."""
-    ex = {e.casefold() for e in exclude}
-    xd = [int(v) % modulus for v in attributes]
-    for i, w in enumerate(VOCABULARY):
-        if w.casefold() in ex:
-            continue
-        if i < len(xd) and xd[i] != 0:
-            return w
-    for w in VOCABULARY:
-        if w.casefold() in ex:
-            continue
-        f = f_for_required_keywords([w])
-        dot = sum(f[j] * xd[j] for j in range(min(len(f), len(xd)))) % modulus
-        if dot != 0:
-            return w
-    for w in VOCABULARY:
-        if w.casefold() not in ex:
-            return w
-    return VOCABULARY[-1]
 
 
 # --- score → attribute vector ---
@@ -209,49 +177,6 @@ def format_label_scores_table(
         yn = "yes" if i < len(active) and active[i] else "no"
         lines.append(f"{row_indent}{lab:<{col_w}}  {s:>7.4f}  {yn}")
     return "\n".join(lines)
-
-
-def format_paired_label_scores_table(
-    baseline: Mapping[str, float],
-    watermarked: Mapping[str, float],
-    *,
-    cutoff: float,
-    row_indent: str = "  ",
-) -> str:
-    labels = list(VOCABULARY)
-    col_w = max(len(lab) for lab in labels) if labels else 8
-    col_w = max(col_w, 10)
-    b_act = _active_mask_from_scores(baseline, cutoff)
-    w_act = _active_mask_from_scores(watermarked, cutoff)
-    lines = [
-        f"{row_indent}{'label':<{col_w}}  {'baseline':>8}  {'wm':>8}  {'Δ':>8}  {'b':>3}  {'w':>3}",
-        f"{row_indent}{'-' * col_w}  {'-' * 8}  {'-' * 8}  {'-' * 8}  {'-' * 3}  {'-' * 3}",
-    ]
-    for i, lab in enumerate(labels):
-        sb = float(baseline.get(lab, 0.0))
-        sw = float(watermarked.get(lab, 0.0))
-        delta = sw - sb
-        b_y = "y" if i < len(b_act) and b_act[i] else "n"
-        w_y = "y" if i < len(w_act) and w_act[i] else "n"
-        lines.append(
-            f"{row_indent}{lab:<{col_w}}  {sb:>8.4f}  {sw:>8.4f}  {delta:+8.4f}  {b_y:>3}  {w_y:>3}"
-        )
-    return "\n".join(lines)
-
-
-def log_paired_label_scores(
-    *,
-    baseline: Mapping[str, float],
-    watermarked: Mapping[str, float],
-    score_cutoff: float | None = None,
-) -> None:
-    cutoff = SCORE_CUTOFF if score_cutoff is None else score_cutoff
-    logger.info(
-        "Label scores — baseline vs watermarked (classifier=%s; cutoff=%g; b/w = active y/n)\n%s",
-        get_scorer().model_id,
-        cutoff,
-        format_paired_label_scores_table(baseline, watermarked, cutoff=cutoff),
-    )
 
 
 def _fixed_tail(n: int, modulus: int) -> List[int]:

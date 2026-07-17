@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import shutil
 import statistics
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence, TypeVar
+from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar
 
 from rich.console import Console
 from rich.progress import (
@@ -152,20 +152,6 @@ def in_notebook() -> bool:
         return False
 
 
-def use_plain_benchmark_tables() -> bool:
-    """
-    Plain fixed-width tables for benchmark summaries (default on).
-
-    Rich ``Table`` output ellipsizes cells when many columns are present; plain tables
-    stay readable in terminals and notebooks. Set ``BENCHMARK_PLAIN_TABLE=0`` to opt in
-    to Rich tables (not recommended).
-    """
-    v = os.environ.get("BENCHMARK_PLAIN_TABLE", "").strip().lower()
-    if v in ("0", "false", "no", "never"):
-        return False
-    return True
-
-
 def print_plain_table(
     *,
     title: str | None,
@@ -205,9 +191,8 @@ def require_prc_extension() -> None:
         return
     raise RuntimeError(
         "PRC native extension is not installed (imported prc has no set_code_length). "
-        "Build it with:\n"
-        "  uv sync --extra dev\n"
-        "  uv run maturin develop --release -m prc/Cargo.toml"
+        "Install/build it with:\n"
+        "  uv sync"
     )
 
 
@@ -239,7 +224,7 @@ def iter_with_progress(
     description: str,
     disable: bool = False,
 ) -> Iterator[T]:
-    """Iterate benchmark trials with elapsed + ETA columns sized to the real terminal."""
+    """Iterate items with elapsed + ETA columns sized to the real terminal."""
     if disable:
         yield from items
         return
@@ -261,6 +246,67 @@ def iter_with_progress(
         for item in items:
             yield item
             progress.advance(task_id)
+
+
+@dataclass
+class ProgressHandle:
+    """Long-lived progress control for sweeps that span many protocol trials."""
+
+    _advance: Callable[[int], None]
+    _set_description: Callable[[str], None]
+
+    def advance(self, n: int = 1) -> None:
+        self._advance(int(n))
+
+    def set_description(self, description: str) -> None:
+        self._set_description(str(description))
+
+
+@contextmanager
+def progress_task(
+    description: str,
+    total: int,
+    *,
+    disable: bool = False,
+) -> Iterator[ProgressHandle]:
+    """Context manager for a single progress bar updated across nested work."""
+    if disable or total <= 0:
+        yield ProgressHandle(_advance=lambda _n: None, _set_description=lambda _s: None)
+        return
+
+    progress_console = make_progress_console()
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=32),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(compact=True, elapsed_when_finished=False),
+        console=progress_console,
+        transient=True,
+        refresh_per_second=10,
+        expand=False,
+    ) as progress:
+        task_id = progress.add_task(description, total=int(total))
+
+        def _advance(n: int) -> None:
+            progress.advance(task_id, n)
+
+        def _set_description(text: str) -> None:
+            progress.update(task_id, description=text)
+
+        yield ProgressHandle(_advance=_advance, _set_description=_set_description)
+
+
+def resolve_show_progress(*, quiet: bool, show_progress: bool | None) -> bool:
+    """Trial progress defaults to on; ``quiet`` only suppresses tables/logs.
+
+    Pass ``show_progress=False`` to disable bars (e.g. nested under a parent bar).
+    """
+    del quiet  # intentional: progress is independent of table quietness
+    if show_progress is None:
+        return True
+    return bool(show_progress)
 
 
 def baseline_max_new_tokens() -> int:
@@ -411,7 +457,6 @@ def save_policy_summary(
     summary: Any,
     exit_code: int,
     runs: int,
-    fresh_key_per_trial: bool,
     llm_model_id: str | None = None,
 ) -> Path:
     roll = {sid: _rollup_to_dict(r) for sid, r in summary.roll.items()}
@@ -440,7 +485,6 @@ def save_policy_summary(
                 "code_length": summary.code_length,
                 "wm_bit_redundancy": summary.wm_bit_redundancy,
                 "runs_per_prompt": int(runs),
-                "fresh_key_per_trial": bool(fresh_key_per_trial),
             },
             "runtime": runtime_metadata(llm_model_id=llm_model_id),
             "prompt_cases": prompt_cases_to_json(summary.prompt_cases),
@@ -639,8 +683,6 @@ def save_ber_diagnostics(
 ) -> Path:
     cfg = asdict(summary.config)
     results = [asdict(r) for r in summary.results]
-    for row in results:
-        row["partition_error_breakdown"] = asdict(row["partition_error_breakdown"])
 
     ber_keys = (
         "channel_ber_from_ids",

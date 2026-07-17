@@ -199,9 +199,7 @@ def main() -> int:
     wm_text = out["generated_text_wm"]
     encode_attributes: List[int] = list(out["attributes"])
     secret: List[int] = list(out["prc_secret_bits"])
-    sacrificed_bits = int(out.get("sacrificed_bits", 0))
     natural_partition_choices = int(out.get("natural_partition_choices", 0))
-    recovery_stalls = int(out.get("recovery_stalls", 0))
     retok_replacements = int(out.get("retok_replacements", 0))
     recovery_ids_aligned = bool(out.get("recovery_ids_aligned", False))
     t_bl = float(out["seconds_baseline_gen"])
@@ -212,8 +210,8 @@ def main() -> int:
     c.print(
         f"  [dim]generate[/] baseline={t_bl:.3f}s  watermarked={t_wm:.3f}s  "
         f"PRC payload={len(secret)} logical bits  "
-        f"sacrificed_bits={sacrificed_bits}  natural_partition={natural_partition_choices}  "
-        f"recovery_stalls={recovery_stalls}  retok_replacements={retok_replacements}  "
+        f"natural_partition={natural_partition_choices}  "
+        f"retok_replacements={retok_replacements}  "
         f"recovery_ids_aligned={'yes' if recovery_ids_aligned else 'no'}"
     )
 
@@ -263,13 +261,12 @@ def main() -> int:
     det_table.add_column("expect", justify="center")
     det_table.add_column("got", justify="center")
     det_table.add_column("BER%", justify="right")
-    det_table.add_column("sacrificed", justify="right")
     det_table.add_column("natural_part", justify="right")
     det_table.add_column("time", justify="right")
     det_table.add_column("check", justify="center")
 
     t0 = time.perf_counter()
-    recovered_wm = wm.recover_channel_bits(wm_text, generation_out=out)
+    recovered_wm = wm.recover_channel_bits(wm_text)
     t_recover = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -283,7 +280,6 @@ def main() -> int:
         "True",
         "True" if m_ok else "False",
         f"{ber:.2f}",
-        str(sacrificed_bits),
         str(natural_partition_choices),
         f"{t_recover + t_m:.3f}s",
         _pass_cell(m_ok),
@@ -298,7 +294,6 @@ def main() -> int:
         "—",
         "True",
         "True" if u_ok else "False",
-        "—",
         "—",
         "—",
         f"{t_u:.3f}s",
@@ -320,7 +315,6 @@ def main() -> int:
             "True" if w_ok else "False",
             "—",
             "—",
-            "—",
             f"{t_w:.3f}s",
             _pass_cell(w_ok == expect_ok),
         )
@@ -334,7 +328,9 @@ def main() -> int:
         model=m,
     )
     t0 = time.perf_counter()
-    recovered_neg = wm.recover_channel_bits(wrong)
+    recovered_neg = randrecover.uncorrelated_bits_from_text(
+        wrong, tok, n_bits=wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY
+    )
     neg_ok, _ = wm.master_detect(sk, wrong, recovered_bits=recovered_neg)
     t_neg = time.perf_counter() - t0
     neg_pass = not bool(neg_ok)
@@ -345,7 +341,6 @@ def main() -> int:
         "—",
         "False",
         "True" if neg_ok else "False",
-        "—",
         "—",
         "—",
         f"{t_neg:.3f}s",

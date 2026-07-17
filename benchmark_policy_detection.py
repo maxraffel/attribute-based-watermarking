@@ -1,25 +1,30 @@
-﻿"""
-Policy-detection benchmark: same end-to-end flow as ``app.py`` (generate ΓåÆ verify ``derive_attributes`` ΓåÆ
-issue unconstrained + one constrained key per closed-vocabulary label ΓåÆ CPRF seed checks ΓåÆ
-``master_detect`` / ``detect`` on good transcript ΓåÆ negative-control ``master_detect`` on decoy).
+"""
+Policy-detection benchmark: same end-to-end flow as ``app.py`` (generate → verify
+``derive_attributes`` → issue unconstrained + one constrained key per closed-vocabulary
+label → CPRF seed checks → ``master_detect`` / ``detect`` on good transcript →
+negative-control ``master_detect`` on decoy).
 
-Runs many trials over configurable prompts and code length with a Rich **progress bar** (transient).
-Per-trial logging is minimal; results are **aggregated into tables**: per-prompt TPR/FNR/TNR/FPR for
-policy ``detect`` vs recovered active-label expectation, counts of which protocol stages matched;
-**the same policy table** computed only on runs where encode-time ``attributes`` equals verify-time
-``derive_attributes`` (full vector); then mean wall time per pipeline stage.
+Runs many trials over configurable prompts and code length with a Rich progress bar
+(transient). Per-trial logging is minimal; results are aggregated into plain tables:
+per-prompt TPR/FNR/TNR/FPR for policy ``detect`` vs recovered active-label expectation,
+counts of which protocol stages matched; the same policy table computed only on runs
+where encode-time ``attributes`` equals verify-time ``derive_attributes`` (full vector);
+then mean wall time per pipeline stage.
 
-CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--reuse-key``, ``--wm-bit-redundancy``,
+CLI: ``--code-length``, ``--runs``, ``--modulus``, ``--wm-bit-redundancy``,
 ``--torch-compile``, optional ``--llm-model``, repeatable ``--prompt-case id:prompt``.
 
-``run_benchmark_label_conditioned_matrix`` builds a ``|V| ├ù |V|`` matrix (columns = verify-time attributed
-labels); ``run_benchmark_prompt_conditioned_matrix`` builds ``|V| ├ù |P|`` (columns = benchmark prompt ids).
-For notebooks / plotting: ``run_benchmark_with_summary(..., quiet=True)``
-returns a ``BenchmarkRunSummary``;
-``micro_fpr`` / ``micro_tpr`` pool per-label policy FPR/TPR; ``micro_fpr_wilson`` / ``micro_tpr_wilson``
-add Wilson score ~95 percent intervals on those pooled proportions; ``wilson_score_interval`` applies likewise to Monte Carlo
-rates; ``prc_random_detect_positive_rate`` estimates PRC ``detect`` acceptance on random bits against a random
-PRC key (same spirit as ``testing.py``).
+``run_benchmark_label_conditioned_matrix`` builds a ``|V| x |V|`` matrix (columns =
+verify-time attributed labels); ``run_benchmark_prompt_conditioned_matrix`` builds
+``|V| x |P|`` (columns = benchmark prompt ids). For notebooks / plotting:
+``run_benchmark_with_summary(..., quiet=True)`` returns a ``BenchmarkRunSummary`` with
+tables suppressed but a per-trial progress bar still shown (pass ``show_progress=False``
+to hide it).
+
+``micro_fpr_wilson`` / ``micro_tpr_wilson`` add Wilson score ~95% intervals on pooled
+policy FPR/TPR; ``wilson_score_interval`` applies likewise to Monte Carlo rates;
+``prc_random_detect_positive_rate`` estimates PRC ``detect`` acceptance on random bits
+against a random PRC key (same spirit as ``testing.py``).
 """
 
 from __future__ import annotations
@@ -33,7 +38,6 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from rich.console import Console
-from rich.table import Table
 
 import benchmark_io
 import text_attributes
@@ -69,10 +73,6 @@ def _configure_benchmark(
         model.configure(**kwargs)
 
 
-def _use_plain_table() -> bool:
-    return benchmark_io.use_plain_benchmark_tables()
-
-
 DEFAULT_PROMPT_CASES: list[tuple[str, str]] = [
     (
         "medicine_stem_cell",
@@ -99,10 +99,6 @@ DEFAULT_PROMPT_CASES: list[tuple[str, str]] = [
         "medicine_software_practice",
         "Explain how software has transformed the practice of medicine."),
 ]
-
-# Alias kept for notebook cells that import this name explicitly.
-COMPREHENSIVE_PROMPT_CASES: list[tuple[str, str]] = DEFAULT_PROMPT_CASES
-
 
 
 def parse_prompt_case(spec: str) -> tuple[str, str]:
@@ -330,7 +326,7 @@ class PromptConditionedDetectionMatrix:
 def sum_confusion_counts(
     roll: dict[str, PromptRollup],
     prompt_cases: Sequence[tuple[str, str]]) -> tuple[int, int, int, int]:
-    """Sum TP/FN/TN/FP over every prompt id (micro pool over runs ├ù labels)."""
+    """Sum TP/FN/TN/FP over every prompt id (micro pool over runs × labels)."""
     tp = fn = tn = fp = 0
     for sid, _ in prompt_cases:
         r = roll[sid]
@@ -339,22 +335,6 @@ def sum_confusion_counts(
         tn += r.tn
         fp += r.fp
     return tp, fn, tn, fp
-
-
-def micro_fpr(
-    roll: dict[str, PromptRollup],
-    prompt_cases: Sequence[tuple[str, str]]) -> float:
-    """Micro-averaged false positive rate for policy ``detect`` vs active-label gold."""
-    tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
-    return _rates(tp, fn, tn, fp)[3]
-
-
-def micro_tpr(
-    roll: dict[str, PromptRollup],
-    prompt_cases: Sequence[tuple[str, str]]) -> float:
-    """Micro-averaged true positive rate for policy ``detect`` vs active-label gold."""
-    tp, fn, tn, fp = sum_confusion_counts(roll, prompt_cases)
-    return _rates(tp, fn, tn, fp)[0]
 
 
 def wilson_score_interval(
@@ -438,12 +418,13 @@ def run_benchmark_label_conditioned_matrix(
     runs: int,
     modulus: int,
     code_length: int,
-    fresh_key_per_trial: bool,
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
     burn_in_tokens: int = 100,
     quiet: bool = False,
+    show_progress: bool | None = None,
+    trial_progress: benchmark_io.ProgressHandle | None = None,
     torch_compile: bool | None = None,
 ) -> tuple[int, LabelConditionedDetectionMatrix]:
     """
@@ -464,6 +445,10 @@ def run_benchmark_label_conditioned_matrix(
     if wm_bit_redundancy < 1:
         raise ValueError("wm_bit_redundancy must be >= 1")
 
+    progress_on = benchmark_io.resolve_show_progress(
+        quiet=quiet, show_progress=show_progress
+    )
+
     _configure_benchmark(
         code_length=code_length,
         wm_bit_redundancy=wm_bit_redundancy,
@@ -478,7 +463,6 @@ def run_benchmark_label_conditioned_matrix(
     denominators: dict[str, dict[str, int]] = {
         r: {c: 0 for c in vocab} for r in vocab
     }
-    sk_shared: dict[str, Any] = {}
     sid_runs: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
     sid_master: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
     sid_open: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
@@ -490,42 +474,53 @@ def run_benchmark_label_conditioned_matrix(
             f"matrix benchmark  code_length={wm.SECURITY_PARAM}  "
             f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
             f"modulus={modulus}  runs={runs}  |V|={len(vocab)}  "
-            f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
+            f"keys=fresh per trial  "
             f"llm={model.MODEL_ID!r}"
         )
 
-    trials, pregen = _prepare_trials_with_baselines(prompt_cases, runs, quiet=quiet)
+    trials, pregen = _prepare_trials_with_baselines(
+        prompt_cases,
+        runs,
+        show_baseline_progress=progress_on and trial_progress is None,
+    )
     amortized = pregen.amortized_seconds
+    generated: list[_GeneratedTrial] = []
     for (_, sid, prompt), baseline in zip(
         benchmark_io.iter_with_progress(
             trials,
-            description="Benchmark matrix",
-            disable=quiet),
+            description="Benchmark matrix generate",
+            disable=not progress_on or trial_progress is not None,
+        ),
         pregen.texts,
     ):
-        if fresh_key_per_trial:
-            sk = wm.setup(modulus)
-        else:
-            if sk_shared.get(sid) is None:
-                sk_shared[sid] = wm.setup(modulus)
-            sk = sk_shared[sid]
-
-        (
-            word_stats,
-            _attributes_match,
-            master_ok,
-            open_ok,
-            _cprf_label_ok,
-            _cprf_label_n,
-            control_ok,
-            _ber,
-            _tt_inner,
-            em_open_m) = run_one_trial(
-            sk,
-            prompt,
-            baseline_text=baseline,
-            baseline_gen_seconds=amortized,
+        sk = wm.setup(modulus)
+        generated.append(
+            _generate_trial(
+                sk,
+                prompt,
+                baseline_text=baseline,
+                baseline_gen_seconds=amortized,
+            )
         )
+
+    scored = _score_protocol_trials_batched(
+        generated,
+        show_progress=progress_on,
+        trial_progress=trial_progress,
+        description="Benchmark matrix",
+    )
+    for ((_, sid, _prompt), _baseline), (
+        word_stats,
+        _attributes_match,
+        master_ok,
+        open_ok,
+        _cprf_label_ok,
+        _cprf_label_n,
+        control_ok,
+        _ber,
+        _tt_inner,
+        em_open_m,
+    ) in zip(zip(trials, pregen.texts), scored):
         sid_runs[sid] += 1
         if master_ok:
             sid_master[sid] += 1
@@ -597,12 +592,13 @@ def run_benchmark_prompt_conditioned_matrix(
     runs: int,
     modulus: int,
     code_length: int,
-    fresh_key_per_trial: bool,
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
     burn_in_tokens: int = 100,
     quiet: bool = False,
+    show_progress: bool | None = None,
+    trial_progress: benchmark_io.ProgressHandle | None = None,
     torch_compile: bool | None = None,
 ) -> tuple[int, PromptConditionedDetectionMatrix]:
     """
@@ -627,6 +623,10 @@ def run_benchmark_prompt_conditioned_matrix(
     if wm_bit_redundancy < 1:
         raise ValueError("wm_bit_redundancy must be >= 1")
 
+    progress_on = benchmark_io.resolve_show_progress(
+        quiet=quiet, show_progress=show_progress
+    )
+
     _configure_benchmark(
         code_length=code_length,
         wm_bit_redundancy=wm_bit_redundancy,
@@ -640,7 +640,6 @@ def run_benchmark_prompt_conditioned_matrix(
     denominators: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
     numerators_attributes_match: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
     denominators_attributes_match: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
-    sk_shared: dict[str, Any] = {}
     sid_runs: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
     sid_master: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
     sid_open: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
@@ -652,42 +651,53 @@ def run_benchmark_prompt_conditioned_matrix(
             f"prompt-matrix benchmark  code_length={wm.SECURITY_PARAM}  "
             f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
             f"modulus={modulus}  runs={runs}  |V|={len(vocab)}  "
-            f"|P|={len(col_ids)}  keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
+            f"|P|={len(col_ids)}  keys=fresh per trial  "
             f"llm={model.MODEL_ID!r}"
         )
 
-    trials, pregen = _prepare_trials_with_baselines(prompt_cases, runs, quiet=quiet)
+    trials, pregen = _prepare_trials_with_baselines(
+        prompt_cases,
+        runs,
+        show_baseline_progress=progress_on and trial_progress is None,
+    )
     amortized = pregen.amortized_seconds
+    generated: list[_GeneratedTrial] = []
     for (_, sid, prompt), baseline in zip(
         benchmark_io.iter_with_progress(
             trials,
-            description="Benchmark prompt matrix",
-            disable=quiet),
+            description="Benchmark prompt matrix generate",
+            disable=not progress_on or trial_progress is not None,
+        ),
         pregen.texts,
     ):
-        if fresh_key_per_trial:
-            sk = wm.setup(modulus)
-        else:
-            if sk_shared.get(sid) is None:
-                sk_shared[sid] = wm.setup(modulus)
-            sk = sk_shared[sid]
-
-        (
-            word_stats,
-            attributes_match,
-            master_ok,
-            open_ok,
-            _cprf_label_ok,
-            _cprf_label_n,
-            control_ok,
-            _ber,
-            _tt_inner,
-            em_open_m) = run_one_trial(
-            sk,
-            prompt,
-            baseline_text=baseline,
-            baseline_gen_seconds=amortized,
+        sk = wm.setup(modulus)
+        generated.append(
+            _generate_trial(
+                sk,
+                prompt,
+                baseline_text=baseline,
+                baseline_gen_seconds=amortized,
+            )
         )
+
+    scored = _score_protocol_trials_batched(
+        generated,
+        show_progress=progress_on,
+        trial_progress=trial_progress,
+        description="Benchmark prompt matrix",
+    )
+    for ((_, sid, _prompt), _baseline), (
+        word_stats,
+        attributes_match,
+        master_ok,
+        open_ok,
+        _cprf_label_ok,
+        _cprf_label_n,
+        control_ok,
+        _ber,
+        _tt_inner,
+        em_open_m,
+    ) in zip(zip(trials, pregen.texts), scored):
         sid_runs[sid] += 1
         if master_ok:
             sid_master[sid] += 1
@@ -775,13 +785,13 @@ def _prepare_trials_with_baselines(
     prompt_cases: Sequence[tuple[str, str]],
     runs: int,
     *,
-    quiet: bool,
+    show_baseline_progress: bool,
 ) -> tuple[list[tuple[int, str, str]], benchmark_io.BaselinePregenResult]:
     """Build the trial grid and pregenerate one baseline per trial (order-matched)."""
     trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
     pregen = benchmark_io.pregenerate_baselines(
         [prompt for _, _, prompt in trials],
-        quiet=quiet,
+        quiet=not show_baseline_progress,
         description="Baselines",
     )
     if len(pregen.texts) != len(trials):
@@ -791,12 +801,51 @@ def _prepare_trials_with_baselines(
     return trials, pregen
 
 
-def run_one_trial(
+@dataclass
+class _GeneratedTrial:
+    """WM generation payload for integrity-preserving (text + scheme) recovery."""
+
+    sk: Any
+    wm_text: str
+    encode_attributes: list[Any]
+    secret: list[int]
+    tt: TimingTotals
+
+
+def _generate_trial(
     sk: Any,
     prompt: str,
     *,
     baseline_text: str | None = None,
     baseline_gen_seconds: float | None = None,
+) -> _GeneratedTrial:
+    tt = TimingTotals()
+    out = wm.generate(sk, prompt, baseline_text=baseline_text)
+    # Drop privileged generation metadata; recovery sees text + scheme only.
+    wm_text = str(out["generated_text_wm"])
+    encode_attributes = list(out["attributes"])
+    secret = list(out["prc_secret_bits"])
+    if baseline_gen_seconds is not None:
+        t_baseline = float(baseline_gen_seconds)
+    else:
+        t_baseline = float(out["seconds_baseline_gen"])
+    tt.t_baseline_gen = t_baseline
+    tt.t_wm_gen = float(out["seconds_watermarked_gen"])
+    del out
+    return _GeneratedTrial(
+        sk=sk,
+        wm_text=wm_text,
+        encode_attributes=encode_attributes,
+        secret=secret,
+        tt=tt,
+    )
+
+
+def _score_generated_trial(
+    generated: _GeneratedTrial,
+    recovered_bits: Sequence[int],
+    *,
+    recover_seconds: float = 0.0,
 ) -> tuple[
     list[dict[str, Any]],
     bool,
@@ -809,26 +858,13 @@ def run_one_trial(
     TimingTotals,
     bool,
 ]:
-    """
-    One full app.py-shaped trial. Returns word-level rows, flags, CPRF sub-counts, BER, timings,
-    and whether unconstrained CPRF seeds matched.
-
-    Pass ``baseline_text`` from ``benchmark_io.pregenerate_baselines`` so trials share a
-    batched baseline phase. ``baseline_gen_seconds`` amortizes that phase into timings.
-    """
-    tt = TimingTotals()
-
-    out = wm.generate(sk, prompt, baseline_text=baseline_text)
-    wm_text = out["generated_text_wm"]
-    encode_attributes = list(out["attributes"])
-    secret = list(out["prc_secret_bits"])
-    if baseline_gen_seconds is not None:
-        t_baseline = float(baseline_gen_seconds)
-    else:
-        t_baseline = float(out["seconds_baseline_gen"])
-    t_wm = float(out["seconds_watermarked_gen"])
-    tt.t_baseline_gen = t_baseline
-    tt.t_wm_gen = t_wm
+    """Detect / CPRF / negative-control scoring for one generated trial."""
+    sk = generated.sk
+    wm_text = generated.wm_text
+    encode_attributes = generated.encode_attributes
+    secret = generated.secret
+    tt = generated.tt
+    recovered_wm = list(recovered_bits)
 
     t_d0 = time.perf_counter()
     verify_attributes = derive_verify_attributes(wm_text, sk.modulus)
@@ -861,9 +897,8 @@ def run_one_trial(
     tt.t_cprf_checks = time.perf_counter() - t_c0
 
     t_m0 = time.perf_counter()
-    recovered_wm = wm.recover_channel_bits(wm_text, generation_out=out)
     m_ok, m_bits = wm.master_detect(sk, wm_text, recovered_bits=recovered_wm)
-    tt.t_master_good = time.perf_counter() - t_m0
+    tt.t_master_good = (time.perf_counter() - t_m0) + float(recover_seconds)
     ber = _ber_percent(secret, m_bits)
 
     t_u0 = time.perf_counter()
@@ -887,14 +922,18 @@ def run_one_trial(
     tt.t_detect_per_label = time.perf_counter() - t_pv0
 
     t_nc0 = time.perf_counter()
-    m, tok, device = model.load()
+    _m, tok, device = model.load()
     wrong = randrecover.negative_control_transcript_like(
         wm_text,
         tok,
         device,
         n_bits=wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY,
-        model=m)
-    recovered_neg = wm.recover_channel_bits(wrong)
+        model=_m,
+    )
+    # Decoy has no watermark channel; scheme-length uncorrelated bits.
+    recovered_neg = randrecover.uncorrelated_bits_from_text(
+        wrong, tok, n_bits=wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY
+    )
     ctrl_ok_raw, _ = wm.master_detect(sk, wrong, recovered_bits=recovered_neg)
     control_ok = not bool(ctrl_ok_raw)
     tt.t_negative_control = time.perf_counter() - t_nc0
@@ -909,7 +948,77 @@ def run_one_trial(
         control_ok,
         ber,
         tt,
-        em_open_m)
+        em_open_m,
+    )
+
+
+def _score_protocol_trials_batched(
+    generated: Sequence[_GeneratedTrial],
+    *,
+    show_progress: bool,
+    trial_progress: benchmark_io.ProgressHandle | None,
+    description: str,
+) -> list[
+    tuple[
+        list[dict[str, Any]],
+        bool,
+        bool,
+        bool,
+        int,
+        int,
+        bool,
+        float,
+        TimingTotals,
+        bool,
+    ]
+]:
+    """Batch integrity recovery over generated texts, then score each trial."""
+    texts = [g.wm_text for g in generated]
+    n = len(texts)
+    if n == 0:
+        return []
+
+    recover_disable = (not show_progress) or (trial_progress is not None)
+    t0 = time.perf_counter()
+    with benchmark_io.progress_task(
+        f"{description} recover",
+        n,
+        disable=recover_disable,
+    ) as recover_bar:
+        bits_list = wm.recover_channel_bits_batch(
+            texts, on_batch_done=lambda k: recover_bar.advance(k)
+        )
+    recover_wall = time.perf_counter() - t0
+    amortize = recover_wall / n
+
+    scored: list[
+        tuple[
+            list[dict[str, Any]],
+            bool,
+            bool,
+            bool,
+            int,
+            int,
+            bool,
+            float,
+            TimingTotals,
+            bool,
+        ]
+    ] = []
+    for g, bits in zip(
+        benchmark_io.iter_with_progress(
+            list(generated),
+            description=f"{description} score",
+            disable=not show_progress or trial_progress is not None,
+        ),
+        bits_list,
+    ):
+        scored.append(
+            _score_generated_trial(g, bits, recover_seconds=amortize)
+        )
+        if trial_progress is not None:
+            trial_progress.advance(1)
+    return scored
 
 
 def _mean_timings(r: PromptRollup) -> dict[str, float]:
@@ -1009,63 +1118,6 @@ def _print_timing_table_plain(
     print(f"Sum of all listed stage means (per run): {gm['t_grand_avg']:.4f} s")
 
 
-def _print_timing_rich_table(
-    roll: dict[str, PromptRollup],
-    prompt_cases: Sequence[tuple[str, str]],
-    console: Console) -> None:
-    console.print()
-    table = Table(
-        title="Mean wall time per pipeline stage (s; avg over runs)",
-        expand=True)
-    table.add_column("prompt_id", style="dim", min_width=18, overflow="fold")
-    for col in (
-        "setup",
-        "baseline",
-        "wm_gen",
-        "derive_attributes",
-        "issue_keys",
-        "cprf",
-        "m_good",
-        "det_open",
-        "det_vocab",
-        "neg_ctrl"):
-        table.add_column(col, justify="right", min_width=8, no_wrap=True, overflow="fold")
-
-    for sid, _ in prompt_cases:
-        r = roll[sid]
-        if r.runs == 0:
-            continue
-        m = _mean_timings(r)
-        table.add_row(
-            sid,
-            f"{m.get('t_setup', 0):.4f}",
-            f"{m['t_baseline_gen']:.4f}",
-            f"{m['t_wm_gen']:.4f}",
-            f"{m['t_derive_attributes']:.4f}",
-            f"{m['t_issue_keys']:.4f}",
-            f"{m['t_cprf_checks']:.4f}",
-            f"{m['t_master_good']:.4f}",
-            f"{m['t_detect_open']:.4f}",
-            f"{m['t_detect_per_label']:.4f}",
-            f"{m['t_negative_control']:.4f}")
-
-    gm = _aggregate_timing_means(roll, prompt_cases)
-    table.add_row(
-        "[bold]ALL/run[/]",
-        f"{gm['t_setup']:.4f}",
-        f"{gm['t_baseline_gen']:.4f}",
-        f"{gm['t_wm_gen']:.4f}",
-        f"{gm['t_derive_attributes']:.4f}",
-        f"{gm['t_issue_keys']:.4f}",
-        f"{gm['t_cprf_checks']:.4f}",
-        f"{gm['t_master_good']:.4f}",
-        f"{gm['t_detect_open']:.4f}",
-        f"{gm['t_detect_per_label']:.4f}",
-        f"{gm['t_negative_control']:.4f}")
-    console.print(table)
-    console.print(f"[dim]Sum of listed stage means per run:[/] {gm['t_grand_avg']:.4f} s")
-
-
 def _print_plain_results(
     *,
     prompt_cases: Sequence[tuple[str, str]],
@@ -1159,97 +1211,6 @@ def _print_plain_results(
         )
 
 
-def _print_rich_results(
-    *,
-    prompt_cases: Sequence[tuple[str, str]],
-    roll: dict[str, PromptRollup],
-    vocab_n: int,
-    console: Console,
-    table_title: str,
-    print_legend: bool) -> None:
-    console.print()
-    table = Table(title=table_title, expand=True)
-    table.add_column("prompt_id", style="dim", min_width=18, overflow="fold")
-    table.add_column("runs", justify="right", min_width=4, no_wrap=True)
-    for col in (
-        "TPR",
-        "FNR",
-        "TNR",
-        "FPR",
-        "attr==",
-        "master",
-        "open",
-        "uCPRF",
-        "lCPRF",
-        "ctrl",
-        "BER_avg",
-        "BER_max",
-        "mism",
-        "dCP",
-        "FN*",
-        "FP*"):
-        table.add_column(col, justify="right", min_width=7, no_wrap=True, overflow="fold")
-
-    for sid, _ in prompt_cases:
-        r = roll[sid]
-        n = r.runs
-        if n == 0:
-            table.add_row(
-                sid,
-                "0",
-                "n/a",
-                "n/a",
-                "n/a",
-                "n/a",
-                "0/0",
-                "n/a",
-                "n/a",
-                "n/a",
-                "n/a",
-                "n/a",
-                "n/a",
-                "n/a",
-                "n/a",
-                "n/a",
-                "n/a",
-                "n/a",
-                "n/a")
-            continue
-        tpr, fnr, tnr, fpr = _rates(r.tp, r.fn, r.tn, r.fp)
-        lcprf = (
-            f"{r.cprf_per_label_expect_ok}/{r.cprf_per_label_checks}"
-            if r.cprf_per_label_checks
-            else "n/a"
-        )
-        table.add_row(
-            sid,
-            str(n),
-            _fmt_rate(tpr),
-            _fmt_rate(fnr),
-            _fmt_rate(tnr),
-            _fmt_rate(fpr),
-            f"{r.attributes_match}/{n}",
-            f"{r.master_good}/{n}",
-            f"{r.open_detect_good}/{n}",
-            f"{r.unconstrained_cprf_ok}/{n}",
-            lcprf,
-            f"{r.control_correct}/{n}",
-            f"{r.ber_sum / n:.2f}",
-            f"{r.ber_max:.2f}",
-            str(r.mismatch_total),
-            str(r.mismatch_cprf_heuristic_bad),
-            str(r.mismatch_fn_with_matching_seeds),
-            str(r.mismatch_fp_with_split_seeds))
-    console.print(table)
-    if print_legend:
-        console.print(
-            "[dim]Gold positive = label in verify-time active set; pred positive = detect True. "
-            "uCPRF = unconstrained sk.eval==dk.c_eval. lCPRF = per-label CPRF expectation hits / checks. "
-            "mism = attribute-vs-detect mismatches; dCP = mismatches where CPRF vs attribute expectation disagreed; "
-            "FN* = FN with matching seeds (suspect LDPC); FP* = FP with split seeds (suspect LDPC).[/]"
-        )
-
-
 def _strict_protocol_ok(
     roll: dict[str, PromptRollup],
     prompt_cases: Sequence[tuple[str, str]]) -> bool:
@@ -1273,50 +1234,29 @@ def _print_protocol_failure_details(
     *,
     roll: dict[str, PromptRollup],
     prompt_cases: Sequence[tuple[str, str]],
-    plain: bool,
-    console: Console) -> None:
+) -> None:
     msg = (
         "Protocol checks did not pass on every run (require: master_detect good, detect open, "
         "unconstrained CPRF match, negative control rejects)."
     )
-    if plain:
-        print()
-        print(msg)
-        for sid, _ in prompt_cases:
-            r = roll[sid]
-            n = r.runs
-            if n == 0:
-                continue
-            bad: list[str] = []
-            if r.master_good < n:
-                bad.append(f"master {r.master_good}/{n}")
-            if r.open_detect_good < n:
-                bad.append(f"open {r.open_detect_good}/{n}")
-            if r.unconstrained_cprf_ok < n:
-                bad.append(f"u_cprf {r.unconstrained_cprf_ok}/{n}")
-            if r.control_correct < n:
-                bad.append(f"control {r.control_correct}/{n}")
-            if bad:
-                print(f"  {sid}: " + ", ".join(bad))
-    else:
-        console.print()
-        console.print(f"[bold red]{msg}[/]")
-        for sid, _ in prompt_cases:
-            r = roll[sid]
-            n = r.runs
-            if n == 0:
-                continue
-            bad: list[str] = []
-            if r.master_good < n:
-                bad.append(f"master {r.master_good}/{n}")
-            if r.open_detect_good < n:
-                bad.append(f"open {r.open_detect_good}/{n}")
-            if r.unconstrained_cprf_ok < n:
-                bad.append(f"u_cprf {r.unconstrained_cprf_ok}/{n}")
-            if r.control_correct < n:
-                bad.append(f"control {r.control_correct}/{n}")
-            if bad:
-                console.print(f"  [yellow]{sid}:[/] " + ", ".join(bad))
+    print()
+    print(msg)
+    for sid, _ in prompt_cases:
+        r = roll[sid]
+        n = r.runs
+        if n == 0:
+            continue
+        bad: list[str] = []
+        if r.master_good < n:
+            bad.append(f"master {r.master_good}/{n}")
+        if r.open_detect_good < n:
+            bad.append(f"open {r.open_detect_good}/{n}")
+        if r.unconstrained_cprf_ok < n:
+            bad.append(f"u_cprf {r.unconstrained_cprf_ok}/{n}")
+        if r.control_correct < n:
+            bad.append(f"control {r.control_correct}/{n}")
+        if bad:
+            print(f"  {sid}: " + ", ".join(bad))
 
 
 def run_benchmark_with_summary(
@@ -1325,16 +1265,21 @@ def run_benchmark_with_summary(
     runs: int,
     modulus: int,
     code_length: int,
-    fresh_key_per_trial: bool,
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
     burn_in_tokens: int = 100,
     quiet: bool = False,
+    show_progress: bool | None = None,
+    trial_progress: benchmark_io.ProgressHandle | None = None,
     torch_compile: bool | None = None,
 ) -> tuple[int, BenchmarkRunSummary]:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3", "text_attributes"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    progress_on = benchmark_io.resolve_show_progress(
+        quiet=quiet, show_progress=show_progress
+    )
 
     _configure_benchmark(
         code_length=code_length,
@@ -1345,53 +1290,64 @@ def run_benchmark_with_summary(
     )
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     roll_attributes_match: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
-    sk_shared: dict[str, Any] = {}
 
     vocab_n = len(VOCABULARY)
     if not quiet:
         console.print(
             f"code_length={wm.SECURITY_PARAM}  wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
             f"channel_bits={wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY}  burn_in={wm.BURN_IN_TOKENS}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
-            f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
+            f"keys=fresh per trial  "
             f"llm={model.MODEL_ID!r}  dtype={model.inference_dtype_label()}  "
             f"torch_compile={'on' if model.TORCH_COMPILE else 'off'}"
         )
 
-    trials, pregen = _prepare_trials_with_baselines(prompt_cases, runs, quiet=quiet)
+    trials, pregen = _prepare_trials_with_baselines(
+        prompt_cases,
+        runs,
+        show_baseline_progress=progress_on and trial_progress is None,
+    )
     amortized = pregen.amortized_seconds
+    generated: list[_GeneratedTrial] = []
+    setup_by_index: list[float] = []
     for (_, sid, prompt), baseline in zip(
         benchmark_io.iter_with_progress(
             trials,
-            description="Benchmark",
-            disable=quiet),
+            description="Benchmark generate",
+            disable=not progress_on or trial_progress is not None,
+        ),
         pregen.texts,
     ):
         t_setup0 = time.perf_counter()
-        if fresh_key_per_trial:
-            sk = wm.setup(modulus)
-        else:
-            if sk_shared.get(sid) is None:
-                sk_shared[sid] = wm.setup(modulus)
-            sk = sk_shared[sid]
-        t_setup = time.perf_counter() - t_setup0
-
-        (
-            word_stats,
-            attributes_match,
-            master_ok,
-            open_ok,
-            cprf_label_ok,
-            cprf_label_n,
-            control_ok,
-            ber,
-            tt_inner,
-            em_open_m) = run_one_trial(
-            sk,
-            prompt,
-            baseline_text=baseline,
-            baseline_gen_seconds=amortized,
+        sk = wm.setup(modulus)
+        setup_by_index.append(time.perf_counter() - t_setup0)
+        generated.append(
+            _generate_trial(
+                sk,
+                prompt,
+                baseline_text=baseline,
+                baseline_gen_seconds=amortized,
+            )
         )
-        tt_inner.t_setup = t_setup
+
+    scored = _score_protocol_trials_batched(
+        generated,
+        show_progress=progress_on,
+        trial_progress=trial_progress,
+        description="Benchmark",
+    )
+    for ((_, sid, _prompt), _baseline), setup_s, (
+        word_stats,
+        attributes_match,
+        master_ok,
+        open_ok,
+        cprf_label_ok,
+        cprf_label_n,
+        control_ok,
+        ber,
+        tt_inner,
+        em_open_m,
+    ) in zip(zip(trials, pregen.texts), setup_by_index, scored):
+        tt_inner.t_setup = setup_s
 
         roll[sid].add_run(
             word_stats=word_stats,
@@ -1453,7 +1409,7 @@ def run_benchmark_with_summary(
 
         if not all_ok:
             _print_protocol_failure_details(
-                roll=roll, prompt_cases=prompt_cases, plain=True, console=console
+                roll=roll, prompt_cases=prompt_cases
             )
 
     return (0 if all_ok else 1, summary)
@@ -1465,7 +1421,6 @@ def run_benchmark(
     runs: int,
     modulus: int,
     code_length: int,
-    fresh_key_per_trial: bool,
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
@@ -1476,7 +1431,6 @@ def run_benchmark(
         runs=runs,
         modulus=modulus,
         code_length=code_length,
-        fresh_key_per_trial=fresh_key_per_trial,
         console=console,
         llm_model_id=llm_model_id,
         wm_bit_redundancy=wm_bit_redundancy,
@@ -1492,12 +1446,12 @@ def run_fpr_vs_code_length_sweep(
     runs: int,
     modulus: int,
     wm_bit_redundancy: int,
-    fresh_key_per_trial: bool,
     console: Console,
     llm_model_id: str | None = None,
     prc_monte_carlo_trials: int = 100_000,
     rng: random.Random | None = None,
     quiet: bool = True,
+    show_progress: bool | None = None,
     torch_compile: bool | None = None,
 ) -> tuple[list[int], dict[str, list[float]], list[int]]:
     """
@@ -1505,6 +1459,9 @@ def run_fpr_vs_code_length_sweep(
 
     Metrics keys: ``scheme_fpr_all``, ``scheme_fpr_xmatch``, ``prc_random_fpr``,
     plus ``*_ci_low`` / ``*_ci_high`` Wilson bounds where applicable.
+
+    Progress advances once per protocol trial across the whole sweep (not once
+    per code length). ``quiet`` only suppresses per-length result tables.
     """
     prng = rng if rng is not None else random.Random()
     lengths: list[int] = []
@@ -1520,42 +1477,48 @@ def run_fpr_vs_code_length_sweep(
     exit_codes: list[int] = []
 
     length_list = list(code_lengths)
-    show_outer = len(length_list) > 1 and quiet
-    for length in benchmark_io.iter_with_progress(
-        length_list,
-        description="FPR vs code_length",
-        disable=not show_outer,
-    ):
-        r_rand, fp_mc = prc_random_detect_positive_rate(
-            int(length), int(prc_monte_carlo_trials), rng=prng, quiet=True
-        )
-        prc_random_fpr.append(float(r_rand))
-        pl, ph = wilson_score_interval(fp_mc, int(prc_monte_carlo_trials))
-        prc_random_fpr_lo.append(pl)
-        prc_random_fpr_hi.append(ph)
+    trials_per_length = int(runs) * len(prompt_cases)
+    total_trials = trials_per_length * len(length_list)
+    progress_on = True if show_progress is None else bool(show_progress)
 
-        ex, summary = run_benchmark_with_summary(
-            prompt_cases=prompt_cases,
-            runs=int(runs),
-            modulus=int(modulus),
-            code_length=int(length),
-            fresh_key_per_trial=fresh_key_per_trial,
-            console=console,
-            llm_model_id=llm_model_id,
-            wm_bit_redundancy=int(wm_bit_redundancy),
-            quiet=quiet,
-            torch_compile=torch_compile)
-        lengths.append(int(length))
-        exit_codes.append(int(ex))
+    with benchmark_io.progress_task(
+        "FPR sweep",
+        total_trials,
+        disable=not progress_on or total_trials <= 0,
+    ) as sweep_progress:
+        for length in length_list:
+            sweep_progress.set_description(f"FPR sweep n={int(length)}")
+            r_rand, fp_mc = prc_random_detect_positive_rate(
+                int(length), int(prc_monte_carlo_trials), rng=prng, quiet=True
+            )
+            prc_random_fpr.append(float(r_rand))
+            pl, ph = wilson_score_interval(fp_mc, int(prc_monte_carlo_trials))
+            prc_random_fpr_lo.append(pl)
+            prc_random_fpr_hi.append(ph)
 
-        fa, fa_lo, fa_hi = micro_fpr_wilson(summary.roll, summary.prompt_cases)
-        fx, fx_lo, fx_hi = micro_fpr_wilson(summary.roll_attributes_match, summary.prompt_cases)
-        scheme_fpr_all.append(float(fa) if fa >= 0.0 else float("nan"))
-        scheme_fpr_xmatch.append(float(fx) if fx >= 0.0 else float("nan"))
-        scheme_fpr_all_lo.append(fa_lo if fa >= 0.0 else float("nan"))
-        scheme_fpr_all_hi.append(fa_hi if fa >= 0.0 else float("nan"))
-        scheme_fpr_xmatch_lo.append(fx_lo if fx >= 0.0 else float("nan"))
-        scheme_fpr_xmatch_hi.append(fx_hi if fx >= 0.0 else float("nan"))
+            ex, summary = run_benchmark_with_summary(
+                prompt_cases=prompt_cases,
+                runs=int(runs),
+                modulus=int(modulus),
+                code_length=int(length),
+                console=console,
+                llm_model_id=llm_model_id,
+                wm_bit_redundancy=int(wm_bit_redundancy),
+                quiet=quiet,
+                show_progress=False,
+                trial_progress=sweep_progress,
+                torch_compile=torch_compile)
+            lengths.append(int(length))
+            exit_codes.append(int(ex))
+
+            fa, fa_lo, fa_hi = micro_fpr_wilson(summary.roll, summary.prompt_cases)
+            fx, fx_lo, fx_hi = micro_fpr_wilson(summary.roll_attributes_match, summary.prompt_cases)
+            scheme_fpr_all.append(float(fa) if fa >= 0.0 else float("nan"))
+            scheme_fpr_xmatch.append(float(fx) if fx >= 0.0 else float("nan"))
+            scheme_fpr_all_lo.append(fa_lo if fa >= 0.0 else float("nan"))
+            scheme_fpr_all_hi.append(fa_hi if fa >= 0.0 else float("nan"))
+            scheme_fpr_xmatch_lo.append(fx_lo if fx >= 0.0 else float("nan"))
+            scheme_fpr_xmatch_hi.append(fx_hi if fx >= 0.0 else float("nan"))
 
     metrics = {
         "scheme_fpr_all_runs": scheme_fpr_all,
@@ -1578,13 +1541,17 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
     code_length: int,
     runs: int,
     modulus: int,
-    fresh_key_per_trial: bool,
     console: Console,
     llm_model_id: str | None = None,
     quiet: bool = True,
+    show_progress: bool | None = None,
     torch_compile: bool | None = None,
 ) -> tuple[list[int], dict[str, list[float]], list[int]]:
-    """Sweep ``wm_bit_redundancy`` at fixed logical ``code_length``."""
+    """Sweep ``wm_bit_redundancy`` at fixed logical ``code_length``.
+
+    Progress advances once per protocol trial across the whole sweep (not once
+    per redundancy). ``quiet`` only suppresses per-point result tables.
+    """
     redundancies: list[int] = []
     tpr_all: list[float] = []
     tpr_xmatch: list[float] = []
@@ -1595,34 +1562,40 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
     exit_codes: list[int] = []
 
     redundancy_list = list(wm_bit_redundancy_values)
-    show_outer = len(redundancy_list) > 1 and quiet
-    for redundancy in benchmark_io.iter_with_progress(
-        redundancy_list,
-        description="TPR vs wm_bit_redundancy",
-        disable=not show_outer,
-    ):
-        ex, summary = run_benchmark_with_summary(
-            prompt_cases=prompt_cases,
-            runs=int(runs),
-            modulus=int(modulus),
-            code_length=int(code_length),
-            fresh_key_per_trial=fresh_key_per_trial,
-            console=console,
-            llm_model_id=llm_model_id,
-            wm_bit_redundancy=int(redundancy),
-            quiet=quiet,
-            torch_compile=torch_compile)
-        redundancies.append(int(redundancy))
-        exit_codes.append(int(ex))
+    trials_per_point = int(runs) * len(prompt_cases)
+    total_trials = trials_per_point * len(redundancy_list)
+    progress_on = True if show_progress is None else bool(show_progress)
 
-        ta, ta_lo, ta_hi = micro_tpr_wilson(summary.roll, summary.prompt_cases)
-        tx, tx_lo, tx_hi = micro_tpr_wilson(summary.roll_attributes_match, summary.prompt_cases)
-        tpr_all.append(float(ta) if ta >= 0.0 else float("nan"))
-        tpr_xmatch.append(float(tx) if tx >= 0.0 else float("nan"))
-        tpr_all_lo.append(ta_lo if ta >= 0.0 else float("nan"))
-        tpr_all_hi.append(ta_hi if ta >= 0.0 else float("nan"))
-        tpr_xmatch_lo.append(tx_lo if tx >= 0.0 else float("nan"))
-        tpr_xmatch_hi.append(tx_hi if tx >= 0.0 else float("nan"))
+    with benchmark_io.progress_task(
+        "TPR sweep",
+        total_trials,
+        disable=not progress_on or total_trials <= 0,
+    ) as sweep_progress:
+        for redundancy in redundancy_list:
+            sweep_progress.set_description(f"TPR sweep R={int(redundancy)}")
+            ex, summary = run_benchmark_with_summary(
+                prompt_cases=prompt_cases,
+                runs=int(runs),
+                modulus=int(modulus),
+                code_length=int(code_length),
+                console=console,
+                llm_model_id=llm_model_id,
+                wm_bit_redundancy=int(redundancy),
+                quiet=quiet,
+                show_progress=False,
+                trial_progress=sweep_progress,
+                torch_compile=torch_compile)
+            redundancies.append(int(redundancy))
+            exit_codes.append(int(ex))
+
+            ta, ta_lo, ta_hi = micro_tpr_wilson(summary.roll, summary.prompt_cases)
+            tx, tx_lo, tx_hi = micro_tpr_wilson(summary.roll_attributes_match, summary.prompt_cases)
+            tpr_all.append(float(ta) if ta >= 0.0 else float("nan"))
+            tpr_xmatch.append(float(tx) if tx >= 0.0 else float("nan"))
+            tpr_all_lo.append(ta_lo if ta >= 0.0 else float("nan"))
+            tpr_all_hi.append(ta_hi if ta >= 0.0 else float("nan"))
+            tpr_xmatch_lo.append(tx_lo if tx >= 0.0 else float("nan"))
+            tpr_xmatch_hi.append(tx_hi if tx >= 0.0 else float("nan"))
 
     metrics = {
         "tpr_all_runs": tpr_all,
@@ -1698,10 +1671,6 @@ def main() -> int:
     p.add_argument("--code-length", type=int, default=300, metavar="N")
     p.add_argument("--modulus", type=int, default=1024)
     p.add_argument(
-        "--reuse-key",
-        action="store_true",
-        help="Reuse one master key per prompt id across runs (default is fresh key every trial).")
-    p.add_argument(
         "--prompt-case",
         action="append",
         dest="prompt_cases",
@@ -1758,7 +1727,6 @@ def main() -> int:
         runs=args.runs,
         modulus=args.modulus,
         code_length=args.code_length,
-        fresh_key_per_trial=not args.reuse_key,
         console=console,
         llm_model_id=args.llm_model,
         wm_bit_redundancy=args.wm_bit_redundancy,
@@ -1772,7 +1740,6 @@ def main() -> int:
             summary=summary,
             exit_code=exit_code,
             runs=args.runs,
-            fresh_key_per_trial=not args.reuse_key,
             llm_model_id=args.llm_model)
         console.print(f"[dim]Wrote[/] {out}")
     return exit_code

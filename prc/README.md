@@ -68,9 +68,8 @@ A wrapper for Python via maturin/PyO3 is provided.
 From the **repository root** of this project (recommended):
 
 ```sh
-uv sync --extra dev
-uv run maturin develop --release -m prc/Cargo.toml
+uv sync
 uv run python prc/example.py
 ```
 
-Alternatively, create a virtual environment, install `maturin`, run `maturin develop --release` from this `prc` directory, then `python example.py`.
+`uv sync` builds and installs this package as a local path dependency. Alternatively, create a virtual environment, install `maturin`, run `maturin develop --release` from this `prc` directory, then `python example.py`.

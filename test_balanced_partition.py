@@ -73,6 +73,46 @@ def test_cascade_isolated_text_split() -> None:
     assert full[len(prefix) :] == wm
 
 
+def test_fit_text_to_exact_burn_in_token_count() -> None:
+    """Published burn-in prefix can be forced to an exact retokenized length."""
+
+    class _WordTokenizer:
+        """Whitespace tokenizer with stable word↔id roundtrip for tests."""
+
+        def __init__(self) -> None:
+            self._id_to_word: dict[int, str] = {}
+            self._word_to_id: dict[str, int] = {}
+
+        def _id_for(self, word: str) -> int:
+            if word not in self._word_to_id:
+                i = len(self._word_to_id) + 1
+                self._word_to_id[word] = i
+                self._id_to_word[i] = word
+            return self._word_to_id[word]
+
+        def __call__(self, text: str, add_special_tokens: bool = False):
+            del add_special_tokens
+            if not text:
+                return {"input_ids": []}
+            # Preserve trailing space as empty final piece → skip empties from split
+            words = [w for w in text.split(" ") if w != ""]
+            return {"input_ids": [self._id_for(w) for w in words]}
+
+        def decode(self, ids, skip_special_tokens: bool = True) -> str:
+            del skip_special_tokens
+            return " ".join(self._id_to_word[int(i)] for i in ids)
+
+    tok = _WordTokenizer()
+    text = "alpha beta gamma delta epsilon zeta"
+    prefix, ids = rr._fit_text_to_token_count(tok, text, 4)
+    assert len(ids) == 4
+    assert rr._tokenize_text_fragment(tok, prefix) == ids
+    assert prefix == "alpha beta gamma delta"
+
+    empty, empty_ids = rr._fit_text_to_token_count(tok, text, 0)
+    assert empty == "" and empty_ids == []
+
+
 def test_e2e_balanced_watermark() -> None:
     if os.environ.get("RUN_E2E_BALANCED") != "1":
         print("skip test_e2e_balanced_watermark (set RUN_E2E_BALANCED=1)")
@@ -118,5 +158,7 @@ if __name__ == "__main__":
     print("OK test_balanced_soft_channel_roundtrip_no_model")
     test_cascade_isolated_text_split()
     print("OK test_cascade_isolated_text_split")
+    test_fit_text_to_exact_burn_in_token_count()
+    print("OK test_fit_text_to_exact_burn_in_token_count")
     test_e2e_balanced_watermark()
     print("OK test_e2e_balanced_watermark (or skipped)")

@@ -36,9 +36,6 @@ _BENCHMARK_RELOAD_ORDER: tuple[str, ...] = (
 
 _NATIVE_MODULE_PREFIXES: tuple[str, ...] = ("prc", "cprf")
 
-# Back-compat alias for callers that referenced the full list.
-_RELOAD_ORDER: tuple[str, ...] = _CORE_RELOAD_ORDER + _BENCHMARK_RELOAD_ORDER
-
 _CPRF_SOURCES = ("cprf.go",)
 _PRC_SOURCE_GLOBS = ("src/**/*.rs", "Cargo.toml", "Cargo.lock", "pyproject.toml")
 

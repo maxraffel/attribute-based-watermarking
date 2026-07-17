@@ -52,7 +52,6 @@ class BenchmarkConfig:
     burn_in_tokens: int = 100
     model_id: str | None = None
     repeats_per_prompt: int = 1
-    reuse_baseline: bool = True
     #: ``None`` leaves ``model.TORCH_COMPILE`` unchanged (Colab shared settings).
     torch_compile: bool | None = None
     quiet: bool = False
@@ -71,9 +70,7 @@ class ProtocolRunResult:
     attributes_match: bool
     active_labels_match: bool
     master_ber_percent: float
-    sacrificed_bits: int
     natural_partition_choices: int
-    recovery_stalls: int
     retok_replacements: int
     recovery_ids_aligned: bool
     label_policy_ok: dict[str, bool] = field(default_factory=dict)
@@ -147,32 +144,65 @@ def _load_prompts(path: Path | None) -> list[str]:
     return prompts
 
 
-def run_protocol_once(
+@dataclass
+class _GeneratedProtocol:
+    prompt_index: int
+    repeat_index: int
+    prompt: str
+    wm_text: str
+    baseline_text: str
+    encode_attributes: list
+    secret: list[int]
+    natural_partition_choices: int
+    retok_replacements: int
+    recovery_ids_aligned: bool
+    seconds_baseline_gen: float
+    seconds_watermarked_gen: float
+
+
+def _generate_protocol_once(
     sk: object,
-    dk_open: object,
-    dk_by_word: dict[str, object],
     *,
     prompt_index: int,
     repeat_index: int,
     prompt: str,
     baseline_text: str | None = None,
+) -> _GeneratedProtocol:
+    out = wm.generate(sk, prompt, baseline_text=baseline_text)
+    generated = _GeneratedProtocol(
+        prompt_index=prompt_index,
+        repeat_index=repeat_index,
+        prompt=prompt,
+        wm_text=str(out["generated_text_wm"]),
+        baseline_text=str(out["baseline_text"]),
+        encode_attributes=list(out["attributes"]),
+        secret=list(out["prc_secret_bits"]),
+        natural_partition_choices=int(out.get("natural_partition_choices", 0)),
+        retok_replacements=int(out.get("retok_replacements", 0)),
+        recovery_ids_aligned=bool(out.get("recovery_ids_aligned", False)),
+        seconds_baseline_gen=float(out["seconds_baseline_gen"]),
+        seconds_watermarked_gen=float(out["seconds_watermarked_gen"]),
+    )
+    del out  # integrity: recovery must not see privileged generation metadata
+    return generated
+
+
+def _score_protocol_once(
+    sk: object,
+    dk_open: object,
+    dk_by_word: dict[str, object],
+    generated: _GeneratedProtocol,
+    recovered_bits: Sequence[int],
+    *,
+    recover_seconds: float = 0.0,
     neg_control_model_bundle: tuple[object, object, str] | None = None,
 ) -> ProtocolRunResult:
-    """Single ``app.py``-shaped protocol run for one prompt."""
+    """Score one generated trial with integrity-path recovered channel bits."""
     all_ok = True
-
-    out = wm.generate(sk, prompt, baseline_text=baseline_text)
-    wm_text = out["generated_text_wm"]
-    run_baseline_text = out["baseline_text"]
-    encode_attributes = list(out["attributes"])
-    secret = list(out["prc_secret_bits"])
-    sacrificed_bits = int(out.get("sacrificed_bits", 0))
-    natural_partition_choices = int(out.get("natural_partition_choices", 0))
-    recovery_stalls = int(out.get("recovery_stalls", 0))
-    retok_replacements = int(out.get("retok_replacements", 0))
-    recovery_ids_aligned = bool(out.get("recovery_ids_aligned", False))
-    t_bl = float(out["seconds_baseline_gen"])
-    t_wm = float(out["seconds_watermarked_gen"])
+    wm_text = generated.wm_text
+    encode_attributes = generated.encode_attributes
+    secret = generated.secret
+    recovered_wm = list(recovered_bits)
 
     verify_attributes = derive_attributes(wm_text, sk.modulus, log_scores=False)
     encode_active = active_labels_from_attributes(encode_attributes, sk.modulus)
@@ -192,9 +222,8 @@ def run_protocol_once(
     label_policy_ok: dict[str, bool] = {}
 
     t0 = time.perf_counter()
-    recovered_wm = wm.recover_channel_bits(wm_text, generation_out=out)
     m_ok, m_bits = wm.master_detect(sk, wm_text, recovered_bits=recovered_wm)
-    t_m = time.perf_counter() - t0
+    t_m = (time.perf_counter() - t0) + float(recover_seconds)
     master_ber = _ber_percent(secret, m_bits)
     all_ok &= bool(m_ok)
 
@@ -224,16 +253,18 @@ def run_protocol_once(
         model=m,
     )
     t0 = time.perf_counter()
-    recovered_neg = wm.recover_channel_bits(wrong)
+    recovered_neg = randrecover.uncorrelated_bits_from_text(
+        wrong, tok, n_bits=wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY
+    )
     neg_ok, _ = wm.master_detect(sk, wrong, recovered_bits=recovered_neg)
     det_total += time.perf_counter() - t0
     neg_control_pass = not bool(neg_ok)
     all_ok &= neg_control_pass
 
     return ProtocolRunResult(
-        prompt_index=prompt_index,
-        repeat_index=repeat_index,
-        prompt=prompt,
+        prompt_index=generated.prompt_index,
+        repeat_index=generated.repeat_index,
+        prompt=generated.prompt,
         all_ok=all_ok,
         master_detect_ok=bool(m_ok),
         unconstrained_detect_ok=bool(u_ok),
@@ -242,19 +273,17 @@ def run_protocol_once(
         attributes_match=attributes_match,
         active_labels_match=active_labels_match,
         master_ber_percent=master_ber,
-        sacrificed_bits=sacrificed_bits,
-        natural_partition_choices=natural_partition_choices,
-        recovery_stalls=recovery_stalls,
-        retok_replacements=retok_replacements,
-        recovery_ids_aligned=recovery_ids_aligned,
+        natural_partition_choices=generated.natural_partition_choices,
+        retok_replacements=generated.retok_replacements,
+        recovery_ids_aligned=generated.recovery_ids_aligned,
         label_policy_ok=label_policy_ok,
         encode_active=encode_active,
         verify_active=verify_active,
-        seconds_baseline_gen=t_bl,
-        seconds_watermarked_gen=t_wm,
+        seconds_baseline_gen=generated.seconds_baseline_gen,
+        seconds_watermarked_gen=generated.seconds_watermarked_gen,
         seconds_issue_keys=t_keys,
         seconds_detect_total=det_total,
-        baseline_text=run_baseline_text,
+        baseline_text=generated.baseline_text,
     )
 
 
@@ -277,49 +306,67 @@ def run_benchmark(
         for repeat_index in range(cfg.repeats_per_prompt)
     ]
 
-    if cfg.reuse_baseline:
-        # One baseline per prompt id, shared across repeats.
-        pregen = benchmark_io.pregenerate_baselines(
-            list(prompts),
-            quiet=cfg.quiet,
-            description="Baselines",
-        )
-        baseline_by_prompt = {i: pregen.texts[i] for i in range(len(prompts))}
-        trial_baselines = [
-            baseline_by_prompt[prompt_index] for prompt_index, _, _ in trials
-        ]
-    else:
-        # Independent baseline per trial (batched).
-        pregen = benchmark_io.pregenerate_baselines(
-            [prompt for _, _, prompt in trials],
-            quiet=cfg.quiet,
-            description="Baselines",
-        )
-        trial_baselines = list(pregen.texts)
+    # Independent baseline per trial (batched).
+    pregen = benchmark_io.pregenerate_baselines(
+        [prompt for _, _, prompt in trials],
+        quiet=cfg.quiet,
+        description="Baselines",
+    )
+    trial_baselines = list(pregen.texts)
 
     # Amortize so sum of per-trial baseline times equals pregen wall time.
     amortized = pregen.seconds / max(len(trials), 1)
 
-    results: list[ProtocolRunResult] = []
+    generated: list[_GeneratedProtocol] = []
     for (prompt_index, repeat_index, prompt), baseline_text in zip(
         benchmark_io.iter_with_progress(
             trials,
-            description="Watermark benchmark",
+            description="Watermark generate",
             disable=cfg.quiet,
         ),
         trial_baselines,
     ):
-        result = run_protocol_once(
+        generated.append(
+            _generate_protocol_once(
+                sk,
+                prompt_index=prompt_index,
+                repeat_index=repeat_index,
+                prompt=prompt,
+                baseline_text=baseline_text,
+            )
+        )
+
+    n = len(generated)
+    t0 = time.perf_counter()
+    with benchmark_io.progress_task(
+        "Watermark recover",
+        n,
+        disable=cfg.quiet or n <= 0,
+    ) as recover_bar:
+        bits_list = wm.recover_channel_bits_batch(
+            [g.wm_text for g in generated],
+            on_batch_done=lambda k: recover_bar.advance(k),
+        )
+    recover_amortized = (time.perf_counter() - t0) / max(n, 1)
+
+    results: list[ProtocolRunResult] = []
+    for g, bits in zip(
+        benchmark_io.iter_with_progress(
+            generated,
+            description="Watermark score",
+            disable=cfg.quiet,
+        ),
+        bits_list,
+    ):
+        result = _score_protocol_once(
             sk,
             dk_open,
             dk_by_word,
-            prompt_index=prompt_index,
-            repeat_index=repeat_index,
-            prompt=prompt,
-            baseline_text=baseline_text,
+            g,
+            bits,
+            recover_seconds=recover_amortized,
             neg_control_model_bundle=neg_bundle,
         )
-        # Amortize batched baseline wall time into per-run timing.
         result.seconds_baseline_gen = amortized
         results.append(result)
     return results
@@ -338,9 +385,7 @@ class RunAggregate:
     recovery_ids_aligned_rate: float
     avg_master_ber: float
     max_master_ber: float
-    avg_sacrificed_bits: float
     avg_natural_partition: float
-    avg_recovery_stalls: float
     avg_replacements: float
     avg_baseline_gen_s: float
     avg_watermarked_gen_s: float
@@ -363,9 +408,7 @@ def _aggregate_runs(runs: Sequence[ProtocolRunResult]) -> RunAggregate:
             recovery_ids_aligned_rate=0.0,
             avg_master_ber=0.0,
             max_master_ber=0.0,
-            avg_sacrificed_bits=0.0,
             avg_natural_partition=0.0,
-            avg_recovery_stalls=0.0,
             avg_replacements=0.0,
             avg_baseline_gen_s=0.0,
             avg_watermarked_gen_s=0.0,
@@ -391,9 +434,7 @@ def _aggregate_runs(runs: Sequence[ProtocolRunResult]) -> RunAggregate:
         recovery_ids_aligned_rate=_rate(lambda r: r.recovery_ids_aligned),
         avg_master_ber=statistics.mean(r.master_ber_percent for r in runs),
         max_master_ber=max(r.master_ber_percent for r in runs),
-        avg_sacrificed_bits=statistics.mean(r.sacrificed_bits for r in runs),
         avg_natural_partition=statistics.mean(r.natural_partition_choices for r in runs),
-        avg_recovery_stalls=statistics.mean(r.recovery_stalls for r in runs),
         avg_replacements=statistics.mean(r.retok_replacements for r in runs),
         avg_baseline_gen_s=statistics.mean(r.seconds_baseline_gen for r in runs),
         avg_watermarked_gen_s=statistics.mean(r.seconds_watermarked_gen for r in runs),
@@ -427,7 +468,6 @@ def _print_config_block(
     )
     print(f"classifier: {text_attributes.get_scorer().model_id}")
     print(f"vocab |V|={len(VOCABULARY)}  score cutoff: {SCORE_CUTOFF:g}")
-    print(f"reuse baseline: {'yes' if config.reuse_baseline else 'no'}")
     print(
         f"inference_dtype: {model.inference_dtype_label()}  "
         f"torch_compile: {'yes' if model.TORCH_COMPILE else 'no'}"
@@ -455,7 +495,6 @@ def _print_per_prompt_plain(
                 _pct(agg.attributes_match_rate),
                 f"{agg.avg_master_ber:.2f}",
                 f"{agg.max_master_ber:.2f}",
-                f"{agg.avg_sacrificed_bits:.1f}",
                 f"{agg.avg_natural_partition:.0f}",
                 _pct(agg.recovery_ids_aligned_rate),
                 f"{agg.avg_baseline_gen_s + agg.avg_watermarked_gen_s:.1f}s",
@@ -475,13 +514,12 @@ def _print_per_prompt_plain(
             "attrs",
             "BER_avg",
             "BER_max",
-            "sacr",
             "nat",
             "aligned",
             "gen",
             "det",
         ],
-        widths=[3, 40, 5, 7, 7, 7, 7, 7, 8, 8, 5, 4, 7, 6, 6],
+        widths=[3, 40, 5, 7, 7, 7, 7, 7, 8, 8, 4, 7, 6, 6],
         aligns=[">", "<", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">"],
         rows=rows,
     )
@@ -506,12 +544,10 @@ def _print_aggregate_plain(agg: RunAggregate, *, title: str) -> None:
     print(
         f"  avg master BER: {agg.avg_master_ber:.2f}%  "
         f"max master BER: {agg.max_master_ber:.2f}%  "
-        f"avg sacrificed: {agg.avg_sacrificed_bits:.1f}  "
         f"avg natural_part: {agg.avg_natural_partition:.1f}"
     )
     print(
-        f"  avg stalls: {agg.avg_recovery_stalls:.1f}  "
-        f"avg replacements: {agg.avg_replacements:.1f}"
+        f"  avg replacements: {agg.avg_replacements:.1f}"
     )
     print(
         f"  avg gen: baseline={agg.avg_baseline_gen_s:.2f}s  "
@@ -535,16 +571,15 @@ def _print_per_run_plain(runs: Sequence[ProtocolRunResult]) -> None:
                 "ok" if r.unconstrained_detect_ok else "no",
                 "ok" if r.neg_control_pass else "no",
                 f"{r.master_ber_percent:.2f}",
-                str(r.sacrificed_bits),
                 str(r.natural_partition_choices),
                 "yes" if r.recovery_ids_aligned else "no",
             ]
         )
     benchmark_io.print_plain_table(
         title="Per-run detail",
-        headers=["#", "rep", "check", "master", "open", "decoy", "BER%", "sacr", "nat", "aligned"],
-        widths=[3, 4, 6, 7, 5, 6, 7, 5, 4, 7],
-        aligns=[">", ">", ">", ">", ">", ">", ">", ">", ">", ">"],
+        headers=["#", "rep", "check", "master", "open", "decoy", "BER%", "nat", "aligned"],
+        widths=[3, 4, 6, 7, 5, 6, 7, 4, 7],
+        aligns=[">", ">", ">", ">", ">", ">", ">", ">", ">"],
         rows=rows,
     )
 
@@ -555,9 +590,7 @@ def print_summary(
     config: BenchmarkConfig,
     *,
     verbose: bool = False,
-    console: object | None = None,
 ) -> None:
-    del console
     overall = _aggregate_runs(runs)
 
     _print_config_block(prompts, config, overall)
@@ -600,11 +633,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--model-id", default=None, help="Override LM hub id (default from model.py).")
     p.add_argument(
-        "--no-reuse-baseline",
-        action="store_true",
-        help="Re-sample baseline text on every repeat (slower, fully independent runs).",
-    )
-    p.add_argument(
         "--torch-compile",
         action="store_true",
         help="Apply torch.compile to the LM after load (first forwards are slower).",
@@ -646,7 +674,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         burn_in_tokens=args.burn_in_tokens,
         model_id=args.model_id,
         repeats_per_prompt=args.repeats,
-        reuse_baseline=not args.no_reuse_baseline,
         torch_compile=True if args.torch_compile else None,
         quiet=bool(args.quiet),
     )

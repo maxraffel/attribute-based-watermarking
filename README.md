@@ -10,9 +10,8 @@ This project implements text watermarking using:
 
 The fastest way to get started is:
 
-1. Install dependencies
-2. Build the PRC extension
-3. Run `app.py`
+1. Install dependencies (`uv sync` builds the local PRC extension)
+2. Run `app.py`
 
 ---
 
@@ -22,13 +21,15 @@ The fastest way to get started is:
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- Rust toolchain (required by `maturin` to build `prc`)
+- Rust toolchain (required to build the local `prc` package)
 
 ### 2) Install dependencies
 
 ```sh
-uv sync --extra dev
+uv sync
 ```
+
+This installs Python deps and builds/installs the local `prc` path package. For plotting extras used by research benchmarks, use `uv sync --extra research`.
 
 ### 3) Hugging Face access (gated Llama models)
 
@@ -39,15 +40,7 @@ The default LM is `meta-llama/Llama-3.2-3B-Instruct`, which is **gated** on Hugg
 
 Without a token, weight downloads can hang with no progress. `model.load()` now fails fast with a clear error instead.
 
-### 4) Build PRC extension
-
-Run this after cloning, and again any time `prc/` changes:
-
-```sh
-uv run maturin develop --release -m prc/Cargo.toml
-```
-
-### 5) Run the main demo
+### 4) Run the main demo
 
 ```sh
 uv run python app.py
@@ -140,7 +133,7 @@ For private repos, provide a `GITHUB_TOKEN` secret in Colab so the notebook can 
 
 ## Tuning Notes
 
-- Watermark channel: **burn-in** (default 100 free tokens) then **balanced** softmax vocab partitions and **depth** interleaving of PRC bit replicas. During watermarked steps, partitions are built from a **prompt-free** LM context (matching recovery) while sampling still uses the **prompt-conditioned** distribution. Publish uses separate decode+concat so burn-in retokenization cannot shift payload indices.
+- Watermark channel: **burn-in** (default 100 free tokens) then **balanced** softmax vocab partitions and **depth** interleaving of PRC bit replicas. During watermarked steps, partitions are built from a **prompt-free** LM context (matching recovery) while sampling still uses the **prompt-conditioned** distribution. Burn-in is grown/stabilized so the published prefix **retokenizes to exactly** `BURN_IN_TOKENS`; channel bit indices are offset by any residual length delta so integrity recovery (skip first `BURN_IN_TOKENS` of the full retokenized transcript) lines up.
 - Change subject behavior by editing:
   - `LABEL_QUERY_TEMPLATE` in `text_attributes.py`
   - `VOCABULARY` in `text_attributes.py`

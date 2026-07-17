@@ -12,37 +12,45 @@ from text_attributes import derive_attributes, VOCABULARY, CPRF_ATTR_DIM
 SECURITY_PARAM = 300
 WM_BIT_REDUNDANCY = 1
 # Free (unwatermarked) model tokens before the channel payload. Prompt-free
-# recovery warms up on this prefix; separate decode+concat isolates retokenization.
+# recovery warms up on this many retokenized prefix tokens; generation
+# stabilizes the published burn-in so its retokenization has this length.
 BURN_IN_TOKENS = 100
 
 
-def recover_channel_bits(
-    watermarked_text: str,
-    *,
-    generation_out: Dict[str, Any] | None = None,
-    prompt: str | None = None,
-) -> List[int]:
+def recover_channel_bits(watermarked_text: str) -> List[int]:
     """Recover raw channel bits via prompt-free balanced rewind.
 
-    Call this once per transcript and pass the result to ``detect`` /
+    Uses only ``watermarked_text`` plus scheme constants
+    (``BURN_IN_TOKENS``, ``SECURITY_PARAM``, ``WM_BIT_REDUNDANCY``) and the
+    loaded LM/tokenizer.
+
+    Call once per transcript and pass the result to ``detect`` /
     ``master_detect`` via ``recovered_bits`` so multi-key detection does not
     repeat model rewind.
-
-    With ``generation_out``, recovery uses the cascade-isolated character split
-    (``burn_in_char_len``) and does **not** need the original prompt. Generation
-    builds the same prompt-free partitions while still sampling under the prompt.
-    Text-only decoys without generation metadata receive uncorrelated bits.
     """
-    del prompt  # intentionally unused: recovery is prompt-free
-    m, tok, device = model.load()
-    if generation_out is not None:
-        raw, _, _ = randrecover.recover_bitstream_from_generation(
-            m, tok, generation_out, device
-        )
-        return list(raw)
+    return recover_channel_bits_batch([watermarked_text])[0]
 
+
+def recover_channel_bits_batch(
+    watermarked_texts: Sequence[str],
+    *,
+    batch_size: int | None = None,
+    on_batch_done: Any | None = None,
+) -> List[List[int]]:
+    """Batched integrity-preserving recovery for many watermarked texts."""
+    m, tok, device = model.load()
     n_bits = SECURITY_PARAM * WM_BIT_REDUNDANCY
-    return randrecover.uncorrelated_bits_from_text(watermarked_text, tok, n_bits=n_bits)
+    results = randrecover.recover_bitstreams_from_watermarked_texts(
+        m,
+        tok,
+        list(watermarked_texts),
+        device,
+        burn_in_tokens=BURN_IN_TOKENS,
+        n_channel_bits=n_bits,
+        batch_size=batch_size,
+        on_batch_done=on_batch_done,
+    )
+    return [list(bits) for bits, _tokens, _gaps in results]
 
 
 def expand_channel_bits(bits: Sequence[int], redundancy: int) -> List[int]:
@@ -57,11 +65,6 @@ def expand_channel_bits(bits: Sequence[int], redundancy: int) -> List[int]:
     for _ in range(redundancy):
         out.extend(int(b) for b in bits)
     return out
-
-
-def interleave_repetitions(bits: Sequence[int], redundancy: int) -> List[int]:
-    """Alias for ``expand_channel_bits`` (depth-interleaved replicas)."""
-    return expand_channel_bits(bits, redundancy)
 
 
 def majority_deinterleave(
@@ -145,8 +148,6 @@ def detect(
     dk: cprf.ConstrainedKey,
     watermarked_text: str,
     *,
-    generation_out: Dict[str, Any] | None = None,
-    prompt: str | None = None,
     recovered_bits: Sequence[int] | None = None,
 ) -> Tuple[bool, List[int]]:
     attributes = derive_attributes(watermarked_text, dk.modulus, log_scores=False)
@@ -155,9 +156,7 @@ def detect(
     raw = (
         list(recovered_bits)
         if recovered_bits is not None
-        else recover_channel_bits(
-            watermarked_text, generation_out=generation_out, prompt=prompt
-        )
+        else recover_channel_bits(watermarked_text)
     )
     bits_int = majority_deinterleave(raw, SECURITY_PARAM, WM_BIT_REDUNDANCY)
     ok = prc.detect(recovered_s, [bool(b) for b in bits_int])
@@ -168,8 +167,6 @@ def master_detect(
     sk: cprf.MasterKey,
     watermarked_text: str,
     *,
-    generation_out: Dict[str, Any] | None = None,
-    prompt: str | None = None,
     recovered_bits: Sequence[int] | None = None,
 ) -> Tuple[bool, List[int]]:
     attributes = derive_attributes(watermarked_text, sk.modulus, log_scores=False)
@@ -178,9 +175,7 @@ def master_detect(
     raw = (
         list(recovered_bits)
         if recovered_bits is not None
-        else recover_channel_bits(
-            watermarked_text, generation_out=generation_out, prompt=prompt
-        )
+        else recover_channel_bits(watermarked_text)
     )
     bits_int = majority_deinterleave(raw, SECURITY_PARAM, WM_BIT_REDUNDANCY)
     ok = prc.detect(s, [bool(b) for b in bits_int])
