@@ -8,8 +8,10 @@ can reload and plot without re-running expensive LM trials.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
+import statistics
 import sys
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -30,7 +32,7 @@ from rich.progress import (
 import model
 import text_attributes
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 BENCHMARK_KIND_POLICY = "policy_detection"
 BENCHMARK_KIND_FPR_SWEEP = "fpr_vs_code_length"
@@ -39,6 +41,93 @@ BENCHMARK_KIND_LABEL_MATRIX = "label_conditioned_matrix"
 BENCHMARK_KIND_PROMPT_MATRIX = "prompt_conditioned_matrix"
 BENCHMARK_KIND_WATERMARK = "watermark_protocol"
 BENCHMARK_KIND_BER = "ber_diagnostics"
+
+# Default z for ~95% two-sided normal / Wilson intervals.
+DEFAULT_CI_Z = 1.96
+
+
+def wilson_score_interval(
+    k: int,
+    n: int,
+    *,
+    z: float = DEFAULT_CI_Z,
+) -> tuple[float, float]:
+    """Wilson score interval for binomial proportion ``k/n``."""
+    if n < 0 or k < 0 or k > n:
+        raise ValueError(f"invalid wilson_score_interval args: k={k}, n={n}")
+    if n == 0:
+        return (float("nan"), float("nan"))
+    p = k / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = (p + z2 / (2 * n)) / denom
+    rad = (z / denom) * math.sqrt((p * (1.0 - p) + z2 / (4 * n)) / n)
+    return (max(0.0, centre - rad), min(1.0, centre + rad))
+
+
+def proportion_with_ci(
+    k: int,
+    n: int,
+    *,
+    z: float = DEFAULT_CI_Z,
+) -> dict[str, float | int]:
+    """Point estimate ``k/n`` plus Wilson ``ci_low`` / ``ci_high``."""
+    if n <= 0:
+        return {"rate": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"), "k": int(k), "n": int(n)}
+    lo, hi = wilson_score_interval(int(k), int(n), z=z)
+    return {"rate": float(k) / float(n), "ci_low": lo, "ci_high": hi, "k": int(k), "n": int(n)}
+
+
+def mean_with_ci(
+    values: Sequence[float],
+    *,
+    z: float = DEFAULT_CI_Z,
+) -> dict[str, float | int]:
+    """Sample mean with normal-approx CI via SEM (``z * s / sqrt(n)``)."""
+    xs = [float(v) for v in values if v == v]
+    n = len(xs)
+    if n == 0:
+        return {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"), "n": 0, "sem": float("nan")}
+    mean = float(statistics.mean(xs))
+    if n == 1:
+        return {"mean": mean, "ci_low": mean, "ci_high": mean, "n": 1, "sem": 0.0}
+    sem = float(statistics.stdev(xs) / math.sqrt(n))
+    return {
+        "mean": mean,
+        "ci_low": mean - z * sem,
+        "ci_high": mean + z * sem,
+        "n": n,
+        "sem": sem,
+    }
+
+
+def rate_matrix_with_ci(
+    numerators: Mapping[str, Mapping[str, int]],
+    denominators: Mapping[str, Mapping[str, int]],
+    *,
+    z: float = DEFAULT_CI_Z,
+) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]], dict[str, dict[str, float]]]:
+    """Build rate / ci_low / ci_high matrices aligned to numerator keys."""
+    rates: dict[str, dict[str, float]] = {}
+    ci_low: dict[str, dict[str, float]] = {}
+    ci_high: dict[str, dict[str, float]] = {}
+    for row, cols in numerators.items():
+        rates[row] = {}
+        ci_low[row] = {}
+        ci_high[row] = {}
+        for col, num in cols.items():
+            den = int(denominators.get(row, {}).get(col, 0))
+            k = int(num)
+            if den <= 0:
+                rates[row][col] = float("nan")
+                ci_low[row][col] = float("nan")
+                ci_high[row][col] = float("nan")
+            else:
+                lo, hi = wilson_score_interval(k, den, z=z)
+                rates[row][col] = k / den
+                ci_low[row][col] = lo
+                ci_high[row][col] = hi
+    return rates, ci_low, ci_high
 
 T = TypeVar("T")
 
@@ -220,6 +309,19 @@ def save_policy_summary(
 ) -> Path:
     roll = {sid: _rollup_to_dict(r) for sid, r in summary.roll.items()}
     roll_xmatch = {sid: _rollup_to_dict(r) for sid, r in summary.roll_attributes_match.items()}
+
+    # Lazy import avoids a cycle: policy_detection imports benchmark_io.
+    from benchmark_policy_detection import micro_fpr_wilson, micro_tpr_wilson
+
+    fpr, fpr_lo, fpr_hi = micro_fpr_wilson(summary.roll, summary.prompt_cases)
+    tpr, tpr_lo, tpr_hi = micro_tpr_wilson(summary.roll, summary.prompt_cases)
+    fpr_x, fpr_x_lo, fpr_x_hi = micro_fpr_wilson(
+        summary.roll_attributes_match, summary.prompt_cases
+    )
+    tpr_x, tpr_x_lo, tpr_x_hi = micro_tpr_wilson(
+        summary.roll_attributes_match, summary.prompt_cases
+    )
+
     return save_json(
         path,
         {
@@ -238,6 +340,28 @@ def save_policy_summary(
             "strict_protocol_ok": bool(summary.strict_protocol_ok),
             "roll": roll,
             "roll_attributes_match": roll_xmatch,
+            "aggregates": {
+                "fpr_all_runs": {
+                    "rate": fpr,
+                    "ci_low": fpr_lo,
+                    "ci_high": fpr_hi,
+                },
+                "tpr_all_runs": {
+                    "rate": tpr,
+                    "ci_low": tpr_lo,
+                    "ci_high": tpr_hi,
+                },
+                "fpr_x_matched_runs_only": {
+                    "rate": fpr_x,
+                    "ci_low": fpr_x_lo,
+                    "ci_high": fpr_x_hi,
+                },
+                "tpr_x_matched_runs_only": {
+                    "rate": tpr_x,
+                    "ci_low": tpr_x_lo,
+                    "ci_high": tpr_x_hi,
+                },
+            },
         },
     )
 
@@ -283,6 +407,7 @@ def save_label_matrix(
     exit_code: int,
     llm_model_id: str | None = None,
 ) -> Path:
+    rates, ci_low, ci_high = rate_matrix_with_ci(matrix.numerators, matrix.denominators)
     return save_json(
         path,
         {
@@ -301,7 +426,9 @@ def save_label_matrix(
             "vocab": list(matrix.vocab),
             "numerators": matrix.numerators,
             "denominators": matrix.denominators,
-            "rates": matrix.rates,
+            "rates": matrix.rates if getattr(matrix, "rates", None) is not None else rates,
+            "rates_ci_low": ci_low,
+            "rates_ci_high": ci_high,
         },
     )
 
@@ -313,6 +440,11 @@ def save_prompt_matrix(
     exit_code: int,
     llm_model_id: str | None = None,
 ) -> Path:
+    rates, ci_low, ci_high = rate_matrix_with_ci(matrix.numerators, matrix.denominators)
+    rates_x, ci_low_x, ci_high_x = rate_matrix_with_ci(
+        matrix.numerators_attributes_match,
+        matrix.denominators_attributes_match,
+    )
     return save_json(
         path,
         {
@@ -332,10 +464,18 @@ def save_prompt_matrix(
             "column_prompt_ids": list(matrix.column_prompt_ids),
             "numerators": matrix.numerators,
             "denominators": matrix.denominators,
-            "rates": matrix.rates,
+            "rates": matrix.rates if getattr(matrix, "rates", None) is not None else rates,
+            "rates_ci_low": ci_low,
+            "rates_ci_high": ci_high,
             "numerators_attributes_match": matrix.numerators_attributes_match,
             "denominators_attributes_match": matrix.denominators_attributes_match,
-            "rates_attributes_match": matrix.rates_attributes_match,
+            "rates_attributes_match": (
+                matrix.rates_attributes_match
+                if getattr(matrix, "rates_attributes_match", None) is not None
+                else rates_x
+            ),
+            "rates_attributes_match_ci_low": ci_low_x,
+            "rates_attributes_match_ci_high": ci_high_x,
         },
     )
 
@@ -350,6 +490,26 @@ def save_watermark_benchmark(
 ) -> Path:
     cfg = config if isinstance(config, dict) else asdict(config)
     run_rows = [asdict(r) if is_dataclass(r) else dict(r) for r in runs]
+    n = len(run_rows)
+
+    def _bool_rate(key: str) -> dict[str, float | int]:
+        k = sum(1 for r in run_rows if bool(r.get(key)))
+        return proportion_with_ci(k, n)
+
+    aggregates: dict[str, Any] = {
+        "n_runs": n,
+        "all_ok": _bool_rate("all_ok"),
+        "master_detect_ok": _bool_rate("master_detect_ok"),
+        "unconstrained_detect_ok": _bool_rate("unconstrained_detect_ok"),
+        "neg_control_pass": _bool_rate("neg_control_pass"),
+        "cprf_ok": _bool_rate("cprf_ok"),
+        "attributes_match": _bool_rate("attributes_match"),
+        "active_labels_match": _bool_rate("active_labels_match"),
+        "recovery_ids_aligned": _bool_rate("recovery_ids_aligned"),
+        "master_ber_percent": mean_with_ci(
+            [float(r.get("master_ber_percent", float("nan"))) for r in run_rows]
+        ),
+    }
     return save_json(
         path,
         {
@@ -359,6 +519,7 @@ def save_watermark_benchmark(
             "config": cfg,
             "prompts": list(prompts),
             "runs": run_rows,
+            "aggregates": aggregates,
         },
     )
 
@@ -373,6 +534,25 @@ def save_ber_diagnostics(
     results = [asdict(r) for r in summary.results]
     for row in results:
         row["partition_error_breakdown"] = asdict(row["partition_error_breakdown"])
+
+    ber_keys = (
+        "channel_ber_from_ids",
+        "channel_ber_from_text",
+        "retokenization_extra_ber",
+        "logical_ber",
+        "end_to_end_ber_master",
+    )
+    aggregates = {
+        key: mean_with_ci([float(r[key]) for r in results]) for key in ber_keys
+    }
+    detect_n = len(results)
+    aggregates["detect_oracle_key"] = proportion_with_ci(
+        sum(1 for r in results if r.get("detect_oracle_key")), detect_n
+    )
+    aggregates["detect_actual_master"] = proportion_with_ci(
+        sum(1 for r in results if r.get("detect_actual_master")), detect_n
+    )
+
     return save_json(
         path,
         {
@@ -381,5 +561,6 @@ def save_ber_diagnostics(
             "runtime": runtime_metadata(llm_model_id=llm_model_id),
             "config": cfg,
             "results": results,
+            "aggregates": aggregates,
         },
     )

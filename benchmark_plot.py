@@ -1,6 +1,9 @@
 """
 Plot benchmark results from JSON files written by benchmark runners.
 
+Confidence intervals (when present in the JSON) are drawn as a translucent band
+around each series line — not as error bars.
+
 Examples:
   uv run python benchmark_plot.py fpr results/benchmark_fpr_vs_code_length.json
   uv run python benchmark_plot.py tpr results/benchmark_tpr_vs_wm_bit_redundancy.json --with-ci
@@ -24,73 +27,129 @@ import pandas as pd
 import benchmark_io
 
 
-def _asym_errbar(y_vals: Sequence[float], lo: Sequence[float], hi: Sequence[float]) -> list[list[float]]:
-    el: list[float] = []
-    eh: list[float] = []
-    for y, a, b in zip(y_vals, lo, hi):
-        if y != y or a != a or b != b:
-            el.append(float("nan"))
-            eh.append(float("nan"))
-        else:
-            el.append(y - a)
-            eh.append(b - y)
-    return [el, eh]
+def _finite(vals: Sequence[float]) -> bool:
+    return all(v == v for v in vals)
+
+
+def _resolve_ci(
+    data: dict,
+    y_key: str,
+    *,
+    lo_key: str | None = None,
+    hi_key: str | None = None,
+) -> tuple[list[float] | None, list[float] | None]:
+    """Return (ci_low, ci_high) lists when both keys exist and lengths match ``y``."""
+    lo_k = lo_key or f"{y_key}_ci_low"
+    hi_k = hi_key or f"{y_key}_ci_high"
+    if lo_k not in data or hi_k not in data:
+        # Common alternate naming: strip trailing series suffix patterns already covered.
+        return None, None
+    y = list(data[y_key])
+    lo = list(data[lo_k])
+    hi = list(data[hi_k])
+    if len(lo) != len(y) or len(hi) != len(y):
+        return None, None
+    return lo, hi
+
+
+def _should_draw_ci(with_ci: bool | None, lo: Sequence[float] | None, hi: Sequence[float] | None) -> bool:
+    if lo is None or hi is None:
+        return False
+    if with_ci is False:
+        return False
+    # with_ci True or None (auto): draw when CI data is present
+    return True
+
+
+def _plot_line_with_ci_band(
+    ax: plt.Axes,
+    x: Sequence[float] | np.ndarray,
+    y: Sequence[float],
+    *,
+    label: str,
+    fmt: str = "o-",
+    ci_low: Sequence[float] | None = None,
+    ci_high: Sequence[float] | None = None,
+    draw_ci: bool = True,
+) -> None:
+    """
+    Plot a series line; when CI bounds are provided, shade a translucent band
+    (thick soft border) around the line.
+    """
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    (line,) = ax.plot(x_arr, y_arr, fmt, label=label, zorder=3)
+    color = line.get_color()
+
+    if not draw_ci or ci_low is None or ci_high is None:
+        return
+    lo = np.asarray(ci_low, dtype=float)
+    hi = np.asarray(ci_high, dtype=float)
+    if lo.shape != y_arr.shape or hi.shape != y_arr.shape:
+        return
+    if not (_finite(lo.tolist()) and _finite(hi.tolist()) and _finite(y_arr.tolist())):
+        # Still shade finite segments where possible
+        mask = np.isfinite(lo) & np.isfinite(hi) & np.isfinite(y_arr) & np.isfinite(x_arr)
+        if not np.any(mask):
+            return
+        x_arr, y_arr, lo, hi = x_arr[mask], y_arr[mask], lo[mask], hi[mask]
+
+    # Soft wide stroke under the line (visual “border”), then CI envelope fill.
+    ax.plot(
+        x_arr,
+        y_arr,
+        color=color,
+        alpha=0.18,
+        linewidth=7.0,
+        solid_capstyle="round",
+        solid_joinstyle="round",
+        zorder=1,
+    )
+    ax.fill_between(x_arr, lo, hi, color=color, alpha=0.28, linewidth=0, zorder=2)
 
 
 def plot_fpr_vs_code_length(
     data: dict,
     *,
     output_png: Path | None = None,
-    with_ci: bool = False,
+    with_ci: bool | None = None,
     show: bool = True,
 ) -> Path:
     lengths = data["code_lengths"]
-    scheme_all = data["scheme_fpr_all_runs"]
-    scheme_x = data["scheme_fpr_x_matched_runs_only"]
-    prc_rand = data["prc_random_detect_rate"]
+    series = [
+        (
+            "scheme_fpr_all_runs",
+            "Scheme FPR (all runs)",
+            "o-",
+            "scheme_fpr_all_ci_low",
+            "scheme_fpr_all_ci_high",
+        ),
+        (
+            "scheme_fpr_x_matched_runs_only",
+            "Scheme FPR (x matched)",
+            "s--",
+            "scheme_fpr_x_matched_ci_low",
+            "scheme_fpr_x_matched_ci_high",
+        ),
+        (
+            "prc_random_detect_rate",
+            "PRC baseline",
+            "^-",
+            "prc_random_detect_rate_ci_low",
+            "prc_random_detect_rate_ci_high",
+        ),
+    ]
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    if with_ci:
-        ax.errorbar(
-            lengths,
-            scheme_all,
-            yerr=_asym_errbar(
-                scheme_all,
-                data.get("scheme_fpr_all_ci_low", scheme_all),
-                data.get("scheme_fpr_all_ci_high", scheme_all),
-            ),
-            fmt="o-",
-            capsize=4,
-            label="Scheme FPR (all runs)",
+    any_ci = False
+    for y_key, label, fmt, lo_k, hi_k in series:
+        y = list(data[y_key])
+        lo, hi = _resolve_ci(data, y_key, lo_key=lo_k, hi_key=hi_k)
+        draw = _should_draw_ci(with_ci, lo, hi)
+        any_ci = any_ci or draw
+        _plot_line_with_ci_band(
+            ax, lengths, y, label=label, fmt=fmt, ci_low=lo, ci_high=hi, draw_ci=draw
         )
-        ax.errorbar(
-            lengths,
-            scheme_x,
-            yerr=_asym_errbar(
-                scheme_x,
-                data.get("scheme_fpr_x_matched_ci_low", scheme_x),
-                data.get("scheme_fpr_x_matched_ci_high", scheme_x),
-            ),
-            fmt="s--",
-            capsize=4,
-            label="Scheme FPR (x matched)",
-        )
-        ax.errorbar(
-            lengths,
-            prc_rand,
-            yerr=_asym_errbar(
-                prc_rand,
-                data.get("prc_random_detect_rate_ci_low", prc_rand),
-                data.get("prc_random_detect_rate_ci_high", prc_rand),
-            ),
-            fmt="^-",
-            capsize=4,
-            label="PRC baseline",
-        )
-    else:
-        ax.plot(lengths, scheme_all, "o-", label="Scheme FPR (all runs)")
-        ax.plot(lengths, scheme_x, "s--", label="Scheme FPR (x matched)")
-        ax.plot(lengths, prc_rand, "^-", label="PRC baseline")
 
     ax.set_xlabel("Code length (logical PRC bits)")
     ax.set_ylabel("False positive rate")
@@ -98,8 +157,10 @@ def plot_fpr_vs_code_length(
     ax.legend(loc="best")
     fig.tight_layout()
 
-    out = output_png or Path(str(data.get("_source_path", "benchmark_fpr_vs_code_length"))).with_suffix(".png")
-    if with_ci and output_png is None:
+    out = output_png or Path(str(data.get("_source_path", "benchmark_fpr_vs_code_length"))).with_suffix(
+        ".png"
+    )
+    if any_ci and output_png is None and with_ci is not False:
         out = out.with_name(out.stem + "_ci.png")
     fig.savefig(out, dpi=150)
     if show:
@@ -113,57 +174,72 @@ def plot_tpr_vs_redundancy(
     data: dict,
     *,
     output_png: Path | None = None,
-    with_ci: bool = False,
+    with_ci: bool | None = None,
     show: bool = True,
 ) -> Path:
-    redundancies = data["wm_bit_redundancy"]
+    # Prefer blowup key (newer JSON); fall back to redundancy.
+    if "wm_channel_blowup" in data:
+        x_vals = list(data["wm_channel_blowup"])
+        x_label = "WM channel blowup / channel length"
+    else:
+        x_vals = list(data["wm_bit_redundancy"])
+        x_label = "WM bit redundancy / channel length"
     code_length = int(data["code_length"])
-    output_lens = [code_length * int(r) for r in redundancies]
-    tpr_all = data["tpr_all_runs"]
-    tpr_x = data["tpr_x_matched_runs_only"]
+    output_lens = [int(round(code_length * float(r))) for r in x_vals]
+    tpr_all = list(data["tpr_all_runs"])
+    tpr_x = list(data["tpr_x_matched_runs_only"])
+
+    lo_all, hi_all = _resolve_ci(
+        data, "tpr_all_runs", lo_key="tpr_all_runs_ci_low", hi_key="tpr_all_runs_ci_high"
+    )
+    lo_x, hi_x = _resolve_ci(
+        data,
+        "tpr_x_matched_runs_only",
+        lo_key="tpr_x_matched_ci_low",
+        hi_key="tpr_x_matched_ci_high",
+    )
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    if with_ci:
-        ax.errorbar(
-            redundancies,
-            tpr_all,
-            yerr=_asym_errbar(
-                tpr_all,
-                data.get("tpr_all_runs_ci_low", tpr_all),
-                data.get("tpr_all_runs_ci_high", tpr_all),
-            ),
-            fmt="o-",
-            capsize=4,
-            label="All runs",
-        )
-        ax.errorbar(
-            redundancies,
-            tpr_x,
-            yerr=_asym_errbar(
-                tpr_x,
-                data.get("tpr_x_matched_ci_low", tpr_x),
-                data.get("tpr_x_matched_ci_high", tpr_x),
-            ),
-            fmt="s--",
-            capsize=4,
-            label="x matched runs",
-        )
-    else:
-        ax.plot(redundancies, tpr_all, "o-", label="All runs")
-        ax.plot(redundancies, tpr_x, "s--", label="x matched runs")
+    draw_all = _should_draw_ci(with_ci, lo_all, hi_all)
+    draw_x = _should_draw_ci(with_ci, lo_x, hi_x)
+    _plot_line_with_ci_band(
+        ax,
+        x_vals,
+        tpr_all,
+        label="All runs",
+        fmt="o-",
+        ci_low=lo_all,
+        ci_high=hi_all,
+        draw_ci=draw_all,
+    )
+    _plot_line_with_ci_band(
+        ax,
+        x_vals,
+        tpr_x,
+        label="x matched runs",
+        fmt="s--",
+        ci_low=lo_x,
+        ci_high=hi_x,
+        draw_ci=draw_x,
+    )
 
     ax.axhline(1.0, color="gray", linestyle=":", linewidth=1.0)
-    ax.set_xticks(redundancies)
-    ax.set_xticklabels([f"{r}\n({L} ch bits)" for r, L in zip(redundancies, output_lens)])
-    ax.set_xlabel("WM bit redundancy / channel length")
+    ax.set_xticks(x_vals)
+    ax.set_xticklabels([f"{r:g}\n({L} ch bits)" for r, L in zip(x_vals, output_lens)])
+    ax.set_xlabel(x_label)
     ax.set_ylabel("True positive rate")
     ax.set_ylim(-0.02, 1.02)
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best")
     fig.tight_layout()
 
-    out = output_png or Path(str(data.get("_source_path", "benchmark_tpr_vs_wm_bit_redundancy"))).with_suffix(".png")
-    if with_ci and output_png is None:
+    default_stem = (
+        "benchmark_tpr_vs_wm_channel_blowup"
+        if "wm_channel_blowup" in data
+        else "benchmark_tpr_vs_wm_bit_redundancy"
+    )
+    out = output_png or Path(str(data.get("_source_path", default_stem))).with_suffix(".png")
+    if (draw_all or draw_x) and output_png is None and with_ci is not False:
         out = out.with_name(out.stem + "_ci.png")
     fig.savefig(out, dpi=150)
     if show:
@@ -182,6 +258,9 @@ def _matrix_heatmap(
     title: str,
     output_png: Path,
     show: bool,
+    ci_low: dict | None = None,
+    ci_high: dict | None = None,
+    with_ci: bool | None = None,
 ) -> Path:
     num_df = pd.DataFrame(numerators).T.reindex(index=row_labels, columns=col_labels).fillna(0)
     den_df = pd.DataFrame(denominators).T.reindex(index=row_labels, columns=col_labels).fillna(0)
@@ -194,6 +273,32 @@ def _matrix_heatmap(
     ax.set_yticks(range(len(row_labels)))
     ax.set_yticklabels(row_labels)
     ax.set_title(title)
+
+    draw_ci = with_ci is not False and ci_low is not None and ci_high is not None
+    if draw_ci:
+        lo_df = pd.DataFrame(ci_low).T.reindex(index=row_labels, columns=col_labels)
+        hi_df = pd.DataFrame(ci_high).T.reindex(index=row_labels, columns=col_labels)
+        for i, row in enumerate(row_labels):
+            for j, col in enumerate(col_labels):
+                val = pct.values[i, j]
+                if val != val:
+                    continue
+                lo = lo_df.loc[row, col]
+                hi = hi_df.loc[row, col]
+                if lo != lo or hi != hi:
+                    text = f"{val:.0f}"
+                else:
+                    text = f"{val:.0f}\n[{100 * float(lo):.0f}-{100 * float(hi):.0f}]"
+                ax.text(
+                    j,
+                    i,
+                    text,
+                    ha="center",
+                    va="center",
+                    color="white" if val >= 50 else "black",
+                    fontsize=7,
+                )
+
     fig.colorbar(im, ax=ax, label="detect rate (%)")
     fig.tight_layout()
     fig.savefig(output_png, dpi=150)
@@ -204,9 +309,17 @@ def _matrix_heatmap(
     return output_png
 
 
-def plot_label_matrix(data: dict, *, output_png: Path | None = None, show: bool = True) -> Path:
+def plot_label_matrix(
+    data: dict,
+    *,
+    output_png: Path | None = None,
+    with_ci: bool | None = None,
+    show: bool = True,
+) -> Path:
     vocab = list(data["vocab"])
-    out = output_png or Path(str(data.get("_source_path", "benchmark_label_conditioned_detection_matrix"))).with_suffix(".png")
+    out = output_png or Path(
+        str(data.get("_source_path", "benchmark_label_conditioned_detection_matrix"))
+    ).with_suffix(".png")
     return _matrix_heatmap(
         data["numerators"],
         data["denominators"],
@@ -215,6 +328,9 @@ def plot_label_matrix(data: dict, *, output_png: Path | None = None, show: bool 
         title="Label-conditioned detection (%)",
         output_png=out,
         show=show,
+        ci_low=data.get("rates_ci_low"),
+        ci_high=data.get("rates_ci_high"),
+        with_ci=with_ci,
     )
 
 
@@ -223,6 +339,7 @@ def plot_prompt_matrix(
     *,
     output_png: Path | None = None,
     xmatch: bool = False,
+    with_ci: bool | None = None,
     show: bool = True,
 ) -> Path:
     vocab = list(data["vocab"])
@@ -239,6 +356,9 @@ def plot_prompt_matrix(
             title="Prompt-conditioned detection — x matched only (%)",
             output_png=out,
             show=show,
+            ci_low=data.get("rates_attributes_match_ci_low"),
+            ci_high=data.get("rates_attributes_match_ci_high"),
+            with_ci=with_ci,
         )
     return _matrix_heatmap(
         data["numerators"],
@@ -248,10 +368,19 @@ def plot_prompt_matrix(
         title="Prompt-conditioned detection (%)",
         output_png=out,
         show=show,
+        ci_low=data.get("rates_ci_low"),
+        ci_high=data.get("rates_ci_high"),
+        with_ci=with_ci,
     )
 
 
-def plot_ber_diagnostics(data: dict, *, output_png: Path | None = None, show: bool = True) -> Path:
+def plot_ber_diagnostics(
+    data: dict,
+    *,
+    output_png: Path | None = None,
+    with_ci: bool | None = None,
+    show: bool = True,
+) -> Path:
     results = data["results"]
     labels = [f"#{r['index'] + 1}" for r in results]
     stages = {
@@ -260,12 +389,43 @@ def plot_ber_diagnostics(data: dict, *, output_png: Path | None = None, show: bo
         "logic": [r["logical_ber"] for r in results],
         "e2e": [r["end_to_end_ber_master"] for r in results],
     }
+    x = np.arange(len(labels), dtype=float)
 
-    x = np.arange(len(labels))
-    width = 0.18
     fig, ax = plt.subplots(figsize=(max(8, len(labels) * 1.2), 5))
-    for i, (name, vals) in enumerate(stages.items()):
-        ax.bar(x + (i - 1.5) * width, vals, width, label=name)
+    for name, vals in stages.items():
+        _plot_line_with_ci_band(ax, x, vals, label=name, fmt="o-", draw_ci=False)
+
+    # Aggregate mean ± CI as a translucent horizontal band per stage (legend via proxy).
+    aggregates = data.get("aggregates") or {}
+    stage_agg_keys = {
+        "ch ids": "channel_ber_from_ids",
+        "ch txt": "channel_ber_from_text",
+        "logic": "logical_ber",
+        "e2e": "end_to_end_ber_master",
+    }
+    draw_agg = with_ci is not False and bool(aggregates)
+    if draw_agg and len(x) > 0:
+        # Match colors already assigned to stage lines.
+        handles, legend_labels = ax.get_legend_handles_labels()
+        color_by_label = {lab: h.get_color() for h, lab in zip(handles, legend_labels)}
+        x0, x1 = float(x[0]), float(x[-1])
+        for name, agg_key in stage_agg_keys.items():
+            agg = aggregates.get(agg_key) or {}
+            lo = agg.get("ci_low")
+            hi = agg.get("ci_high")
+            if lo is None or hi is None or lo != lo or hi != hi:
+                continue
+            color = color_by_label.get(name, "gray")
+            ax.fill_between(
+                [x0, x1],
+                [float(lo), float(lo)],
+                [float(hi), float(hi)],
+                color=color,
+                alpha=0.15,
+                linewidth=0,
+                zorder=0,
+            )
+
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_ylabel("BER (%)")
@@ -274,7 +434,9 @@ def plot_ber_diagnostics(data: dict, *, output_png: Path | None = None, show: bo
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
 
-    out = output_png or Path(str(data.get("_source_path", "benchmark_ber_diagnostics"))).with_suffix(".png")
+    out = output_png or Path(str(data.get("_source_path", "benchmark_ber_diagnostics"))).with_suffix(
+        ".png"
+    )
     fig.savefig(out, dpi=150)
     if show:
         plt.show()
@@ -288,7 +450,7 @@ def plot_from_file(
     json_path: Path,
     *,
     output_png: Path | None = None,
-    with_ci: bool = False,
+    with_ci: bool | None = None,
     xmatch: bool = False,
     show: bool = True,
 ) -> Path:
@@ -311,11 +473,13 @@ def plot_from_file(
     if resolved == "tpr":
         return plot_tpr_vs_redundancy(data, output_png=output_png, with_ci=with_ci, show=show)
     if resolved == "label-matrix":
-        return plot_label_matrix(data, output_png=output_png, show=show)
+        return plot_label_matrix(data, output_png=output_png, with_ci=with_ci, show=show)
     if resolved == "prompt-matrix":
-        return plot_prompt_matrix(data, output_png=output_png, xmatch=xmatch, show=show)
+        return plot_prompt_matrix(
+            data, output_png=output_png, xmatch=xmatch, with_ci=with_ci, show=show
+        )
     if resolved == "ber":
-        return plot_ber_diagnostics(data, output_png=output_png, show=show)
+        return plot_ber_diagnostics(data, output_png=output_png, with_ci=with_ci, show=show)
     raise ValueError(f"unsupported plot kind {kind!r} (resolved {resolved!r}) for {json_path}")
 
 
@@ -334,10 +498,21 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="PNG output path (default: same stem as JSON).",
     )
-    p.add_argument(
+    p.set_defaults(with_ci=None)
+    ci = p.add_mutually_exclusive_group()
+    ci.add_argument(
         "--with-ci",
-        action="store_true",
-        help="For fpr/tpr sweeps, draw Wilson score error bars.",
+        dest="with_ci",
+        action="store_const",
+        const=True,
+        help="Draw confidence bands/annotations when CI fields are present (default: auto).",
+    )
+    ci.add_argument(
+        "--no-ci",
+        dest="with_ci",
+        action="store_const",
+        const=False,
+        help="Do not draw confidence intervals even if present in the JSON.",
     )
     p.add_argument(
         "--xmatch",

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import random
 import sys
 import time
@@ -357,17 +356,8 @@ def wilson_score_interval(
     n: int,
     *,
     z: float = 1.96) -> tuple[float, float]:
-    """Wilson score interval for binomial proportion ``k/n`` (default ``z`` = 1.96 Γëê two-sided 95%)."""
-    if n < 0 or k < 0 or k > n:
-        raise ValueError(f"invalid wilson_score_interval args: k={k}, n={n}")
-    if n == 0:
-        return (float("nan"), float("nan"))
-    p = k / n
-    z2 = z * z
-    denom = 1.0 + z2 / n
-    centre = (p + z2 / (2 * n)) / denom
-    rad = (z / denom) * math.sqrt((p * (1.0 - p) + z2 / (4 * n)) / n)
-    return (max(0.0, centre - rad), min(1.0, centre + rad))
+    """Wilson score interval for binomial proportion ``k/n`` (default ``z`` ≈ two-sided 95%)."""
+    return benchmark_io.wilson_score_interval(k, n, z=z)
 
 
 def micro_fpr_wilson(
