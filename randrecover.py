@@ -185,14 +185,33 @@ def get_vectorized_partition(vocab_size: int, device: str, seed_index: int) -> t
     return mask.to(device=dev)
 
 
-def get_balanced_partition_from_probs(probs: torch.Tensor) -> torch.BoolTensor:
+def _balanced_orientation_flip(step_index: int) -> bool:
+    """Deterministic pseudorandom orientation of the balanced mask at ``step_index``.
+
+    The greedy split always assigns the heaviest token to set A first, so
+    without this flip the heavier half is almost always A. On natural
+    (non-enforce) steps the sampler takes the heavier half, which would bias
+    recovered bits toward 0. Flipping the orientation pseudorandomly per step
+    makes natural-step bits ~fair coins, and (unlike strict alternation) stays
+    uncorrelated across the depth-layout replicas of one logical bit.
+    """
+    digest = hashlib.md5(f"balanced-flip:{int(step_index)}".encode()).digest()
+    return bool(digest[0] & 1)
+
+
+def get_balanced_partition_from_probs(
+    probs: torch.Tensor, step_index: int = 0
+) -> torch.BoolTensor:
     """
     Split positive-mass tokens into two sets with near-equal probability mass.
 
-    Deterministic given ``probs`` alone: positive-mass tokens are processed by
-    descending probability (ties broken by token id), and each token is assigned
-    to the currently lighter set. Zero-mass tokens get a fixed parity assignment
-    because they cannot affect the probability balance.
+    Deterministic given ``probs`` and ``step_index``: positive-mass tokens are
+    processed by descending probability (ties broken by token id), and each
+    token is assigned to the currently lighter set. Zero-mass tokens get a
+    fixed parity assignment because they cannot affect the probability balance.
+    The A/B orientation is then flipped pseudorandomly per ``step_index`` (see
+    ``_balanced_orientation_flip``); generation and recovery must pass the same
+    ``step_index`` to reconstruct the identical mask.
     """
     if probs.ndim != 1:
         raise ValueError(f"probs must be 1-D, got shape {tuple(probs.shape)}")
@@ -206,12 +225,13 @@ def get_balanced_partition_from_probs(probs: torch.Tensor) -> torch.BoolTensor:
     v = int(p.numel())
     device = p.device
 
+    flip = _balanced_orientation_flip(step_index)
     ids = torch.arange(v, device=device)
     mask = (ids % 2) == 0
 
     positive = (p > 0).nonzero(as_tuple=False).squeeze(1)
     if positive.numel() == 0:
-        return mask
+        return ~mask if flip else mask
 
     p_pos = p[positive]
     # Stable descending-prob order among positive-mass tokens; ties -> smaller id.
@@ -229,7 +249,7 @@ def get_balanced_partition_from_probs(probs: torch.Tensor) -> torch.BoolTensor:
         else:
             mask[idx] = False
             mass_b += float(pi)
-    return mask
+    return ~mask if flip else mask
 
 
 def balanced_partition_masses(probs: torch.Tensor, mask_A: torch.BoolTensor) -> Tuple[float, float]:
@@ -653,7 +673,7 @@ def generate_with_watermark_balanced(
             base_probs = _scores_to_next_token_probs(
                 logits_wm, input_ids_wm, logits_processor
             )
-            mask_A = get_balanced_partition_from_probs(base_probs)
+            mask_A = get_balanced_partition_from_probs(base_probs, bit_idx)
             mass_a, mass_b = balanced_partition_masses(base_probs, mask_A)
             partition_mass_gaps.append(abs(mass_a - mass_b))
 
@@ -837,7 +857,7 @@ def recover_bitstream_balanced(
             base_probs = _scores_to_next_token_probs(
                 logits, input_ids, logits_processor
             )
-            mask_A = get_balanced_partition_from_probs(base_probs)
+            mask_A = get_balanced_partition_from_probs(base_probs, bit_idx)
             mass_a, mass_b = balanced_partition_masses(base_probs, mask_A)
             mass_gaps.append(abs(mass_a - mass_b))
 
