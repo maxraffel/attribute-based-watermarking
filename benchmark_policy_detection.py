@@ -1,4 +1,4 @@
-"""
+﻿"""
 Policy-detection benchmark: same end-to-end flow as ``app.py`` (generate ΓåÆ verify ``derive_attributes`` ΓåÆ
 issue unconstrained + one constrained key per closed-vocabulary label ΓåÆ CPRF seed checks ΓåÆ
 ``master_detect`` / ``detect`` on good transcript ΓåÆ negative-control ``master_detect`` on decoy).
