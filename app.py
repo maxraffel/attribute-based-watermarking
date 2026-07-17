@@ -261,14 +261,8 @@ def main() -> int:
     det_table.add_column("time", justify="right")
     det_table.add_column("check", justify="center")
 
-    # Recover channel bits once; each key only re-derives attributes / CPRF / PRC.
     t0 = time.perf_counter()
-    raw_wm = wm.recover_channel_bits(wm_text)
-    t_recover = time.perf_counter() - t0
-    c.print(f"  [dim]channel recover[/] {t_recover:.3f}s  ({len(raw_wm)} bits)")
-
-    t0 = time.perf_counter()
-    m_ok, m_bits = wm.master_detect(sk, wm_text, raw_bits=raw_wm)
+    m_ok, m_bits = wm.master_detect(sk, wm_text)
     t_m = time.perf_counter() - t0
     ber = _ber_percent(secret, m_bits)
     all_ok &= bool(m_ok)
@@ -285,7 +279,7 @@ def main() -> int:
     )
 
     t0 = time.perf_counter()
-    u_ok, _ = wm.detect(dk_open, wm_text, raw_bits=raw_wm)
+    u_ok, _ = wm.detect(dk_open, wm_text)
     t_u = time.perf_counter() - t0
     all_ok &= u_ok is True
     det_table.add_row(
@@ -300,11 +294,11 @@ def main() -> int:
         _pass_cell(u_ok),
     )
 
-    det_total = t_recover + t_m + t_u
+    det_total = t_m + t_u
     for w in VOCABULARY:
         expect_ok = w in active_set
         t0 = time.perf_counter()
-        w_ok, _ = wm.detect(dk_by_word[w], wm_text, raw_bits=raw_wm)
+        w_ok, _ = wm.detect(dk_by_word[w], wm_text)
         t_w = time.perf_counter() - t0
         det_total += t_w
         all_ok &= bool(w_ok) == bool(expect_ok)
@@ -329,8 +323,7 @@ def main() -> int:
         model=m,
     )
     t0 = time.perf_counter()
-    raw_neg = wm.recover_channel_bits(wrong)
-    neg_ok, _ = wm.master_detect(sk, wrong, raw_bits=raw_neg)
+    neg_ok, _ = wm.master_detect(sk, wrong)
     t_neg = time.perf_counter() - t0
     neg_pass = not bool(neg_ok)
     all_ok &= neg_pass

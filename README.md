@@ -111,8 +111,6 @@ Important behavior:
 - `watermarking.py` - Core API: setup/generate/detect/master_detect
 - `text_attributes.py` - Closed vocabulary, label classification, and `derive_attributes`
 - `randrecover.py` - Watermark embedding/recovery channel logic
-- `scripts/build_partition_weights.py` - One-time unigram count → packaged weights
-- `data/partition_weights/` - Committed partition weight artifacts (no runtime recount)
 - `benchmark_policy_detection.py` - Repeated benchmark runs
 - `test_attr_classification.py` - Simple label-classification demo on sample text
 - `cprf/` - CPRF shared library integration
@@ -148,14 +146,6 @@ For private repos, provide a `GITHUB_TOKEN` secret in Colab so the notebook can 
 - Change attribute size by editing `ATTR_TAIL_DIM` in `text_attributes.py`.
 - Change PRC code length by setting `CODE_LENGTH` in `app.py` (or `wm.SECURITY_PARAM` + `prc.set_code_length(...)` in scripts).
 - Change the watermark LM or sampling: `model.configure(model_id=..., temperature=..., top_p=..., top_k=...)`.
-- Partition masks use **packaged** unigram weights under `data/partition_weights/` (loaded once; not recounted at runtime). Rebuild only when changing tokenizer/vocab:
-
-  ```sh
-  uv sync --extra weights
-  uv run python scripts/build_partition_weights.py
-  ```
-
-  See `data/partition_weights/README.md`.
 
 ---
 
