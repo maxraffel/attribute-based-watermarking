@@ -1,4 +1,4 @@
-"""
+﻿"""
 Policy-detection benchmark: same end-to-end flow as ``app.py`` (generate ΓåÆ verify ``derive_attributes`` ΓåÆ
 issue unconstrained + one constrained key per closed-vocabulary label ΓåÆ CPRF seed checks ΓåÆ
 ``master_detect`` / ``detect`` on good transcript ΓåÆ negative-control ``master_detect`` on decoy).
@@ -52,12 +52,14 @@ def _configure_benchmark(
     *,
     code_length: int,
     wm_bit_redundancy: int = 1,
+    burn_in_tokens: int = 100,
     llm_model_id: str | None = None,
 ) -> None:
     benchmark_io.require_prc_extension()
     wm.SECURITY_PARAM = code_length
     prc.set_code_length(code_length)
     wm.WM_BIT_REDUNDANCY = wm_bit_redundancy
+    wm.BURN_IN_TOKENS = burn_in_tokens
     if llm_model_id:
         model.configure(model_id=llm_model_id)
 
@@ -439,6 +441,7 @@ def run_benchmark_label_conditioned_matrix(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
+    burn_in_tokens: int = 100,
     quiet: bool = False,
 ) -> tuple[int, LabelConditionedDetectionMatrix]:
     """
@@ -462,7 +465,9 @@ def run_benchmark_label_conditioned_matrix(
     _configure_benchmark(
         code_length=code_length,
         wm_bit_redundancy=wm_bit_redundancy,
-        llm_model_id=llm_model_id)
+        burn_in_tokens=burn_in_tokens,
+        llm_model_id=llm_model_id,
+    )
     vocab = tuple(VOCABULARY)
     numerators: dict[str, dict[str, int]] = {
         r: {c: 0 for c in vocab} for r in vocab
@@ -584,6 +589,7 @@ def run_benchmark_prompt_conditioned_matrix(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
+    burn_in_tokens: int = 100,
     quiet: bool = False,
 ) -> tuple[int, PromptConditionedDetectionMatrix]:
     """
@@ -611,7 +617,9 @@ def run_benchmark_prompt_conditioned_matrix(
     _configure_benchmark(
         code_length=code_length,
         wm_bit_redundancy=wm_bit_redundancy,
-        llm_model_id=llm_model_id)
+        burn_in_tokens=burn_in_tokens,
+        llm_model_id=llm_model_id,
+    )
     vocab = tuple(VOCABULARY)
     col_ids = tuple(str(sid) for sid, _ in prompt_cases)
     numerators: dict[str, dict[str, int]] = {r: {p: 0 for p in col_ids} for r in vocab}
@@ -1268,6 +1276,7 @@ def run_benchmark_with_summary(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
+    burn_in_tokens: int = 100,
     quiet: bool = False,
 ) -> tuple[int, BenchmarkRunSummary]:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3", "text_attributes"):
@@ -1276,7 +1285,9 @@ def run_benchmark_with_summary(
     _configure_benchmark(
         code_length=code_length,
         wm_bit_redundancy=wm_bit_redundancy,
-        llm_model_id=llm_model_id)
+        burn_in_tokens=burn_in_tokens,
+        llm_model_id=llm_model_id,
+    )
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     roll_attributes_match: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
     sk_shared: dict[str, Any] = {}
@@ -1285,7 +1296,7 @@ def run_benchmark_with_summary(
     if not quiet:
         console.print(
             f"code_length={wm.SECURITY_PARAM}  wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
-            f"channel_bits={wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
+            f"channel_bits={wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY}  burn_in={wm.BURN_IN_TOKENS}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
             f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
             f"llm={model.MODEL_ID!r}"
         )
@@ -1626,6 +1637,12 @@ def main() -> int:
         metavar="R",
         help="Depth-interleave R replicas of each logical PRC bit on the token channel; recovery uses strict majority (ties->0).")
     p.add_argument(
+        "--burn-in-tokens",
+        type=int,
+        default=100,
+        metavar="B",
+        help="Unwatermarked warm-up tokens before the channel payload (default: 100).")
+    p.add_argument(
         "--output",
         "-o",
         type=Path,
@@ -1658,7 +1675,9 @@ def main() -> int:
         console=console,
         llm_model_id=args.llm_model,
         wm_bit_redundancy=args.wm_bit_redundancy,
-        quiet=False)
+        burn_in_tokens=args.burn_in_tokens,
+        quiet=False,
+    )
     if args.output is not None:
         out = benchmark_io.save_policy_summary(
             args.output,

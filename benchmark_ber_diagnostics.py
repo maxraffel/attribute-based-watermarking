@@ -48,6 +48,7 @@ class BerDiagConfig:
     modulus: int = 1024
     code_length: int = 100
     wm_bit_redundancy: int = 3
+    burn_in_tokens: int = 100
     model_id: str | None = None
 
 
@@ -193,6 +194,7 @@ def _configure(cfg: BerDiagConfig) -> None:
     wm.SECURITY_PARAM = cfg.code_length
     prc.set_code_length(cfg.code_length)
     wm.WM_BIT_REDUNDANCY = cfg.wm_bit_redundancy
+    wm.BURN_IN_TOKENS = cfg.burn_in_tokens
     if cfg.model_id:
         model.configure(model_id=cfg.model_id)
 
@@ -294,13 +296,15 @@ def diagnose_prompt(
     r_ver = sk.eval(verify_attributes)
 
     raw_from_ids, _, _ = randrecover.recover_bitstream_from_generation(
-        m, tok, out, device
+        m, tok, out, device, prefer_text_split=False
     )
-    # Text-only replay: retokenize decoded text under the same prompt.
-    enc = tok(wm_text, return_tensors="pt")
-    text_suffix = enc["input_ids"][0].tolist()
-    raw_from_text, _, _ = randrecover.recover_bitstream(
-        m, tok, prompt, text_suffix, device
+    # Cascade-isolated text path: split at burn_in_char_len, tokenize parts independently.
+    raw_from_text, _, _ = randrecover.recover_bitstream_from_text(
+        m,
+        tok,
+        wm_text,
+        device,
+        burn_in_char_len=int(out["burn_in_char_len"]),
     )
 
     logical_from_text = _logical_bits(
@@ -470,6 +474,7 @@ def print_ber_diagnostics(
     print(f"prompts: {summary.n}")
     print(
         f"code_length: {cfg.code_length}  wm_bit_redundancy: {cfg.wm_bit_redundancy}  "
+        f"burn_in_tokens: {cfg.burn_in_tokens}  "
         f"modulus: {cfg.modulus}"
     )
     print(f"LLM: {model.MODEL_ID}")
@@ -626,6 +631,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--modulus", type=int, default=1024)
     p.add_argument("--code-length", type=int, default=100)
     p.add_argument("--wm-bit-redundancy", type=int, default=1)
+    p.add_argument(
+        "--burn-in-tokens",
+        type=int,
+        default=100,
+        help="Unwatermarked warm-up tokens before the channel payload (default: 100).",
+    )
     p.add_argument("--model-id", default=None)
     p.add_argument(
         "--verbose",
@@ -651,6 +662,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         modulus=args.modulus,
         code_length=args.code_length,
         wm_bit_redundancy=args.wm_bit_redundancy,
+        burn_in_tokens=args.burn_in_tokens,
         model_id=args.model_id,
     )
     summary = run_ber_diagnostics(_load_prompts(args.prompts), cfg)

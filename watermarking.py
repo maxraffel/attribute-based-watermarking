@@ -11,6 +11,9 @@ from text_attributes import derive_attributes, VOCABULARY, CPRF_ATTR_DIM
 
 SECURITY_PARAM = 300
 WM_BIT_REDUNDANCY = 1
+# Free (unwatermarked) model tokens before the channel payload. Prompt-free
+# recovery warms up on this prefix; separate decode+concat isolates retokenization.
+BURN_IN_TOKENS = 100
 
 
 def recover_channel_bits(
@@ -19,18 +22,18 @@ def recover_channel_bits(
     generation_out: Dict[str, Any] | None = None,
     prompt: str | None = None,
 ) -> List[int]:
-    """Recover raw channel bits from a balanced watermarked generation.
+    """Recover raw channel bits via prompt-free balanced rewind.
 
     Call this once per transcript and pass the result to ``detect`` /
     ``master_detect`` via ``recovered_bits`` so multi-key detection does not
     repeat model rewind.
 
-    Balanced recovery requires ``generation_out`` (prompt + model token ids).
-    Text-only inputs (e.g. decoy / negative controls) have no watermark channel
-    to rewind; they receive deterministic uncorrelated bits sized to the
-    expected channel length.
+    With ``generation_out``, recovery uses the cascade-isolated character split
+    (``burn_in_char_len``) and does **not** need the original prompt. Generation
+    builds the same prompt-free partitions while still sampling under the prompt.
+    Text-only decoys without generation metadata receive uncorrelated bits.
     """
-    del prompt  # reserved for callers
+    del prompt  # intentionally unused: recovery is prompt-free
     m, tok, device = model.load()
     if generation_out is not None:
         raw, _, _ = randrecover.recover_bitstream_from_generation(
@@ -95,10 +98,12 @@ def issue(sk: cprf.MasterKey, keywords: List[str]) -> cprf.ConstrainedKey:
 def generate(sk: cprf.MasterKey, prompt: str, *, baseline_text: str | None = None) -> dict:
     m, tok, device = model.load()
     n_channel = SECURITY_PARAM * WM_BIT_REDUNDANCY
+    # Match watermarked length: burn-in + channel tokens.
+    n_baseline = BURN_IN_TOKENS + n_channel
 
     if baseline_text is None:
         t0 = time.perf_counter()
-        baseline = randrecover.generate_baseline(m, tok, prompt, n_channel, device)
+        baseline = randrecover.generate_baseline(m, tok, prompt, n_baseline, device)
         seconds_baseline_gen = time.perf_counter() - t0
     else:
         baseline = baseline_text
@@ -113,7 +118,14 @@ def generate(sk: cprf.MasterKey, prompt: str, *, baseline_text: str | None = Non
     bits = [1 if b else 0 for b in prc.encode(prc.key_gen_from_seed(sha256(r).digest()))]
     channel_bits = expand_channel_bits(bits, WM_BIT_REDUNDANCY)
     t2 = time.perf_counter()
-    out = randrecover.generate_with_watermark(m, tok, prompt, channel_bits, device)
+    out = randrecover.generate_with_watermark(
+        m,
+        tok,
+        prompt,
+        channel_bits,
+        device,
+        burn_in_tokens=BURN_IN_TOKENS,
+    )
     seconds_watermarked_gen = time.perf_counter() - t2
 
     # --- logging ---
@@ -125,6 +137,7 @@ def generate(sk: cprf.MasterKey, prompt: str, *, baseline_text: str | None = Non
     out["prc_secret_bits"] = list(bits)
     out["wm_bit_redundancy"] = WM_BIT_REDUNDANCY
     out["wm_channel_bits"] = list(channel_bits)
+    out["burn_in_tokens"] = BURN_IN_TOKENS
     return out
 
 

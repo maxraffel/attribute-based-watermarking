@@ -140,12 +140,13 @@ For private repos, provide a `GITHUB_TOKEN` secret in Colab so the notebook can 
 
 ## Tuning Notes
 
-- Watermark channel: always **balanced** softmax vocab partitions and **depth** interleaving of PRC bit replicas (`WM_BIT_REDUNDANCY` full codeword passes).
+- Watermark channel: **burn-in** (default 100 free tokens) then **balanced** softmax vocab partitions and **depth** interleaving of PRC bit replicas. During watermarked steps, partitions are built from a **prompt-free** LM context (matching recovery) while sampling still uses the **prompt-conditioned** distribution. Publish uses separate decode+concat so burn-in retokenization cannot shift payload indices.
 - Change subject behavior by editing:
   - `LABEL_QUERY_TEMPLATE` in `text_attributes.py`
   - `VOCABULARY` in `text_attributes.py`
 - Change attribute size by editing `ATTR_TAIL_DIM` in `text_attributes.py`.
 - Change PRC code length by setting `CODE_LENGTH` in `app.py` (or `wm.SECURITY_PARAM` + `prc.set_code_length(...)` in scripts).
+- Change burn-in length via `BURN_IN_TOKENS` in `app.py` / `wm.BURN_IN_TOKENS`.
 - Change the watermark LM or sampling: `model.configure(model_id=..., temperature=..., top_p=..., top_k=...)`.
 
 ---

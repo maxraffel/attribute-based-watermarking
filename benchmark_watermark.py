@@ -49,6 +49,7 @@ class BenchmarkConfig:
     modulus: int = 1024
     code_length: int = 100
     wm_bit_redundancy: int = 7
+    burn_in_tokens: int = 100
     model_id: str | None = None
     repeats_per_prompt: int = 1
     reuse_baseline: bool = True
@@ -123,6 +124,7 @@ def _configure_watermarking(config: BenchmarkConfig) -> None:
     wm.SECURITY_PARAM = config.code_length
     prc.set_code_length(config.code_length)
     wm.WM_BIT_REDUNDANCY = config.wm_bit_redundancy
+    wm.BURN_IN_TOKENS = config.burn_in_tokens
     if config.model_id:
         model.configure(model_id=config.model_id)
 
@@ -379,6 +381,7 @@ def _print_config_block(
     print(
         f"modulus: {config.modulus}  code_length: {config.code_length}  "
         f"wm_bit_redundancy: {config.wm_bit_redundancy}  "
+        f"burn_in_tokens: {config.burn_in_tokens}  "
         f"channel: {config.code_length * config.wm_bit_redundancy} bits (depth-interleaved, balanced partition)"
     )
     print(f"LLM: {model.MODEL_ID}")
@@ -549,6 +552,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--modulus", type=int, default=1024)
     p.add_argument("--code-length", type=int, default=100)
     p.add_argument("--wm-bit-redundancy", type=int, default=5)
+    p.add_argument(
+        "--burn-in-tokens",
+        type=int,
+        default=100,
+        help="Unwatermarked warm-up tokens before the channel payload (default: 100).",
+    )
     p.add_argument("--model-id", default=None, help="Override LM hub id (default from model.py).")
     p.add_argument(
         "--no-reuse-baseline",
@@ -584,6 +593,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         modulus=args.modulus,
         code_length=args.code_length,
         wm_bit_redundancy=args.wm_bit_redundancy,
+        burn_in_tokens=args.burn_in_tokens,
         model_id=args.model_id,
         repeats_per_prompt=args.repeats,
         reuse_baseline=not args.no_reuse_baseline,

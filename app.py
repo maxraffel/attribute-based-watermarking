@@ -36,6 +36,7 @@ from text_attributes import (
 MODULUS = 1024
 CODE_LENGTH = 100
 WM_BIT_REDUNDANCY = 3  # depth-interleaved channel repeats per PRC bit; recovery = strict majority (tie → 0)
+BURN_IN_TOKENS = 100  # free tokens before watermark payload (prompt-free recovery warm-up)
 MODEL_ID: str | None = None  # None → ``model.DEFAULT_MODEL_ID``
 PROMPT = (
     # '''Explain the economic nuance and impact of Drake Maye during his college football career at North Carolina.'''
@@ -169,6 +170,7 @@ def main() -> int:
             f"[bold]modulus[/] {MODULUS}  ·  [bold]code_length[/] {CODE_LENGTH}  ·  "
             f"[bold]wm_bit_redundancy[/] {WM_BIT_REDUNDANCY}  "
             f"(channel {CODE_LENGTH * WM_BIT_REDUNDANCY} bits, depth-interleaved)\n"
+            f"[bold]burn_in_tokens[/] {BURN_IN_TOKENS}  ·  "
             f"[bold]partition[/] balanced softmax  ·  "
             f"[bold]LLM[/] {model.MODEL_ID}\n"
             f"[bold]sampling[/] temperature={model.SAMPLING['temperature']}  "
@@ -182,6 +184,7 @@ def main() -> int:
     wm.SECURITY_PARAM = CODE_LENGTH
     prc.set_code_length(CODE_LENGTH)
     wm.WM_BIT_REDUNDANCY = WM_BIT_REDUNDANCY
+    wm.BURN_IN_TOKENS = BURN_IN_TOKENS
 
     c.rule("1) Setup & generate", style="cyan")
     sk = wm.setup(MODULUS)
