@@ -49,6 +49,8 @@ class BenchmarkConfig:
     modulus: int = 1024
     code_length: int = 100
     wm_bit_redundancy: int = 7
+    redundancy_layout: str = "depth"
+    partition_mode: str = "static"
     model_id: str | None = None
     repeats_per_prompt: int = 1
     reuse_baseline: bool = True
@@ -123,6 +125,8 @@ def _configure_watermarking(config: BenchmarkConfig) -> None:
     wm.SECURITY_PARAM = config.code_length
     prc.set_code_length(config.code_length)
     wm.WM_BIT_REDUNDANCY = config.wm_bit_redundancy
+    wm.set_redundancy_layout(config.redundancy_layout)
+    wm.set_partition_mode(config.partition_mode)
     if config.model_id:
         model.configure(model_id=config.model_id)
 
@@ -182,13 +186,14 @@ def run_protocol_once(
     label_policy_ok: dict[str, bool] = {}
 
     t0 = time.perf_counter()
-    m_ok, m_bits = wm.master_detect(sk, wm_text)
+    recovered_wm = wm.recover_channel_bits(wm_text, generation_out=out)
+    m_ok, m_bits = wm.master_detect(sk, wm_text, recovered_bits=recovered_wm)
     t_m = time.perf_counter() - t0
     master_ber = _ber_percent(secret, m_bits)
     all_ok &= bool(m_ok)
 
     t0 = time.perf_counter()
-    u_ok, _ = wm.detect(dk_open, wm_text)
+    u_ok, _ = wm.detect(dk_open, wm_text, recovered_bits=recovered_wm)
     t_u = time.perf_counter() - t0
     all_ok &= u_ok is True
 
@@ -196,7 +201,7 @@ def run_protocol_once(
     for w in VOCABULARY:
         expect_ok = w in active_set
         t0 = time.perf_counter()
-        w_ok, _ = wm.detect(dk_by_word[w], wm_text)
+        w_ok, _ = wm.detect(dk_by_word[w], wm_text, recovered_bits=recovered_wm)
         det_total += time.perf_counter() - t0
         ok_w = bool(w_ok) == bool(expect_ok)
         label_policy_ok[w] = ok_w
@@ -213,7 +218,8 @@ def run_protocol_once(
         model=m,
     )
     t0 = time.perf_counter()
-    neg_ok, _ = wm.master_detect(sk, wrong)
+    recovered_neg = wm.recover_channel_bits(wrong)
+    neg_ok, _ = wm.master_detect(sk, wrong, recovered_bits=recovered_neg)
     det_total += time.perf_counter() - t0
     neg_control_pass = not bool(neg_ok)
     all_ok &= neg_control_pass
@@ -377,6 +383,8 @@ def _print_config_block(
     print(
         f"modulus: {config.modulus}  code_length: {config.code_length}  "
         f"wm_bit_redundancy: {config.wm_bit_redundancy}  "
+        f"redundancy_layout: {config.redundancy_layout}  "
+        f"partition_mode: {config.partition_mode}  "
         f"channel: {config.code_length * config.wm_bit_redundancy} bits"
     )
     print(f"LLM: {model.MODEL_ID}")
@@ -547,6 +555,18 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--modulus", type=int, default=1024)
     p.add_argument("--code-length", type=int, default=100)
     p.add_argument("--wm-bit-redundancy", type=int, default=5)
+    p.add_argument(
+        "--redundancy-layout",
+        choices=("depth", "block"),
+        default="depth",
+        help="Channel replica layout: depth (interleaved passes) or block (contiguous).",
+    )
+    p.add_argument(
+        "--partition-mode",
+        choices=("static", "balanced"),
+        default="static",
+        help="Vocab partition scheme: static (original) or balanced (per-step softmax).",
+    )
     p.add_argument("--model-id", default=None, help="Override LM hub id (default from model.py).")
     p.add_argument(
         "--no-reuse-baseline",
@@ -582,6 +602,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         modulus=args.modulus,
         code_length=args.code_length,
         wm_bit_redundancy=args.wm_bit_redundancy,
+        redundancy_layout=args.redundancy_layout,
+        partition_mode=args.partition_mode,
         model_id=args.model_id,
         repeats_per_prompt=args.repeats,
         reuse_baseline=not args.no_reuse_baseline,

@@ -48,6 +48,8 @@ class BerDiagConfig:
     modulus: int = 1024
     code_length: int = 100
     wm_bit_redundancy: int = 3
+    redundancy_layout: str = "depth"
+    partition_mode: str = "static"
     model_id: str | None = None
 
 
@@ -140,8 +142,20 @@ def _bit_errors(secret: Sequence[int], recovered: Sequence[int]) -> list[int]:
     return [i for i in range(len(s)) if s[i] != r[i]]
 
 
-def _logical_bits(raw: Sequence[int], code_length: int, redundancy: int) -> list[int]:
-    return wm.majority_deinterleave(raw, code_length, redundancy)
+def _logical_bits(
+    raw: Sequence[int],
+    code_length: int,
+    redundancy: int,
+    layout: str | None = None,
+) -> list[int]:
+    return wm.majority_deinterleave(raw, code_length, redundancy, layout=layout)
+
+
+def _replica_indices(bit_index: int, code_length: int, redundancy: int, layout: str) -> list[int]:
+    if layout == "block":
+        base = bit_index * redundancy
+        return [base + r for r in range(redundancy)]
+    return [bit_index + r * code_length for r in range(redundancy)]
 
 
 def _majority_vote_analysis(
@@ -149,25 +163,26 @@ def _majority_vote_analysis(
     raw: Sequence[int],
     code_length: int,
     redundancy: int,
+    layout: str | None = None,
 ) -> tuple[int, int, int]:
     """Return (corrections, regressions, tie_votes) relative to embedded logical bits."""
     if redundancy <= 1:
         return 0, 0, 0
-    secret_logical = _logical_bits(channel_bits, code_length, redundancy)
-    raw_logical = _logical_bits(raw, code_length, redundancy)
+    layout_key = (wm.REDUNDANCY_LAYOUT if layout is None else layout).strip().lower()
+    secret_logical = _logical_bits(channel_bits, code_length, redundancy, layout_key)
+    raw_logical = _logical_bits(raw, code_length, redundancy, layout_key)
     corrections = regressions = tie_votes = 0
     need = code_length * redundancy
     padded = (list(raw) + [0] * need)[:need]
     for i in range(code_length):
-        votes = [int(padded[i + r * code_length]) for r in range(redundancy)]
+        idxs = _replica_indices(i, code_length, redundancy, layout_key)
+        votes = [int(padded[j]) for j in idxs]
         if 2 * sum(votes) == redundancy:
             tie_votes += 1
         embedded = secret_logical[i]
         recovered = raw_logical[i]
         chunk_err = any(
-            (idx := i + r * code_length) < len(channel_bits)
-            and int(channel_bits[idx]) != int(padded[idx])
-            for r in range(redundancy)
+            j < len(channel_bits) and int(channel_bits[j]) != int(padded[j]) for j in idxs
         )
         if chunk_err and embedded == recovered:
             corrections += 1
@@ -186,6 +201,8 @@ def _configure(cfg: BerDiagConfig) -> None:
     wm.SECURITY_PARAM = cfg.code_length
     prc.set_code_length(cfg.code_length)
     wm.WM_BIT_REDUNDANCY = cfg.wm_bit_redundancy
+    wm.set_redundancy_layout(cfg.redundancy_layout)
+    wm.set_partition_mode(cfg.partition_mode)
     if cfg.model_id:
         model.configure(model_id=cfg.model_id)
 
@@ -289,47 +306,68 @@ def diagnose_prompt(
     r_ver = sk.eval(verify_attributes)
 
     ids_suffix = out["input_ids_wm"][0].tolist()
-    raw_from_ids, _ = randrecover.recover_bitstream(
-        ids_suffix, partition_dim, device, special_ids, tokenizer=tok
-    )
-    raw_from_text, _ = randrecover.recover_bitstream_from_text(
-        wm_text, tok, device, model=m, partition_vocab_size=partition_dim
-    )
+    if cfg.partition_mode == "balanced":
+        raw_from_ids, _, _ = randrecover.recover_bitstream_balanced_from_generation(
+            m, tok, out, device
+        )
+        # Text-only replay: retokenize decoded text under the same prompt.
+        enc = tok(wm_text, return_tensors="pt")
+        text_suffix = enc["input_ids"][0].tolist()
+        raw_from_text, _, _ = randrecover.recover_bitstream_balanced(
+            m, tok, prompt, text_suffix, device
+        )
+    else:
+        raw_from_ids, _ = randrecover.recover_bitstream(
+            ids_suffix, partition_dim, device, special_ids, tokenizer=tok
+        )
+        raw_from_text, _ = randrecover.recover_bitstream_from_text(
+            wm_text, tok, device, model=m, partition_vocab_size=partition_dim
+        )
 
     logical_from_text = _logical_bits(
-        raw_from_text, cfg.code_length, cfg.wm_bit_redundancy
+        raw_from_text, cfg.code_length, cfg.wm_bit_redundancy, cfg.redundancy_layout
     )
 
-    audit = randrecover.audit_partition_replication_tokenwise(out, tok, device, model=m)
-    channel_steps: list[randrecover.WatermarkChannelStep] = list(out.get("channel_steps") or [])
+    audit = None
+    audit_rows = []
+    gen_errs = rec_errs = map_mismatches = cell_mismatches = 0
+    if hasattr(randrecover, "audit_partition_replication_tokenwise"):
+        audit = randrecover.audit_partition_replication_tokenwise(out, tok, device, model=m)
+        audit_rows = list(audit.rows)
+        for row in audit_rows:
+            k = row.bit_index
+            if k < len(channel_bits):
+                emb = int(channel_bits[k])
+                if (
+                    row.bit_implied_by_generation_mask is not None
+                    and row.bit_implied_by_generation_mask != emb
+                ):
+                    gen_errs += 1
+                if row.bit_from_recovery_pipeline is not None and row.bit_from_recovery_pipeline != emb:
+                    rec_errs += 1
+            if row.mapping_entry_agrees_with_token_id is False:
+                map_mismatches += 1
+            cell_mismatches += row.num_vocab_cells_mismatched
+
+    channel_steps: list = list(out.get("channel_steps") or [])
     partition_breakdown = _analyze_partition_error_causes(
         channel_bits, raw_from_ids, raw_from_text, channel_steps
     )
 
-    gen_errs = rec_errs = map_mismatches = cell_mismatches = 0
-    for row in audit.rows:
-        k = row.bit_index
-        if k < len(channel_bits):
-            emb = int(channel_bits[k])
-            if (
-                row.bit_implied_by_generation_mask is not None
-                and row.bit_implied_by_generation_mask != emb
-            ):
-                gen_errs += 1
-            if row.bit_from_recovery_pipeline is not None and row.bit_from_recovery_pipeline != emb:
-                rec_errs += 1
-        if row.mapping_entry_agrees_with_token_id is False:
-            map_mismatches += 1
-        cell_mismatches += row.num_vocab_cells_mismatched
-
     vote_corr, vote_reg, tie_votes = _majority_vote_analysis(
-        channel_bits, raw_from_text, cfg.code_length, cfg.wm_bit_redundancy
+        channel_bits,
+        raw_from_text,
+        cfg.code_length,
+        cfg.wm_bit_redundancy,
+        cfg.redundancy_layout,
     )
 
     detect_oracle_both = _prc_detect(r_enc, secret, cfg.code_length)
     detect_oracle_key = _prc_detect(r_enc, logical_from_text, cfg.code_length)
     detect_oracle_bits = _prc_detect(r_ver, secret, cfg.code_length)
-    master_ok, master_bits = wm.master_detect(sk, wm_text)
+    master_ok, master_bits = wm.master_detect(
+        sk, wm_text, recovered_bits=raw_from_text
+    )
 
     ch_ids = _ber_percent(channel_bits, raw_from_ids)
     ch_text = _ber_percent(channel_bits, raw_from_text)
@@ -346,8 +384,13 @@ def diagnose_prompt(
             f"Retokenization adds {ch_text - ch_ids:.1f}% channel BER "
             f"({ch_ids:.1f}% ids -> {ch_text:.1f}% text)"
         )
-    if not audit.all_partitions_recreated:
-        notes.append("Generation vs recovery partition masks differ (vocab dim mismatch?)")
+    partitions_match = True
+    n_payload_tokens = len(raw_from_ids)
+    if audit is not None:
+        partitions_match = bool(audit.all_partitions_recreated)
+        n_payload_tokens = int(audit.num_payload_tokens)
+        if not partitions_match:
+            notes.append("Generation vs recovery partition masks differ (vocab dim mismatch?)")
     if gen_errs > 0:
         notes.append(
             f"{gen_errs} tokens landed outside secret half at generation "
@@ -382,7 +425,7 @@ def diagnose_prompt(
         n_channel_embedded=len(channel_bits),
         n_channel_from_ids=len(raw_from_ids),
         n_channel_from_text=len(raw_from_text),
-        n_payload_tokens=audit.num_payload_tokens,
+        n_payload_tokens=n_payload_tokens,
         channel_ber_from_ids=ch_ids,
         channel_ber_from_text=ch_text,
         retokenization_extra_ber=max(0.0, ch_text - ch_ids),
@@ -396,7 +439,7 @@ def diagnose_prompt(
         detect_oracle_key=detect_oracle_key,
         detect_oracle_bits=detect_oracle_bits,
         detect_actual_master=bool(master_ok),
-        partition_masks_match=audit.all_partitions_recreated,
+        partition_masks_match=partitions_match,
         channel_errors_at_generation=gen_errs,
         channel_errors_at_recovery=rec_errs,
         partition_error_breakdown=partition_breakdown,
@@ -449,6 +492,8 @@ def print_ber_diagnostics(
     print(f"prompts: {summary.n}")
     print(
         f"code_length: {cfg.code_length}  wm_bit_redundancy: {cfg.wm_bit_redundancy}  "
+        f"redundancy_layout: {cfg.redundancy_layout}  "
+        f"partition_mode: {cfg.partition_mode}  "
         f"modulus: {cfg.modulus}"
     )
     print(f"LLM: {model.MODEL_ID}")
@@ -605,6 +650,18 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--modulus", type=int, default=1024)
     p.add_argument("--code-length", type=int, default=100)
     p.add_argument("--wm-bit-redundancy", type=int, default=1)
+    p.add_argument(
+        "--redundancy-layout",
+        choices=("depth", "block"),
+        default="depth",
+        help="Channel replica layout: depth (interleaved passes) or block (contiguous).",
+    )
+    p.add_argument(
+        "--partition-mode",
+        choices=("static", "balanced"),
+        default="static",
+        help="Vocab partition scheme: static (original) or balanced (per-step softmax).",
+    )
     p.add_argument("--model-id", default=None)
     p.add_argument(
         "--verbose",
@@ -630,6 +687,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         modulus=args.modulus,
         code_length=args.code_length,
         wm_bit_redundancy=args.wm_bit_redundancy,
+        redundancy_layout=args.redundancy_layout,
+        partition_mode=args.partition_mode,
         model_id=args.model_id,
     )
     summary = run_ber_diagnostics(_load_prompts(args.prompts), cfg)

@@ -52,12 +52,16 @@ def _configure_benchmark(
     *,
     code_length: int,
     wm_bit_redundancy: int = 1,
+    partition_mode: str = "static",
+    redundancy_layout: str = "depth",
     llm_model_id: str | None = None,
 ) -> None:
     benchmark_io.require_prc_extension()
     wm.SECURITY_PARAM = code_length
     prc.set_code_length(code_length)
     wm.WM_BIT_REDUNDANCY = wm_bit_redundancy
+    wm.set_partition_mode(partition_mode)
+    wm.set_redundancy_layout(redundancy_layout)
     if llm_model_id:
         model.configure(model_id=llm_model_id)
 
@@ -454,6 +458,8 @@ def run_benchmark_label_conditioned_matrix(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
+    partition_mode: str = "static",
+    redundancy_layout: str = "depth",
     quiet: bool = False,
 ) -> tuple[int, LabelConditionedDetectionMatrix]:
     """
@@ -477,6 +483,8 @@ def run_benchmark_label_conditioned_matrix(
     _configure_benchmark(
         code_length=code_length,
         wm_bit_redundancy=wm_bit_redundancy,
+        partition_mode=partition_mode,
+        redundancy_layout=redundancy_layout,
         llm_model_id=llm_model_id,
     )
     vocab = tuple(VOCABULARY)
@@ -496,7 +504,9 @@ def run_benchmark_label_conditioned_matrix(
     if not quiet:
         console.print(
             f"matrix benchmark  code_length={wm.SECURITY_PARAM}  "
-            f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  modulus={modulus}  runs={runs}  |V|={len(vocab)}  "
+            f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  partition_mode={wm.PARTITION_MODE}  "
+            f"redundancy_layout={wm.REDUNDANCY_LAYOUT}  "
+            f"modulus={modulus}  runs={runs}  |V|={len(vocab)}  "
             f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
             f"llm={model.MODEL_ID!r}"
         )
@@ -602,6 +612,8 @@ def run_benchmark_prompt_conditioned_matrix(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
+    partition_mode: str = "static",
+    redundancy_layout: str = "depth",
     quiet: bool = False,
 ) -> tuple[int, PromptConditionedDetectionMatrix]:
     """
@@ -629,6 +641,8 @@ def run_benchmark_prompt_conditioned_matrix(
     _configure_benchmark(
         code_length=code_length,
         wm_bit_redundancy=wm_bit_redundancy,
+        partition_mode=partition_mode,
+        redundancy_layout=redundancy_layout,
         llm_model_id=llm_model_id,
     )
     vocab = tuple(VOCABULARY)
@@ -647,7 +661,9 @@ def run_benchmark_prompt_conditioned_matrix(
     if not quiet:
         console.print(
             f"prompt-matrix benchmark  code_length={wm.SECURITY_PARAM}  "
-            f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  modulus={modulus}  runs={runs}  |V|={len(vocab)}  "
+            f"wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  partition_mode={wm.PARTITION_MODE}  "
+            f"redundancy_layout={wm.REDUNDANCY_LAYOUT}  "
+            f"modulus={modulus}  runs={runs}  |V|={len(vocab)}  "
             f"|P|={len(col_ids)}  keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
             f"llm={model.MODEL_ID!r}"
         )
@@ -823,19 +839,20 @@ def run_one_trial(
     tt.t_cprf_checks = time.perf_counter() - t_c0
 
     t_m0 = time.perf_counter()
-    m_ok, m_bits = wm.master_detect(sk, wm_text)
+    recovered_wm = wm.recover_channel_bits(wm_text, generation_out=out)
+    m_ok, m_bits = wm.master_detect(sk, wm_text, recovered_bits=recovered_wm)
     tt.t_master_good = time.perf_counter() - t_m0
     ber = _ber_percent(secret, m_bits)
 
     t_u0 = time.perf_counter()
-    u_ok, _ = wm.detect(dk_open, wm_text)
+    u_ok, _ = wm.detect(dk_open, wm_text, recovered_bits=recovered_wm)
     tt.t_detect_open = time.perf_counter() - t_u0
 
     word_stats: list[dict[str, Any]] = []
     t_pv0 = time.perf_counter()
     for w in VOCABULARY:
         expect_detect = w in active_set
-        got, _ = wm.detect(dk_by_word[w], wm_text)
+        got, _ = wm.detect(dk_by_word[w], wm_text, recovered_bits=recovered_wm)
         word_stats.append(
             {
                 "word": w,
@@ -856,7 +873,8 @@ def run_one_trial(
         n_bits=wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY,
         model=m,
     )
-    ctrl_ok_raw, _ = wm.master_detect(sk, wrong)
+    recovered_neg = wm.recover_channel_bits(wrong)
+    ctrl_ok_raw, _ = wm.master_detect(sk, wrong, recovered_bits=recovered_neg)
     control_ok = not bool(ctrl_ok_raw)
     tt.t_negative_control = time.perf_counter() - t_nc0
 
@@ -1314,6 +1332,8 @@ def run_benchmark_with_summary(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
+    partition_mode: str = "static",
+    redundancy_layout: str = "depth",
     quiet: bool = False,
 ) -> tuple[int, BenchmarkRunSummary]:
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3", "text_attributes"):
@@ -1322,6 +1342,8 @@ def run_benchmark_with_summary(
     _configure_benchmark(
         code_length=code_length,
         wm_bit_redundancy=wm_bit_redundancy,
+        partition_mode=partition_mode,
+        redundancy_layout=redundancy_layout,
         llm_model_id=llm_model_id,
     )
     roll: dict[str, PromptRollup] = {sid: PromptRollup() for sid, _ in prompt_cases}
@@ -1332,6 +1354,8 @@ def run_benchmark_with_summary(
     if not quiet:
         console.print(
             f"code_length={wm.SECURITY_PARAM}  wm_bit_redundancy={wm.WM_BIT_REDUNDANCY}  "
+            f"partition_mode={wm.PARTITION_MODE}  "
+            f"redundancy_layout={wm.REDUNDANCY_LAYOUT}  "
             f"channel_bits={wm.SECURITY_PARAM * wm.WM_BIT_REDUNDANCY}  modulus={modulus}  runs={runs}  |V|={vocab_n}  "
             f"keys={'fresh per trial' if fresh_key_per_trial else 'reuse per prompt id'}  "
             f"llm={model.MODEL_ID!r}"
@@ -1447,6 +1471,8 @@ def run_benchmark(
     console: Console,
     llm_model_id: str | None = None,
     wm_bit_redundancy: int = 1,
+    partition_mode: str = "static",
+    redundancy_layout: str = "depth",
 ) -> int:
     code, _ = run_benchmark_with_summary(
         prompt_cases=prompt_cases,
@@ -1457,6 +1483,8 @@ def run_benchmark(
         console=console,
         llm_model_id=llm_model_id,
         wm_bit_redundancy=wm_bit_redundancy,
+        partition_mode=partition_mode,
+        redundancy_layout=redundancy_layout,
         quiet=False,
     )
     return code
@@ -1472,6 +1500,8 @@ def run_fpr_vs_code_length_sweep(
     fresh_key_per_trial: bool,
     console: Console,
     llm_model_id: str | None = None,
+    partition_mode: str = "static",
+    redundancy_layout: str = "depth",
     prc_monte_carlo_trials: int = 100_000,
     rng: random.Random | None = None,
     quiet: bool = True,
@@ -1513,6 +1543,8 @@ def run_fpr_vs_code_length_sweep(
             console=console,
             llm_model_id=llm_model_id,
             wm_bit_redundancy=int(wm_bit_redundancy),
+            partition_mode=partition_mode,
+            redundancy_layout=redundancy_layout,
             quiet=quiet,
         )
         lengths.append(int(length))
@@ -1551,6 +1583,8 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
     fresh_key_per_trial: bool,
     console: Console,
     llm_model_id: str | None = None,
+    partition_mode: str = "static",
+    redundancy_layout: str = "depth",
     quiet: bool = True,
 ) -> tuple[list[int], dict[str, list[float]], list[int]]:
     """Sweep ``wm_bit_redundancy`` at fixed logical ``code_length``."""
@@ -1573,6 +1607,8 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
             console=console,
             llm_model_id=llm_model_id,
             wm_bit_redundancy=int(redundancy),
+            partition_mode=partition_mode,
+            redundancy_layout=redundancy_layout,
             quiet=quiet,
         )
         redundancies.append(int(redundancy))
@@ -1687,6 +1723,18 @@ def main() -> int:
         help="Depth-interleave R replicas of each logical PRC bit on the token channel; recovery uses strict majority (ties->0).",
     )
     p.add_argument(
+        "--partition-mode",
+        choices=("static", "balanced"),
+        default="static",
+        help="Vocab partition scheme: static (original) or balanced (per-step softmax).",
+    )
+    p.add_argument(
+        "--redundancy-layout",
+        choices=("depth", "block"),
+        default="depth",
+        help="Channel replica layout: depth (interleaved passes) or block (contiguous).",
+    )
+    p.add_argument(
         "--output",
         "-o",
         type=Path,
@@ -1720,6 +1768,8 @@ def main() -> int:
         console=console,
         llm_model_id=args.llm_model,
         wm_bit_redundancy=args.wm_bit_redundancy,
+        partition_mode=args.partition_mode,
+        redundancy_layout=args.redundancy_layout,
         quiet=False,
     )
     if args.output is not None:

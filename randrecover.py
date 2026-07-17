@@ -185,6 +185,64 @@ def get_vectorized_partition(vocab_size: int, device: str, seed_index: int) -> t
     return mask.to(device=dev)
 
 
+def get_balanced_partition_from_probs(probs: torch.Tensor) -> torch.BoolTensor:
+    """
+    Split positive-mass tokens into two sets with near-equal probability mass.
+
+    Deterministic given ``probs`` alone: positive-mass tokens are processed by
+    descending probability (ties broken by token id), and each token is assigned
+    to the currently lighter set. Zero-mass tokens get a fixed parity assignment
+    because they cannot affect the probability balance.
+    """
+    if probs.ndim != 1:
+        raise ValueError(f"probs must be 1-D, got shape {tuple(probs.shape)}")
+    p = probs.detach().to(dtype=torch.float32)
+    if not torch.isfinite(p).all():
+        raise ValueError("probs must be finite")
+    total = float(p.sum().item())
+    if total <= 0.0:
+        raise ValueError("probs must sum to a positive value")
+    p = p / total
+    v = int(p.numel())
+    device = p.device
+
+    ids = torch.arange(v, device=device)
+    mask = (ids % 2) == 0
+
+    positive = (p > 0).nonzero(as_tuple=False).squeeze(1)
+    if positive.numel() == 0:
+        return mask
+
+    p_pos = p[positive]
+    # Stable descending-prob order among positive-mass tokens; ties -> smaller id.
+    keys = (1.0 - p_pos) * float(v + 1) + positive.to(dtype=p.dtype)
+    order = torch.argsort(keys)
+    pos_sorted = positive[order]
+    p_sorted = p_pos[order]
+
+    mass_a = 0.0
+    mass_b = 0.0
+    for idx, pi in zip(pos_sorted.tolist(), p_sorted.tolist()):
+        if mass_a <= mass_b:
+            mask[idx] = True
+            mass_a += float(pi)
+        else:
+            mask[idx] = False
+            mass_b += float(pi)
+    return mask
+
+
+def balanced_partition_masses(probs: torch.Tensor, mask_A: torch.BoolTensor) -> Tuple[float, float]:
+    """Return ``(mass_A, mass_B)`` for ``probs`` under ``mask_A``."""
+    p = probs.detach().to(dtype=torch.float32)
+    total = float(p.sum().item())
+    if total <= 0.0:
+        return 0.0, 0.0
+    p = p / total
+    mass_a = float(p[mask_A].sum().item())
+    return mass_a, 1.0 - mass_a
+
+
 def resolve_partition_vocab_size_for_recovery(
     tokenizer: AutoTokenizer,
     *,
@@ -423,6 +481,7 @@ def generate_with_watermark(
 
     Partition index ``k`` is always ``len(prev_retok_ids_ns)`` — the same index
     ``recover_bitstream`` uses for the ``k``-th non-special token at detect time.
+    Uses static unigram-balanced vocabulary partitions (independent of step probs).
     """
     special_ids = set(getattr(tokenizer, "all_special_ids", []))
     inputs = encode_prompt_for_generation(tokenizer, prompt, device)
@@ -525,6 +584,8 @@ def generate_with_watermark(
         "prompt_text": prompt,
         "generated_text_wm": generated_text_wm,
         "input_ids_wm": recovery_input_ids,
+        "model_input_ids": input_ids_wm.detach().cpu(),
+        "prompt_len": prompt_len,
         "secret_bitstream": secret_bitstream,
         "sacrificed_bits": sacrificed_bits,
         "natural_partition_choices": natural_partition_choices,
@@ -533,6 +594,125 @@ def generate_with_watermark(
         "recovery_ids_aligned": recovery_ids_aligned,
         "recovery_slots_committed": len(prev_retok_ids_ns),
         "incremental_ids_aligned": gen_ns == recovery_ns,
+        "partition_mode": "static",
+        "partition_vocab_dim": partition_vocab_dim,
+    }
+
+
+def generate_with_watermark_balanced(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    secret_bitstream: List[int],
+    device: str = "cpu",
+    *,
+    generation_extra: Dict[str, Any] | None = None,
+) -> Dict:
+    """Watermark by biasing each model step with a softmax-balanced vocab split.
+
+    Unlike ``generate_with_watermark``, one secret bit is bound to each generated
+    model token (not a retokenized recovery slot). Partitions are recomputed from
+    the current next-token distribution so the two halves have near-equal mass.
+    Use ``recover_bitstream_balanced`` with the same prompt and model token ids.
+    """
+    special_ids = set(getattr(tokenizer, "all_special_ids", []))
+    inputs = encode_prompt_for_generation(tokenizer, prompt, device)
+    input_ids_wm = inputs["input_ids"].clone()
+    prompt_len = int(inputs["input_ids"].shape[1])
+    attn_mask = inputs.get("attention_mask", None)
+
+    n_bits = len(secret_bitstream)
+    _, logits_processor = _prepare_sampling_logits_processor_bundle(
+        model,
+        tokenizer,
+        inputs,
+        decode_horizon=n_bits,
+        generation_extra=generation_extra,
+    )
+    natural_partition_choices = 0
+    partition_mass_gaps: List[float] = []
+    partition_vocab_dim: int | None = None
+    model_kwargs: Dict[str, Any] = {"use_cache": True}
+    if attn_mask is not None:
+        model_kwargs["attention_mask"] = attn_mask
+    step_input_ids = input_ids_wm
+
+    for bit_idx in range(n_bits):
+        with torch.no_grad():
+            outputs = model(input_ids=step_input_ids, **model_kwargs)
+            logits_wm = outputs.logits[0, -1, :]
+            d_logits = int(logits_wm.shape[-1])
+            if partition_vocab_dim is None:
+                partition_vocab_dim = d_logits
+            elif partition_vocab_dim != d_logits:
+                raise RuntimeError(
+                    f"logits vocab width changed mid-decode ({d_logits} vs {partition_vocab_dim})"
+                )
+            model_kwargs["past_key_values"] = outputs.past_key_values
+
+            base_probs = _scores_to_next_token_probs(
+                logits_wm, input_ids_wm, logits_processor
+            )
+            mask_A = get_balanced_partition_from_probs(base_probs)
+            mass_a, mass_b = balanced_partition_masses(base_probs, mask_A)
+            partition_mass_gaps.append(abs(mass_a - mass_b))
+
+            secret_bit = int(secret_bitstream[bit_idx])
+            p = float(base_probs[mask_A].sum().item())
+            q = min(p, 1.0 - p)
+            choose_A, used_enforce = _choose_watermark_partition_half(
+                secret_bit, p, q
+            )
+            probs_wm = _mask_disallowed_half_probs(
+                base_probs, mask_A, choose_set_A=choose_A
+            )
+            if not used_enforce:
+                natural_partition_choices += 1
+            if torch.isfinite(probs_wm).all() and float(probs_wm.sum().item()) > 0:
+                probs_wm = probs_wm.clamp(min=0)
+                probs_wm = probs_wm / probs_wm.sum()
+                next_token_id_wm = torch.multinomial(probs_wm, num_samples=1)
+            else:
+                next_token_id_wm = torch.multinomial(base_probs, num_samples=1)
+
+        input_ids_wm = torch.cat([input_ids_wm, next_token_id_wm.unsqueeze(0)], dim=-1)
+        step_input_ids = next_token_id_wm.unsqueeze(0)
+        if "attention_mask" in model_kwargs:
+            model_kwargs["attention_mask"] = torch.cat(
+                [
+                    model_kwargs["attention_mask"],
+                    torch.ones((1, 1), dtype=model_kwargs["attention_mask"].dtype, device=device),
+                ],
+                dim=-1,
+            )
+
+    suffix_ids = input_ids_wm[0, prompt_len:].tolist()
+    generated_text_wm = tokenizer.decode(suffix_ids, skip_special_tokens=True)
+    recovery_input_ids = tokenizer(generated_text_wm, return_tensors="pt")["input_ids"]
+    gap_mean = (
+        sum(partition_mass_gaps) / len(partition_mass_gaps) if partition_mass_gaps else 0.0
+    )
+
+    return {
+        "prompt_text": prompt,
+        "generated_text_wm": generated_text_wm,
+        "input_ids_wm": recovery_input_ids,
+        "model_input_ids": input_ids_wm.detach().cpu(),
+        "prompt_len": prompt_len,
+        "model_suffix_ids": suffix_ids,
+        "secret_bitstream": secret_bitstream,
+        "sacrificed_bits": 0,
+        "natural_partition_choices": natural_partition_choices,
+        "recovery_stalls": 0,
+        "retok_replacements": 0,
+        "recovery_ids_aligned": True,
+        "recovery_slots_committed": n_bits,
+        "incremental_ids_aligned": True,
+        "partition_mode": "balanced",
+        "partition_vocab_dim": partition_vocab_dim,
+        "partition_mass_gap_mean": gap_mean,
+        "partition_mass_gap_max": max(partition_mass_gaps) if partition_mass_gaps else 0.0,
+        "special_ids_in_suffix": sum(1 for t in suffix_ids if t in special_ids),
     }
 
 
@@ -602,6 +782,126 @@ def recover_bitstream_from_text(
     )
 
 
+def recover_bitstream_balanced(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    model_suffix_ids: List[int],
+    device: str = "cpu",
+    *,
+    generation_extra: Dict[str, Any] | None = None,
+) -> Tuple[List[int], List[int], List[float]]:
+    """
+    Recover bits embedded by ``generate_with_watermark_balanced``.
+
+    Replays the prompt + each prefix of ``model_suffix_ids``, rebuilds the
+    softmax-balanced partition at every step, and reads which half the actual
+    token landed in. Returns ``(bits, tokens, mass_gaps)``.
+    """
+    inputs = encode_prompt_for_generation(tokenizer, prompt, device)
+    prompt_ids = inputs["input_ids"]
+    prompt_len = int(prompt_ids.shape[1])
+    attn_mask = inputs.get("attention_mask", None)
+
+    n = len(model_suffix_ids)
+    _, logits_processor = _prepare_sampling_logits_processor_bundle(
+        model,
+        tokenizer,
+        inputs,
+        decode_horizon=max(n, 1),
+        generation_extra=generation_extra,
+    )
+
+    full_ids = torch.cat(
+        [
+            prompt_ids,
+            torch.tensor([model_suffix_ids], dtype=prompt_ids.dtype, device=prompt_ids.device),
+        ],
+        dim=-1,
+    )
+    input_ids = prompt_ids.clone()
+    model_kwargs: Dict[str, Any] = {"use_cache": True}
+    if attn_mask is not None:
+        model_kwargs["attention_mask"] = attn_mask
+    step_input_ids = input_ids
+
+    recovered_bits: List[int] = []
+    recovered_tokens: List[int] = []
+    mass_gaps: List[float] = []
+
+    for bit_idx, token_id in enumerate(model_suffix_ids):
+        with torch.no_grad():
+            outputs = model(input_ids=step_input_ids, **model_kwargs)
+            logits = outputs.logits[0, -1, :]
+            model_kwargs["past_key_values"] = outputs.past_key_values
+            base_probs = _scores_to_next_token_probs(
+                logits, input_ids, logits_processor
+            )
+            mask_A = get_balanced_partition_from_probs(base_probs)
+            mass_a, mass_b = balanced_partition_masses(base_probs, mask_A)
+            mass_gaps.append(abs(mass_a - mass_b))
+
+            tid = int(token_id)
+            if tid < 0 or tid >= int(mask_A.numel()):
+                recovered_bits.append(1)
+            else:
+                recovered_bits.append(0 if bool(mask_A[tid].item()) else 1)
+            recovered_tokens.append(tid)
+
+        next_tok = torch.tensor([[tid]], dtype=input_ids.dtype, device=device)
+        input_ids = torch.cat([input_ids, next_tok], dim=-1)
+        step_input_ids = next_tok
+        if "attention_mask" in model_kwargs:
+            model_kwargs["attention_mask"] = torch.cat(
+                [
+                    model_kwargs["attention_mask"],
+                    torch.ones((1, 1), dtype=model_kwargs["attention_mask"].dtype, device=device),
+                ],
+                dim=-1,
+            )
+
+    # Sanity: reconstructed length matches prompt + suffix.
+    if int(input_ids.shape[1]) != prompt_len + n:
+        raise RuntimeError(
+            f"balanced recovery length mismatch: got {int(input_ids.shape[1])}, "
+            f"expected {prompt_len + n}"
+        )
+    if not torch.equal(input_ids, full_ids):
+        raise RuntimeError("balanced recovery replay diverged from provided suffix ids")
+
+    return recovered_bits, recovered_tokens, mass_gaps
+
+
+def recover_bitstream_balanced_from_generation(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    generation_out: Dict[str, Any],
+    device: str = "cpu",
+    *,
+    generation_extra: Dict[str, Any] | None = None,
+) -> Tuple[List[int], List[int], List[float]]:
+    """Recover using ``prompt_text`` / ``model_suffix_ids`` from a balanced generate call."""
+    prompt = str(generation_out["prompt_text"])
+    if "model_suffix_ids" in generation_out:
+        suffix = [int(t) for t in generation_out["model_suffix_ids"]]
+    else:
+        model_ids = generation_out["model_input_ids"]
+        if isinstance(model_ids, torch.Tensor):
+            row = model_ids[0] if model_ids.dim() > 1 else model_ids
+            prompt_len = int(generation_out["prompt_len"])
+            suffix = [int(t) for t in row[prompt_len:].tolist()]
+        else:
+            raise KeyError("generation_out missing model_suffix_ids / model_input_ids")
+    return recover_bitstream_balanced(
+        model,
+        tokenizer,
+        prompt,
+        suffix,
+        device,
+        generation_extra=generation_extra,
+    )
+
+
 def negative_control_transcript_like(
     reference_text: str,
     tokenizer: AutoTokenizer,
@@ -611,17 +911,31 @@ def negative_control_transcript_like(
     model: torch.nn.Module | None = None,
     phrase: str = "Unrelated decoy text used only as a negative control. ",
 ) -> str:
+    """Build a decoy string with enough tokens/chars for a negative-control detect.
+
+    Uses tokenizer length only (no model rewind). ``model`` is accepted for API
+    compatibility with callers that already have a loaded LM.
+    """
+    del model, device
     ref_chars = max(len(reference_text), 1)
-    s = ""
-    while True:
-        s += phrase
-        bits, _ = recover_bitstream_from_text(s, tokenizer, device, model=model)
-        if len(bits) >= n_bits and len(s) >= ref_chars:
-            return s
+    special_ids = set(getattr(tokenizer, "all_special_ids", []))
+    phrase_ids = tokenizer(phrase, add_special_tokens=False)["input_ids"]
+    if phrase_ids and isinstance(phrase_ids[0], list):
+        phrase_ids = [t for row in phrase_ids for t in row]
+    phrase_ns = sum(1 for t in phrase_ids if t not in special_ids)
+    if phrase_ns <= 0:
+        raise ValueError("negative-control phrase must yield at least one non-special token")
+
+    # Ceiling of needed phrases for bit count and character length.
+    n_for_bits = (int(n_bits) + phrase_ns - 1) // phrase_ns
+    n_for_chars = (ref_chars + len(phrase) - 1) // len(phrase)
+    return phrase * max(n_for_bits, n_for_chars, 1)
 
 
 __all__ = [
     "get_vectorized_partition",
+    "get_balanced_partition_from_probs",
+    "balanced_partition_masses",
     "configure_partition_weights",
     "clear_partition_weights",
     "get_partition_weights",
@@ -630,8 +944,11 @@ __all__ = [
     "resolve_partition_vocab_size_for_recovery",
     "encode_prompt_for_generation",
     "generate_with_watermark",
+    "generate_with_watermark_balanced",
     "generate_baseline",
     "recover_bitstream",
     "recover_bitstream_from_text",
+    "recover_bitstream_balanced",
+    "recover_bitstream_balanced_from_generation",
     "negative_control_transcript_like",
 ]

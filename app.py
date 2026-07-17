@@ -35,7 +35,11 @@ from text_attributes import (
 # --- customize here ---
 MODULUS = 1024
 CODE_LENGTH = 100
-WM_BIT_REDUNDANCY = 5  # depth-interleaved token-channel repeats per PRC bit; recovery = strict majority (tie → 0)
+WM_BIT_REDUNDANCY = 5  # token-channel repeats per PRC bit; recovery = strict majority (tie → 0)
+# ``static`` = original seeded partitions; ``balanced`` = per-step softmax-balanced masks
+PARTITION_MODE = "balanced"
+# ``depth`` = R interleaved codeword passes; ``block`` = each bit repeated R times contiguously
+REDUNDANCY_LAYOUT = "depth"
 MODEL_ID: str | None = None  # None → ``model.DEFAULT_MODEL_ID``
 PROMPT = (
     # '''Explain the economic nuance and impact of Drake Maye during his college football career at North Carolina.'''
@@ -169,6 +173,8 @@ def main() -> int:
             f"[bold]modulus[/] {MODULUS}  ·  [bold]code_length[/] {CODE_LENGTH}  ·  "
             f"[bold]wm_bit_redundancy[/] {WM_BIT_REDUNDANCY}  "
             f"(channel {CODE_LENGTH * WM_BIT_REDUNDANCY} bits)\n"
+            f"[bold]partition_mode[/] {PARTITION_MODE}  ·  "
+            f"[bold]redundancy_layout[/] {REDUNDANCY_LAYOUT}\n"
             f"[bold]LLM[/] {model.MODEL_ID}\n"
             f"[bold]sampling[/] temperature={model.SAMPLING['temperature']}  "
             f"top_p={model.SAMPLING['top_p']}  top_k={model.SAMPLING['top_k']}\n"
@@ -181,6 +187,8 @@ def main() -> int:
     wm.SECURITY_PARAM = CODE_LENGTH
     prc.set_code_length(CODE_LENGTH)
     wm.WM_BIT_REDUNDANCY = WM_BIT_REDUNDANCY
+    wm.set_partition_mode(PARTITION_MODE)
+    wm.set_redundancy_layout(REDUNDANCY_LAYOUT)
 
     c.rule("1) Setup & generate", style="cyan")
     sk = wm.setup(MODULUS)
@@ -262,7 +270,11 @@ def main() -> int:
     det_table.add_column("check", justify="center")
 
     t0 = time.perf_counter()
-    m_ok, m_bits = wm.master_detect(sk, wm_text)
+    recovered_wm = wm.recover_channel_bits(wm_text, generation_out=out)
+    t_recover = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    m_ok, m_bits = wm.master_detect(sk, wm_text, recovered_bits=recovered_wm)
     t_m = time.perf_counter() - t0
     ber = _ber_percent(secret, m_bits)
     all_ok &= bool(m_ok)
@@ -274,12 +286,12 @@ def main() -> int:
         f"{ber:.2f}",
         str(sacrificed_bits),
         str(natural_partition_choices),
-        f"{t_m:.3f}s",
+        f"{t_recover + t_m:.3f}s",
         _pass_cell(m_ok),
     )
 
     t0 = time.perf_counter()
-    u_ok, _ = wm.detect(dk_open, wm_text)
+    u_ok, _ = wm.detect(dk_open, wm_text, recovered_bits=recovered_wm)
     t_u = time.perf_counter() - t0
     all_ok &= u_ok is True
     det_table.add_row(
@@ -294,11 +306,11 @@ def main() -> int:
         _pass_cell(u_ok),
     )
 
-    det_total = t_m + t_u
+    det_total = t_recover + t_m + t_u
     for w in VOCABULARY:
         expect_ok = w in active_set
         t0 = time.perf_counter()
-        w_ok, _ = wm.detect(dk_by_word[w], wm_text)
+        w_ok, _ = wm.detect(dk_by_word[w], wm_text, recovered_bits=recovered_wm)
         t_w = time.perf_counter() - t0
         det_total += t_w
         all_ok &= bool(w_ok) == bool(expect_ok)
@@ -323,7 +335,8 @@ def main() -> int:
         model=m,
     )
     t0 = time.perf_counter()
-    neg_ok, _ = wm.master_detect(sk, wrong)
+    recovered_neg = wm.recover_channel_bits(wrong)
+    neg_ok, _ = wm.master_detect(sk, wrong, recovered_bits=recovered_neg)
     t_neg = time.perf_counter() - t0
     neg_pass = not bool(neg_ok)
     all_ok &= neg_pass
