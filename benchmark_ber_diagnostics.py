@@ -103,6 +103,11 @@ class BerDiagnosticsSummary:
             return 0.0
         return sum(getattr(r, attr) for r in self.results) / self.n
 
+    def _max(self, attr: str) -> float:
+        if not self.results:
+            return 0.0
+        return max(getattr(r, attr) for r in self.results)
+
 
 def _ber_percent(secret: Sequence[int], recovered: Sequence[int]) -> float:
     n = len(secret)
@@ -407,14 +412,23 @@ def print_ber_diagnostics(
     )
 
     print()
-    print("-- Stage BER (averages) --")
+    print("-- Stage BER (avg / max) --")
     print(
-        f"  1. Channel from ids={summary._avg('channel_ber_from_ids'):.2f}%  "
-        f"from text={summary._avg('channel_ber_from_text'):.2f}%  "
-        f"(retokenize gap={summary._avg('retokenization_extra_ber'):.2f}%)"
+        f"  1. Channel from ids={summary._avg('channel_ber_from_ids'):.2f}%/"
+        f"{summary._max('channel_ber_from_ids'):.2f}%  "
+        f"from text={summary._avg('channel_ber_from_text'):.2f}%/"
+        f"{summary._max('channel_ber_from_text'):.2f}%  "
+        f"(retokenize gap={summary._avg('retokenization_extra_ber'):.2f}%/"
+        f"{summary._max('retokenization_extra_ber'):.2f}%)"
     )
-    print(f"  2. Logical PRC payload: {summary._avg('logical_ber'):.2f}%")
-    print(f"  3. End-to-end (master path): {summary._avg('end_to_end_ber_master'):.2f}%")
+    print(
+        f"  2. Logical PRC payload: {summary._avg('logical_ber'):.2f}%/"
+        f"{summary._max('logical_ber'):.2f}%"
+    )
+    print(
+        f"  3. End-to-end (master path): {summary._avg('end_to_end_ber_master'):.2f}%/"
+        f"{summary._max('end_to_end_ber_master'):.2f}%"
+    )
 
     n = summary.n or 1
     print()

@@ -98,7 +98,19 @@ def issue(sk: cprf.MasterKey, keywords: List[str]) -> cprf.ConstrainedKey:
     return sk.constrain(f)
 
 
-def generate(sk: cprf.MasterKey, prompt: str, *, baseline_text: str | None = None) -> dict:
+def _tokens_per_sec(n_tokens: int, seconds: float) -> float:
+    if seconds <= 0.0 or n_tokens <= 0:
+        return 0.0
+    return float(n_tokens) / float(seconds)
+
+
+def generate(
+    sk: cprf.MasterKey,
+    prompt: str,
+    *,
+    baseline_text: str | None = None,
+    baseline_n_tokens: int | None = None,
+) -> dict:
     m, tok, device = model.load()
     n_channel = SECURITY_PARAM * WM_BIT_REDUNDANCY
     # Match watermarked length: burn-in + channel tokens.
@@ -106,11 +118,18 @@ def generate(sk: cprf.MasterKey, prompt: str, *, baseline_text: str | None = Non
 
     if baseline_text is None:
         t0 = time.perf_counter()
-        baseline = randrecover.generate_baseline(m, tok, prompt, n_baseline, device)
+        baseline, n_tokens_baseline = randrecover.generate_baseline(
+            m, tok, prompt, n_baseline, device
+        )
         seconds_baseline_gen = time.perf_counter() - t0
     else:
         baseline = baseline_text
         seconds_baseline_gen = 0.0
+        if baseline_n_tokens is not None:
+            n_tokens_baseline = int(baseline_n_tokens)
+        else:
+            # Fallback when a pregen count was not supplied.
+            n_tokens_baseline = int(n_baseline)
 
     baseline_scores: dict[str, float] = {}
     attributes = derive_attributes(
@@ -130,6 +149,7 @@ def generate(sk: cprf.MasterKey, prompt: str, *, baseline_text: str | None = Non
         burn_in_tokens=BURN_IN_TOKENS,
     )
     seconds_watermarked_gen = time.perf_counter() - t2
+    n_tokens_watermarked = len(out["burn_in_ids"]) + len(out["wm_suffix_ids"])
 
     # --- logging ---
     out["attributes"] = attributes
@@ -137,6 +157,14 @@ def generate(sk: cprf.MasterKey, prompt: str, *, baseline_text: str | None = Non
     out["label_scores_baseline"] = dict(baseline_scores)
     out["seconds_baseline_gen"] = seconds_baseline_gen
     out["seconds_watermarked_gen"] = seconds_watermarked_gen
+    out["n_tokens_baseline"] = int(n_tokens_baseline)
+    out["n_tokens_watermarked"] = int(n_tokens_watermarked)
+    out["tokens_per_sec_baseline"] = _tokens_per_sec(
+        n_tokens_baseline, seconds_baseline_gen
+    )
+    out["tokens_per_sec_watermarked"] = _tokens_per_sec(
+        n_tokens_watermarked, seconds_watermarked_gen
+    )
     out["prc_secret_bits"] = list(bits)
     out["wm_bit_redundancy"] = WM_BIT_REDUNDANCY
     out["wm_channel_bits"] = list(channel_bits)

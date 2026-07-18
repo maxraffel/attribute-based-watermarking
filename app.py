@@ -36,13 +36,13 @@ from text_attributes import (
 # --- customize here ---
 MODULUS = 1024
 CODE_LENGTH = 100
-WM_BIT_REDUNDANCY = 3  # depth-interleaved channel repeats per PRC bit; recovery = strict majority (tie → 0)
+WM_BIT_REDUNDANCY = 5  # depth-interleaved channel repeats per PRC bit; recovery = strict majority (tie → 0)
 BURN_IN_TOKENS = 100  # free tokens before watermark payload (prompt-free recovery warm-up)
 MODEL_ID: str | None = None  # None → ``model.DEFAULT_MODEL_ID``
 PROMPT = (
     # '''Explain the economic nuance and impact of Drake Maye during his college football career at North Carolina.'''
     # "Write a program to reverse a linked list then provide an analysis of its time complexity."
-    "Explain how software has transformed the art world."
+    "Explain how stem cell therapy is being used in regenerative medicine."
 )
 
 TEXT_EXCERPT_CHARS = 400
@@ -204,11 +204,16 @@ def main() -> int:
     recovery_ids_aligned = bool(out.get("recovery_ids_aligned", False))
     t_bl = float(out["seconds_baseline_gen"])
     t_wm = float(out["seconds_watermarked_gen"])
+    n_bl = int(out["n_tokens_baseline"])
+    n_wm = int(out["n_tokens_watermarked"])
+    tok_s_bl = float(out["tokens_per_sec_baseline"])
+    tok_s_wm = float(out["tokens_per_sec_watermarked"])
 
     _print_text(c, "Baseline text", baseline_text)
     _print_text(c, "Watermarked text", wm_text)
     c.print(
-        f"  [dim]generate[/] baseline={t_bl:.3f}s  watermarked={t_wm:.3f}s  "
+        f"  [dim]generate[/] baseline={t_bl:.3f}s ({n_bl} tok, {tok_s_bl:.1f} tok/s)  "
+        f"watermarked={t_wm:.3f}s ({n_wm} tok, {tok_s_wm:.1f} tok/s)  "
         f"PRC payload={len(secret)} logical bits  "
         f"natural_partition={natural_partition_choices}  "
         f"retok_replacements={retok_replacements}  "

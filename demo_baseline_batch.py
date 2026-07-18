@@ -54,7 +54,7 @@ def main() -> int:
         print(f"  micro-batch done: {n} prompt(s)", flush=True)
 
     t0 = time.perf_counter()
-    texts = randrecover.generate_baselines(
+    texts, token_counts = randrecover.generate_baselines(
         m,
         tok,
         prompts,
@@ -64,11 +64,18 @@ def main() -> int:
         on_batch_done=_on_batch,
     )
     elapsed = time.perf_counter() - t0
+    total_tok = sum(token_counts)
+    tok_s = (total_tok / elapsed) if elapsed > 0 else 0.0
 
-    print(f"\nFinished in {elapsed:.2f}s  (micro-batches: {batches})\n")
+    print(
+        f"\nFinished in {elapsed:.2f}s  ({tok_s:.1f} tok/s, "
+        f"micro-batches: {batches})\n"
+    )
     print("=" * 72)
-    for i, (prompt, text) in enumerate(zip(prompts, texts), start=1):
-        print(f"[{i}/{len(prompts)}] PROMPT")
+    for i, (prompt, text, n_tok) in enumerate(
+        zip(prompts, texts, token_counts), start=1
+    ):
+        print(f"[{i}/{len(prompts)}] PROMPT  ({n_tok} new tokens)")
         print(prompt)
         print("--- OUTPUT ---")
         print(text if text.strip() else "(empty)")

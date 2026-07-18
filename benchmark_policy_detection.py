@@ -145,6 +145,8 @@ class TimingTotals:
     t_setup: float = 0.0
     t_baseline_gen: float = 0.0
     t_wm_gen: float = 0.0
+    n_baseline_tokens: int = 0
+    n_wm_tokens: int = 0
     t_derive_attributes: float = 0.0
     t_issue_keys: float = 0.0
     t_cprf_checks: float = 0.0
@@ -250,6 +252,8 @@ class PromptRollup:
         self.timings.t_setup += timings.t_setup
         self.timings.t_baseline_gen += timings.t_baseline_gen
         self.timings.t_wm_gen += timings.t_wm_gen
+        self.timings.n_baseline_tokens += timings.n_baseline_tokens
+        self.timings.n_wm_tokens += timings.n_wm_tokens
         self.timings.t_derive_attributes += timings.t_derive_attributes
         self.timings.t_issue_keys += timings.t_issue_keys
         self.timings.t_cprf_checks += timings.t_cprf_checks
@@ -300,6 +304,9 @@ class LabelConditionedDetectionMatrix:
     wm_bit_redundancy: int
     modulus: int
     strict_protocol_ok: bool
+    avg_master_ber: float = 0.0
+    max_master_ber: float = 0.0
+    n_ber_trials: int = 0
 
 
 @dataclass(frozen=True)
@@ -332,6 +339,9 @@ class PromptConditionedDetectionMatrix:
     wm_bit_redundancy: int
     modulus: int
     strict_protocol_ok: bool
+    avg_master_ber: float = 0.0
+    max_master_ber: float = 0.0
+    n_ber_trials: int = 0
 
 
 def sum_confusion_counts(
@@ -383,6 +393,26 @@ def micro_tpr_wilson(
         return (float("nan"), float("nan"), float("nan"))
     lo, hi = wilson_score_interval(tp, n, z=z)
     return (tp / n, lo, hi)
+
+
+def micro_ber_stats(
+    roll: dict[str, PromptRollup],
+    prompt_cases: Sequence[tuple[str, str]],
+) -> tuple[float, float, int]:
+    """Pooled master-path BER over prompts: ``(avg_ber, max_ber, n_runs)``."""
+    ber_sum = 0.0
+    ber_max = 0.0
+    n = 0
+    for sid, _ in prompt_cases:
+        r = roll[sid]
+        if r.runs <= 0:
+            continue
+        ber_sum += r.ber_sum
+        ber_max = max(ber_max, r.ber_max)
+        n += r.runs
+    if n <= 0:
+        return (float("nan"), float("nan"), 0)
+    return (ber_sum / n, ber_max, n)
 
 
 def prc_random_detect_positive_rate(
@@ -489,6 +519,9 @@ def run_benchmark_label_conditioned_matrix(
     sid_open: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
     sid_ucprf: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
     sid_control: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
+    ber_sum = 0.0
+    ber_max = 0.0
+    n_ber_trials = 0
 
     if not quiet:
         console.print(
@@ -509,13 +542,14 @@ def run_benchmark_label_conditioned_matrix(
     generated: list[_GeneratedTrial] = []
     if trial_progress is not None:
         trial_progress.set_description("Benchmark matrix generate")
-    for (_, sid, prompt), baseline in zip(
+    for (_, sid, prompt), baseline, n_bl_tok in zip(
         benchmark_io.iter_with_progress(
             trials,
             description="Benchmark matrix generate",
             disable=not progress_on or trial_progress is not None,
         ),
         pregen.texts,
+        pregen.token_counts,
     ):
         sk = wm.setup(modulus)
         generated.append(
@@ -524,6 +558,7 @@ def run_benchmark_label_conditioned_matrix(
                 prompt,
                 baseline_text=baseline,
                 baseline_gen_seconds=amortized,
+                baseline_n_tokens=int(n_bl_tok),
             )
         )
         if trial_progress is not None:
@@ -543,7 +578,7 @@ def run_benchmark_label_conditioned_matrix(
         _cprf_label_ok,
         _cprf_label_n,
         control_ok,
-        _ber,
+        ber,
         _tt_inner,
         em_open_m,
     ) in zip(zip(trials, pregen.texts), scored):
@@ -556,6 +591,9 @@ def run_benchmark_label_conditioned_matrix(
             sid_ucprf[sid] += 1
         if control_ok:
             sid_control[sid] += 1
+        ber_sum += float(ber)
+        ber_max = max(ber_max, float(ber))
+        n_ber_trials += 1
 
         got_by_row = {str(row["word"]): bool(row["got_detect"]) for row in word_stats}
         # Columns are the labels attributed to this trial's WM text (multi-label possible).
@@ -612,6 +650,13 @@ def run_benchmark_label_conditioned_matrix(
             nx = numerators_attributes_match[r][c]
             rates_attributes_match[r][c] = (nx / dx) if dx > 0 else -1.0
 
+    avg_ber = (ber_sum / n_ber_trials) if n_ber_trials else 0.0
+    if not quiet:
+        console.print(
+            f"  master BER avg={avg_ber:.2f}%  max={ber_max:.2f}%  "
+            f"(n={n_ber_trials})"
+        )
+
     matrix = LabelConditionedDetectionMatrix(
         vocab=vocab,
         numerators=numerators,
@@ -625,7 +670,10 @@ def run_benchmark_label_conditioned_matrix(
         code_length=code_length,
         wm_bit_redundancy=wm.WM_BIT_REDUNDANCY,
         modulus=modulus,
-        strict_protocol_ok=all_ok)
+        strict_protocol_ok=all_ok,
+        avg_master_ber=avg_ber,
+        max_master_ber=ber_max,
+        n_ber_trials=n_ber_trials)
     return (0 if all_ok else 1, matrix)
 
 
@@ -688,6 +736,9 @@ def run_benchmark_prompt_conditioned_matrix(
     sid_open: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
     sid_ucprf: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
     sid_control: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
+    ber_sum = 0.0
+    ber_max = 0.0
+    n_ber_trials = 0
 
     if not quiet:
         console.print(
@@ -708,13 +759,14 @@ def run_benchmark_prompt_conditioned_matrix(
     generated: list[_GeneratedTrial] = []
     if trial_progress is not None:
         trial_progress.set_description("Benchmark prompt matrix generate")
-    for (_, sid, prompt), baseline in zip(
+    for (_, sid, prompt), baseline, n_bl_tok in zip(
         benchmark_io.iter_with_progress(
             trials,
             description="Benchmark prompt matrix generate",
             disable=not progress_on or trial_progress is not None,
         ),
         pregen.texts,
+        pregen.token_counts,
     ):
         sk = wm.setup(modulus)
         generated.append(
@@ -723,6 +775,7 @@ def run_benchmark_prompt_conditioned_matrix(
                 prompt,
                 baseline_text=baseline,
                 baseline_gen_seconds=amortized,
+                baseline_n_tokens=int(n_bl_tok),
             )
         )
         if trial_progress is not None:
@@ -742,7 +795,7 @@ def run_benchmark_prompt_conditioned_matrix(
         _cprf_label_ok,
         _cprf_label_n,
         control_ok,
-        _ber,
+        ber,
         _tt_inner,
         em_open_m,
     ) in zip(zip(trials, pregen.texts), scored):
@@ -755,6 +808,9 @@ def run_benchmark_prompt_conditioned_matrix(
             sid_ucprf[sid] += 1
         if control_ok:
             sid_control[sid] += 1
+        ber_sum += float(ber)
+        ber_max = max(ber_max, float(ber))
+        n_ber_trials += 1
 
         got_by_row = {str(row["word"]): bool(row["got_detect"]) for row in word_stats}
         attributed_cols = tuple(
@@ -803,6 +859,13 @@ def run_benchmark_prompt_conditioned_matrix(
             nx = numerators_attributes_match[r][p]
             rates_attributes_match[r][p] = (nx / dx) if dx > 0 else -1.0
 
+    avg_ber = (ber_sum / n_ber_trials) if n_ber_trials else 0.0
+    if not quiet:
+        console.print(
+            f"  master BER avg={avg_ber:.2f}%  max={ber_max:.2f}%  "
+            f"(n={n_ber_trials})"
+        )
+
     matrix = PromptConditionedDetectionMatrix(
         vocab=vocab,
         column_prompt_ids=col_ids,
@@ -817,7 +880,10 @@ def run_benchmark_prompt_conditioned_matrix(
         code_length=code_length,
         wm_bit_redundancy=wm.WM_BIT_REDUNDANCY,
         modulus=modulus,
-        strict_protocol_ok=all_ok)
+        strict_protocol_ok=all_ok,
+        avg_master_ber=avg_ber,
+        max_master_ber=ber_max,
+        n_ber_trials=n_ber_trials)
     return (0 if all_ok else 1, matrix)
 
 
@@ -855,6 +921,10 @@ def _prepare_trials_with_baselines(
         raise RuntimeError(
             f"baseline pregen length {len(pregen.texts)} != trials {len(trials)}"
         )
+    if len(pregen.token_counts) != len(trials):
+        raise RuntimeError(
+            f"baseline token_counts length {len(pregen.token_counts)} != trials {len(trials)}"
+        )
     return trials, pregen
 
 
@@ -875,9 +945,15 @@ def _generate_trial(
     *,
     baseline_text: str | None = None,
     baseline_gen_seconds: float | None = None,
+    baseline_n_tokens: int | None = None,
 ) -> _GeneratedTrial:
     tt = TimingTotals()
-    out = wm.generate(sk, prompt, baseline_text=baseline_text)
+    out = wm.generate(
+        sk,
+        prompt,
+        baseline_text=baseline_text,
+        baseline_n_tokens=baseline_n_tokens,
+    )
     # Drop privileged generation metadata; recovery sees text + scheme only.
     wm_text = str(out["generated_text_wm"])
     encode_attributes = list(out["attributes"])
@@ -888,6 +964,8 @@ def _generate_trial(
         t_baseline = float(out["seconds_baseline_gen"])
     tt.t_baseline_gen = t_baseline
     tt.t_wm_gen = float(out["seconds_watermarked_gen"])
+    tt.n_baseline_tokens = int(out["n_tokens_baseline"])
+    tt.n_wm_tokens = int(out["n_tokens_watermarked"])
     del out
     return _GeneratedTrial(
         sk=sk,
@@ -1087,6 +1165,12 @@ def _score_protocol_trials_batched(
     return scored
 
 
+def _tokens_per_sec(n_tokens: float, seconds: float) -> float:
+    if seconds <= 0.0 or n_tokens <= 0.0:
+        return 0.0
+    return float(n_tokens) / float(seconds)
+
+
 def _mean_timings(r: PromptRollup) -> dict[str, float]:
     n = r.runs
     if n == 0:
@@ -1103,7 +1187,12 @@ def _mean_timings(r: PromptRollup) -> dict[str, float]:
         "t_detect_open",
         "t_detect_per_label",
         "t_negative_control")
-    return {k: getattr(t, k) / n for k in keys}
+    means = {k: getattr(t, k) / n for k in keys}
+    means["n_baseline_tokens"] = t.n_baseline_tokens / n
+    means["n_wm_tokens"] = t.n_wm_tokens / n
+    means["tok_s_baseline"] = _tokens_per_sec(t.n_baseline_tokens, t.t_baseline_gen)
+    means["tok_s_wm"] = _tokens_per_sec(t.n_wm_tokens, t.t_wm_gen)
+    return means
 
 
 def _aggregate_timing_means(
@@ -1122,6 +1211,8 @@ def _aggregate_timing_means(
         "t_detect_open",
         "t_detect_per_label",
         "t_negative_control")}
+    n_baseline_tokens = 0
+    n_wm_tokens = 0
     for sid, _ in prompt_cases:
         r = roll[sid]
         n = r.runs
@@ -1131,11 +1222,27 @@ def _aggregate_timing_means(
         t = r.timings
         for k in acc:
             acc[k] += getattr(t, k)
+        n_baseline_tokens += t.n_baseline_tokens
+        n_wm_tokens += t.n_wm_tokens
     if total_runs == 0:
-        return {**acc, "t_grand_avg": 0.0}
+        return {
+            **acc,
+            "t_grand_avg": 0.0,
+            "n_baseline_tokens": 0.0,
+            "n_wm_tokens": 0.0,
+            "tok_s_baseline": 0.0,
+            "tok_s_wm": 0.0,
+        }
     for k in acc:
         acc[k] /= total_runs
     acc["t_grand_avg"] = sum(acc.values())
+    acc["n_baseline_tokens"] = n_baseline_tokens / total_runs
+    acc["n_wm_tokens"] = n_wm_tokens / total_runs
+    # Throughput from totals (not mean-of-rates) so amortized pregen is fair.
+    total_bl_s = acc["t_baseline_gen"] * total_runs
+    total_wm_s = acc["t_wm_gen"] * total_runs
+    acc["tok_s_baseline"] = _tokens_per_sec(n_baseline_tokens, total_bl_s)
+    acc["tok_s_wm"] = _tokens_per_sec(n_wm_tokens, total_wm_s)
     return acc
 
 
@@ -1160,13 +1267,52 @@ def _print_timing_table_plain(
         out.append(["ALL (mean/run)"] + [f"{gm[k]:.4f}" for k in keys])
         return out
 
+    def _gen_rows() -> list[list[str]]:
+        out: list[list[str]] = []
+        for sid, _ in prompt_cases:
+            r = roll[sid]
+            if r.runs == 0:
+                continue
+            m = _mean_timings(r)
+            out.append(
+                [
+                    _sid_cell(sid),
+                    f"{m['t_setup']:.4f}",
+                    f"{m['t_baseline_gen']:.4f}",
+                    f"{m['tok_s_baseline']:.1f}",
+                    f"{m['t_wm_gen']:.4f}",
+                    f"{m['tok_s_wm']:.1f}",
+                    f"{m['t_derive_attributes']:.4f}",
+                ]
+            )
+        gm = _aggregate_timing_means(roll, prompt_cases)
+        out.append(
+            [
+                "ALL (mean/run)",
+                f"{gm['t_setup']:.4f}",
+                f"{gm['t_baseline_gen']:.4f}",
+                f"{gm['tok_s_baseline']:.1f}",
+                f"{gm['t_wm_gen']:.4f}",
+                f"{gm['tok_s_wm']:.1f}",
+                f"{gm['t_derive_attributes']:.4f}",
+            ]
+        )
+        return out
+
     benchmark_io.print_plain_table(
-        title="Mean wall time — generation & attributes (seconds per run)",
-        headers=["prompt_id", "setup", "baseline", "wm_gen", "derive_attr"],
-        widths=[22, 8, 10, 10, 11],
-        aligns=["<", ">", ">", ">", ">"],
-        rows=_rows(
-            ("t_setup", "t_baseline_gen", "t_wm_gen", "t_derive_attributes")))
+        title="Mean wall time — generation & attributes (seconds per run; tok/s from totals)",
+        headers=[
+            "prompt_id",
+            "setup",
+            "baseline",
+            "bl_tok/s",
+            "wm_gen",
+            "wm_tok/s",
+            "derive_attr",
+        ],
+        widths=[22, 8, 10, 9, 10, 9, 11],
+        aligns=["<", ">", ">", ">", ">", ">", ">"],
+        rows=_gen_rows())
     benchmark_io.print_plain_table(
         title="Mean wall time — keys & detection (seconds per run)",
         headers=["prompt_id", "issue", "cprf", "master", "open", "labels", "decoy"],
@@ -1182,6 +1328,10 @@ def _print_timing_table_plain(
                 "t_negative_control")))
     gm = _aggregate_timing_means(roll, prompt_cases)
     print(f"Sum of all listed stage means (per run): {gm['t_grand_avg']:.4f} s")
+    print(
+        f"Generation throughput (totals): baseline={gm['tok_s_baseline']:.1f} tok/s  "
+        f"watermarked={gm['tok_s_wm']:.1f} tok/s"
+    )
 
 
 def _print_plain_results(
@@ -1378,13 +1528,14 @@ def run_benchmark_with_summary(
     setup_by_index: list[float] = []
     if trial_progress is not None:
         trial_progress.set_description("Benchmark generate")
-    for (_, sid, prompt), baseline in zip(
+    for (_, sid, prompt), baseline, n_bl_tok in zip(
         benchmark_io.iter_with_progress(
             trials,
             description="Benchmark generate",
             disable=not progress_on or trial_progress is not None,
         ),
         pregen.texts,
+        pregen.token_counts,
     ):
         t_setup0 = time.perf_counter()
         sk = wm.setup(modulus)
@@ -1395,6 +1546,7 @@ def run_benchmark_with_summary(
                 prompt,
                 baseline_text=baseline,
                 baseline_gen_seconds=amortized,
+                baseline_n_tokens=int(n_bl_tok),
             )
         )
         if trial_progress is not None:
@@ -1529,7 +1681,8 @@ def run_fpr_vs_code_length_sweep(
     Sweep logical ``code_length`` and return (lengths, metric dict, exit_codes).
 
     Metrics keys: ``scheme_fpr_all``, ``scheme_fpr_xmatch``, ``prc_random_fpr``,
-    plus ``*_ci_low`` / ``*_ci_high`` Wilson bounds where applicable.
+    ``master_ber_avg``, ``master_ber_max``, plus ``*_ci_low`` / ``*_ci_high`` Wilson
+    bounds where applicable.
 
     Progress advances once per LM phase (baseline, watermark generate, channel
     recover) for every protocol trial across the whole sweep — not once per
@@ -1546,6 +1699,8 @@ def run_fpr_vs_code_length_sweep(
     prc_random_fpr: list[float] = []
     prc_random_fpr_lo: list[float] = []
     prc_random_fpr_hi: list[float] = []
+    master_ber_avg: list[float] = []
+    master_ber_max: list[float] = []
     exit_codes: list[int] = []
 
     length_list = list(code_lengths)
@@ -1588,12 +1743,15 @@ def run_fpr_vs_code_length_sweep(
 
             fa, fa_lo, fa_hi = micro_fpr_wilson(summary.roll, summary.prompt_cases)
             fx, fx_lo, fx_hi = micro_fpr_wilson(summary.roll_attributes_match, summary.prompt_cases)
+            ber_avg, ber_max, _ = micro_ber_stats(summary.roll, summary.prompt_cases)
             scheme_fpr_all.append(float(fa) if fa >= 0.0 else float("nan"))
             scheme_fpr_xmatch.append(float(fx) if fx >= 0.0 else float("nan"))
             scheme_fpr_all_lo.append(fa_lo if fa >= 0.0 else float("nan"))
             scheme_fpr_all_hi.append(fa_hi if fa >= 0.0 else float("nan"))
             scheme_fpr_xmatch_lo.append(fx_lo if fx >= 0.0 else float("nan"))
             scheme_fpr_xmatch_hi.append(fx_hi if fx >= 0.0 else float("nan"))
+            master_ber_avg.append(float(ber_avg))
+            master_ber_max.append(float(ber_max))
 
     metrics = {
         "scheme_fpr_all_runs": scheme_fpr_all,
@@ -1605,6 +1763,8 @@ def run_fpr_vs_code_length_sweep(
         "prc_random_detect_rate": prc_random_fpr,
         "prc_random_detect_rate_ci_low": prc_random_fpr_lo,
         "prc_random_detect_rate_ci_high": prc_random_fpr_hi,
+        "master_ber_avg": master_ber_avg,
+        "master_ber_max": master_ber_max,
     }
     return lengths, metrics, exit_codes
 
@@ -1635,6 +1795,8 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
     tpr_all_hi: list[float] = []
     tpr_xmatch_lo: list[float] = []
     tpr_xmatch_hi: list[float] = []
+    master_ber_avg: list[float] = []
+    master_ber_max: list[float] = []
     exit_codes: list[int] = []
 
     redundancy_list = list(wm_bit_redundancy_values)
@@ -1668,12 +1830,15 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
 
             ta, ta_lo, ta_hi = micro_tpr_wilson(summary.roll, summary.prompt_cases)
             tx, tx_lo, tx_hi = micro_tpr_wilson(summary.roll_attributes_match, summary.prompt_cases)
+            ber_avg, ber_max, _ = micro_ber_stats(summary.roll, summary.prompt_cases)
             tpr_all.append(float(ta) if ta >= 0.0 else float("nan"))
             tpr_xmatch.append(float(tx) if tx >= 0.0 else float("nan"))
             tpr_all_lo.append(ta_lo if ta >= 0.0 else float("nan"))
             tpr_all_hi.append(ta_hi if ta >= 0.0 else float("nan"))
             tpr_xmatch_lo.append(tx_lo if tx >= 0.0 else float("nan"))
             tpr_xmatch_hi.append(tx_hi if tx >= 0.0 else float("nan"))
+            master_ber_avg.append(float(ber_avg))
+            master_ber_max.append(float(ber_max))
 
     metrics = {
         "tpr_all_runs": tpr_all,
@@ -1682,6 +1847,8 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
         "tpr_all_runs_ci_high": tpr_all_hi,
         "tpr_x_matched_ci_low": tpr_xmatch_lo,
         "tpr_x_matched_ci_high": tpr_xmatch_hi,
+        "master_ber_avg": master_ber_avg,
+        "master_ber_max": master_ber_max,
     }
     return redundancies, metrics, exit_codes
 

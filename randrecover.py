@@ -193,13 +193,26 @@ def suggest_baseline_batch_size(
     return max(1, min(n_prompts, usable // bytes_per_seq))
 
 
+def _count_new_tokens(gen_ids: torch.Tensor, pad_id: int, *, batched: bool) -> int:
+    """Count newly generated token ids (strip trailing pad fill in batched decode)."""
+    if gen_ids.numel() == 0:
+        return 0
+    if not batched:
+        return int(gen_ids.numel())
+    ids = gen_ids.detach().cpu().tolist()
+    end = len(ids)
+    while end > 0 and int(ids[end - 1]) == int(pad_id):
+        end -= 1
+    return int(end)
+
+
 def _generate_baseline_batch(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
     prompts: Sequence[str],
     max_new_tokens: int,
     device: str | torch.device,
-) -> List[str]:
+) -> List[Tuple[str, int]]:
     inputs = encode_prompts_for_generation(tokenizer, prompts, device)
     prompt_width = int(inputs["input_ids"].shape[1])
     pad_id = _tokenizer_pad_token_id(tokenizer)
@@ -210,11 +223,14 @@ def _generate_baseline_batch(
             do_sample=True,
             pad_token_id=pad_id,
         )
-    texts: List[str] = []
+    rows: List[Tuple[str, int]] = []
     for i in range(out.shape[0]):
         gen_ids = out[i, prompt_width:]
-        texts.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
-    return texts
+        n_tok = _count_new_tokens(gen_ids, pad_id, batched=True)
+        rows.append(
+            (tokenizer.decode(gen_ids, skip_special_tokens=True), n_tok)
+        )
+    return rows
 
 
 def generate_baselines(
@@ -226,17 +242,17 @@ def generate_baselines(
     *,
     batch_size: int | None = None,
     on_batch_done: Any | None = None,
-) -> List[str]:
+) -> Tuple[List[str], List[int]]:
     """Generate baseline texts for many prompts with adaptive GPU batching.
 
-    ``on_batch_done(n_completed_in_batch)`` is invoked after each successful
-    micro-batch (for progress bars). On CUDA OOM the batch size is halved and
-    the micro-batch is retried.
+    Returns ``(texts, n_new_tokens)`` parallel lists. ``on_batch_done(n)`` is
+    invoked after each successful micro-batch (for progress bars). On CUDA OOM
+    the batch size is halved and the micro-batch is retried.
     """
     prompt_list = [str(p) for p in prompts]
     n = len(prompt_list)
     if n == 0:
-        return []
+        return [], []
     if max_new_tokens < 1:
         raise ValueError(f"max_new_tokens must be >= 1, got {max_new_tokens}")
 
@@ -255,6 +271,7 @@ def generate_baselines(
         bs = max(1, min(n, int(batch_size)))
 
     out_texts: List[str] = [""] * n
+    out_n_tokens: List[int] = [0] * n
     i = 0
     while i < n:
         take = min(bs, n - i)
@@ -275,11 +292,13 @@ def generate_baselines(
                     raise
                 take = max(1, take // 2)
                 bs = take
-        out_texts[i : i + take] = chunk
+        for j, (text, n_tok) in enumerate(chunk):
+            out_texts[i + j] = text
+            out_n_tokens[i + j] = int(n_tok)
         if on_batch_done is not None:
             on_batch_done(take)
         i += take
-    return out_texts
+    return out_texts, out_n_tokens
 
 
 def generate_baseline(
@@ -288,8 +307,8 @@ def generate_baseline(
     prompt: str,
     max_new_tokens: int,
     device: str = "cpu",
-) -> str:
-    """Single-prompt baseline (same path as before batching was added)."""
+) -> Tuple[str, int]:
+    """Single-prompt baseline. Returns ``(text, n_new_tokens)``."""
     inputs = encode_prompt_for_generation(tokenizer, prompt, device)
     prompt_len = int(inputs["input_ids"].shape[1])
     pad_id = _tokenizer_pad_token_id(tokenizer)
@@ -301,7 +320,8 @@ def generate_baseline(
             pad_token_id=pad_id,
         )
     gen_ids = out[0, prompt_len:]
-    return tokenizer.decode(gen_ids, skip_special_tokens=True)
+    n_tok = _count_new_tokens(gen_ids, pad_id, batched=False)
+    return tokenizer.decode(gen_ids, skip_special_tokens=True), n_tok
 
 
 def _prepare_sampling_logits_processor_bundle(

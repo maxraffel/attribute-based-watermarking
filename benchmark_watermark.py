@@ -78,6 +78,8 @@ class ProtocolRunResult:
     verify_active: list[str] = field(default_factory=list)
     seconds_baseline_gen: float = 0.0
     seconds_watermarked_gen: float = 0.0
+    n_tokens_baseline: int = 0
+    n_tokens_watermarked: int = 0
     seconds_issue_keys: float = 0.0
     seconds_detect_total: float = 0.0
     baseline_text: str = ""
@@ -158,6 +160,8 @@ class _GeneratedProtocol:
     recovery_ids_aligned: bool
     seconds_baseline_gen: float
     seconds_watermarked_gen: float
+    n_tokens_baseline: int
+    n_tokens_watermarked: int
 
 
 def _generate_protocol_once(
@@ -167,8 +171,14 @@ def _generate_protocol_once(
     repeat_index: int,
     prompt: str,
     baseline_text: str | None = None,
+    baseline_n_tokens: int | None = None,
 ) -> _GeneratedProtocol:
-    out = wm.generate(sk, prompt, baseline_text=baseline_text)
+    out = wm.generate(
+        sk,
+        prompt,
+        baseline_text=baseline_text,
+        baseline_n_tokens=baseline_n_tokens,
+    )
     generated = _GeneratedProtocol(
         prompt_index=prompt_index,
         repeat_index=repeat_index,
@@ -182,6 +192,8 @@ def _generate_protocol_once(
         recovery_ids_aligned=bool(out.get("recovery_ids_aligned", False)),
         seconds_baseline_gen=float(out["seconds_baseline_gen"]),
         seconds_watermarked_gen=float(out["seconds_watermarked_gen"]),
+        n_tokens_baseline=int(out["n_tokens_baseline"]),
+        n_tokens_watermarked=int(out["n_tokens_watermarked"]),
     )
     del out  # integrity: recovery must not see privileged generation metadata
     return generated
@@ -281,6 +293,8 @@ def _score_protocol_once(
         verify_active=verify_active,
         seconds_baseline_gen=generated.seconds_baseline_gen,
         seconds_watermarked_gen=generated.seconds_watermarked_gen,
+        n_tokens_baseline=generated.n_tokens_baseline,
+        n_tokens_watermarked=generated.n_tokens_watermarked,
         seconds_issue_keys=t_keys,
         seconds_detect_total=det_total,
         baseline_text=generated.baseline_text,
@@ -313,18 +327,20 @@ def run_benchmark(
         description="Baselines",
     )
     trial_baselines = list(pregen.texts)
+    trial_baseline_tokens = list(pregen.token_counts)
 
     # Amortize so sum of per-trial baseline times equals pregen wall time.
     amortized = pregen.seconds / max(len(trials), 1)
 
     generated: list[_GeneratedProtocol] = []
-    for (prompt_index, repeat_index, prompt), baseline_text in zip(
+    for (prompt_index, repeat_index, prompt), baseline_text, n_bl_tok in zip(
         benchmark_io.iter_with_progress(
             trials,
             description="Watermark generate",
             disable=cfg.quiet,
         ),
         trial_baselines,
+        trial_baseline_tokens,
     ):
         generated.append(
             _generate_protocol_once(
@@ -333,6 +349,7 @@ def run_benchmark(
                 repeat_index=repeat_index,
                 prompt=prompt,
                 baseline_text=baseline_text,
+                baseline_n_tokens=int(n_bl_tok),
             )
         )
 
@@ -389,8 +406,16 @@ class RunAggregate:
     avg_replacements: float
     avg_baseline_gen_s: float
     avg_watermarked_gen_s: float
+    avg_baseline_tok_s: float
+    avg_watermarked_tok_s: float
     avg_detect_s: float
     label_policy_rates: dict[str, float] = field(default_factory=dict)
+
+
+def _tokens_per_sec(n_tokens: float, seconds: float) -> float:
+    if seconds <= 0.0 or n_tokens <= 0.0:
+        return 0.0
+    return float(n_tokens) / float(seconds)
 
 
 def _aggregate_runs(runs: Sequence[ProtocolRunResult]) -> RunAggregate:
@@ -412,6 +437,8 @@ def _aggregate_runs(runs: Sequence[ProtocolRunResult]) -> RunAggregate:
             avg_replacements=0.0,
             avg_baseline_gen_s=0.0,
             avg_watermarked_gen_s=0.0,
+            avg_baseline_tok_s=0.0,
+            avg_watermarked_tok_s=0.0,
             avg_detect_s=0.0,
         )
 
@@ -421,6 +448,11 @@ def _aggregate_runs(runs: Sequence[ProtocolRunResult]) -> RunAggregate:
     label_policy_rates: dict[str, float] = {}
     for w in VOCABULARY:
         label_policy_rates[w] = sum(1 for r in runs if r.label_policy_ok.get(w, False)) / n
+
+    total_bl_s = sum(r.seconds_baseline_gen for r in runs)
+    total_wm_s = sum(r.seconds_watermarked_gen for r in runs)
+    total_bl_tok = sum(r.n_tokens_baseline for r in runs)
+    total_wm_tok = sum(r.n_tokens_watermarked for r in runs)
 
     return RunAggregate(
         n_runs=n,
@@ -438,6 +470,8 @@ def _aggregate_runs(runs: Sequence[ProtocolRunResult]) -> RunAggregate:
         avg_replacements=statistics.mean(r.retok_replacements for r in runs),
         avg_baseline_gen_s=statistics.mean(r.seconds_baseline_gen for r in runs),
         avg_watermarked_gen_s=statistics.mean(r.seconds_watermarked_gen for r in runs),
+        avg_baseline_tok_s=_tokens_per_sec(total_bl_tok, total_bl_s),
+        avg_watermarked_tok_s=_tokens_per_sec(total_wm_tok, total_wm_s),
         avg_detect_s=statistics.mean(r.seconds_detect_total for r in runs),
         label_policy_rates=label_policy_rates,
     )
@@ -498,6 +532,7 @@ def _print_per_prompt_plain(
                 f"{agg.avg_natural_partition:.0f}",
                 _pct(agg.recovery_ids_aligned_rate),
                 f"{agg.avg_baseline_gen_s + agg.avg_watermarked_gen_s:.1f}s",
+                f"{agg.avg_baseline_tok_s:.0f}/{agg.avg_watermarked_tok_s:.0f}",
                 f"{agg.avg_detect_s:.1f}s",
             ]
         )
@@ -517,10 +552,11 @@ def _print_per_prompt_plain(
             "nat",
             "aligned",
             "gen",
+            "tok/s",
             "det",
         ],
-        widths=[3, 40, 5, 7, 7, 7, 7, 7, 8, 8, 4, 7, 6, 6],
-        aligns=[">", "<", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">"],
+        widths=[3, 40, 5, 7, 7, 7, 7, 7, 8, 8, 4, 7, 6, 9, 6],
+        aligns=[">", "<", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">"],
         rows=rows,
     )
 
@@ -550,8 +586,9 @@ def _print_aggregate_plain(agg: RunAggregate, *, title: str) -> None:
         f"  avg replacements: {agg.avg_replacements:.1f}"
     )
     print(
-        f"  avg gen: baseline={agg.avg_baseline_gen_s:.2f}s  "
-        f"wm={agg.avg_watermarked_gen_s:.2f}s  avg detect={agg.avg_detect_s:.2f}s"
+        f"  avg gen: baseline={agg.avg_baseline_gen_s:.2f}s ({agg.avg_baseline_tok_s:.1f} tok/s)  "
+        f"wm={agg.avg_watermarked_gen_s:.2f}s ({agg.avg_watermarked_tok_s:.1f} tok/s)  "
+        f"avg detect={agg.avg_detect_s:.2f}s"
     )
     policy_bits = "  ".join(
         f"{w}={_pct(agg.label_policy_rates.get(w, 0.0))}" for w in VOCABULARY

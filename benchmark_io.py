@@ -322,6 +322,7 @@ class BaselinePregenResult:
     seconds: float
     batch_size: int
     max_new_tokens: int
+    token_counts: tuple[int, ...] = ()
 
     @property
     def amortized_seconds(self) -> float:
@@ -350,7 +351,13 @@ def pregenerate_baselines(
     n = len(prompt_list)
     n_tokens = int(baseline_max_new_tokens() if max_new_tokens is None else max_new_tokens)
     if n == 0:
-        return BaselinePregenResult(texts=(), seconds=0.0, batch_size=1, max_new_tokens=n_tokens)
+        return BaselinePregenResult(
+            texts=(),
+            seconds=0.0,
+            batch_size=1,
+            max_new_tokens=n_tokens,
+            token_counts=(),
+        )
 
     m, tok, device = model.load()
     t0 = time.perf_counter()
@@ -372,7 +379,7 @@ def pregenerate_baselines(
             on_batch_done(int(k))
 
     if quiet:
-        texts = randrecover.generate_baselines(
+        texts, token_counts = randrecover.generate_baselines(
             m,
             tok,
             prompt_list,
@@ -401,7 +408,7 @@ def pregenerate_baselines(
                 progress.advance(task_id, int(k))
                 _notify(k)
 
-            texts = randrecover.generate_baselines(
+            texts, token_counts = randrecover.generate_baselines(
                 m,
                 tok,
                 prompt_list,
@@ -413,15 +420,18 @@ def pregenerate_baselines(
 
     elapsed = time.perf_counter() - t0
     if not quiet:
+        total_tok = sum(int(t) for t in token_counts)
+        tok_s = (total_tok / elapsed) if elapsed > 0 else 0.0
         print(
             f"pregenerated {n} baselines in {elapsed:.2f}s "
-            f"(max_new_tokens={n_tokens}, batch_size≈{eff_bs})"
+            f"({tok_s:.1f} tok/s, max_new_tokens={n_tokens}, batch_size≈{eff_bs})"
         )
     return BaselinePregenResult(
         texts=tuple(texts),
         seconds=float(elapsed),
         batch_size=int(eff_bs),
         max_new_tokens=n_tokens,
+        token_counts=tuple(int(t) for t in token_counts),
     )
 
 
@@ -477,7 +487,7 @@ def save_policy_summary(
     roll_xmatch = {sid: _rollup_to_dict(r) for sid, r in summary.roll_attributes_match.items()}
 
     # Lazy import avoids a cycle: policy_detection imports benchmark_io.
-    from benchmark_policy_detection import micro_fpr_wilson, micro_tpr_wilson
+    from benchmark_policy_detection import micro_ber_stats, micro_fpr_wilson, micro_tpr_wilson
 
     fpr, fpr_lo, fpr_hi = micro_fpr_wilson(summary.roll, summary.prompt_cases)
     tpr, tpr_lo, tpr_hi = micro_tpr_wilson(summary.roll, summary.prompt_cases)
@@ -485,6 +495,10 @@ def save_policy_summary(
         summary.roll_attributes_match, summary.prompt_cases
     )
     tpr_x, tpr_x_lo, tpr_x_hi = micro_tpr_wilson(
+        summary.roll_attributes_match, summary.prompt_cases
+    )
+    ber_avg, ber_max, ber_n = micro_ber_stats(summary.roll, summary.prompt_cases)
+    ber_avg_x, ber_max_x, ber_n_x = micro_ber_stats(
         summary.roll_attributes_match, summary.prompt_cases
     )
 
@@ -525,6 +539,16 @@ def save_policy_summary(
                     "rate": tpr_x,
                     "ci_low": tpr_x_lo,
                     "ci_high": tpr_x_hi,
+                },
+                "master_ber_all_runs": {
+                    "avg": ber_avg,
+                    "max": ber_max,
+                    "n": ber_n,
+                },
+                "master_ber_x_matched_runs_only": {
+                    "avg": ber_avg_x,
+                    "max": ber_max_x,
+                    "n": ber_n_x,
                 },
             },
         },
@@ -607,6 +631,9 @@ def save_label_matrix(
             ),
             "rates_attributes_match_ci_low": ci_low_x,
             "rates_attributes_match_ci_high": ci_high_x,
+            "master_ber_avg": float(getattr(matrix, "avg_master_ber", float("nan"))),
+            "master_ber_max": float(getattr(matrix, "max_master_ber", float("nan"))),
+            "n_ber_trials": int(getattr(matrix, "n_ber_trials", 0)),
         },
     )
 
@@ -654,6 +681,9 @@ def save_prompt_matrix(
             ),
             "rates_attributes_match_ci_low": ci_low_x,
             "rates_attributes_match_ci_high": ci_high_x,
+            "master_ber_avg": float(getattr(matrix, "avg_master_ber", float("nan"))),
+            "master_ber_max": float(getattr(matrix, "max_master_ber", float("nan"))),
+            "n_ber_trials": int(getattr(matrix, "n_ber_trials", 0)),
         },
     )
 
@@ -719,7 +749,13 @@ def save_ber_diagnostics(
         "end_to_end_ber_master",
     )
     aggregates = {
-        key: mean_with_ci([float(r[key]) for r in results]) for key in ber_keys
+        key: {
+            **mean_with_ci([float(r[key]) for r in results]),
+            "max": (
+                max(float(r[key]) for r in results) if results else float("nan")
+            ),
+        }
+        for key in ber_keys
     }
     detect_n = len(results)
     aggregates["detect_oracle_key"] = proportion_with_ci(
