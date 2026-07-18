@@ -50,6 +50,9 @@ from text_attributes import VOCABULARY, active_labels_from_attributes
 
 make_benchmark_console = benchmark_io.make_benchmark_console
 
+# Parent sweep bars count these LM phases per protocol trial (not score-only).
+_SWEEP_PROGRESS_PHASES_PER_TRIAL = 3  # baseline, watermark generate, channel recover
+
 
 def _configure_benchmark(
     *,
@@ -482,9 +485,12 @@ def run_benchmark_label_conditioned_matrix(
         prompt_cases,
         runs,
         show_baseline_progress=progress_on and trial_progress is None,
+        trial_progress=trial_progress,
     )
     amortized = pregen.amortized_seconds
     generated: list[_GeneratedTrial] = []
+    if trial_progress is not None:
+        trial_progress.set_description("Benchmark matrix generate")
     for (_, sid, prompt), baseline in zip(
         benchmark_io.iter_with_progress(
             trials,
@@ -502,6 +508,8 @@ def run_benchmark_label_conditioned_matrix(
                 baseline_gen_seconds=amortized,
             )
         )
+        if trial_progress is not None:
+            trial_progress.advance(1)
 
     scored = _score_protocol_trials_batched(
         generated,
@@ -659,9 +667,12 @@ def run_benchmark_prompt_conditioned_matrix(
         prompt_cases,
         runs,
         show_baseline_progress=progress_on and trial_progress is None,
+        trial_progress=trial_progress,
     )
     amortized = pregen.amortized_seconds
     generated: list[_GeneratedTrial] = []
+    if trial_progress is not None:
+        trial_progress.set_description("Benchmark prompt matrix generate")
     for (_, sid, prompt), baseline in zip(
         benchmark_io.iter_with_progress(
             trials,
@@ -679,6 +690,8 @@ def run_benchmark_prompt_conditioned_matrix(
                 baseline_gen_seconds=amortized,
             )
         )
+        if trial_progress is not None:
+            trial_progress.advance(1)
 
     scored = _score_protocol_trials_batched(
         generated,
@@ -786,13 +799,22 @@ def _prepare_trials_with_baselines(
     runs: int,
     *,
     show_baseline_progress: bool,
+    trial_progress: benchmark_io.ProgressHandle | None = None,
 ) -> tuple[list[tuple[int, str, str]], benchmark_io.BaselinePregenResult]:
     """Build the trial grid and pregenerate one baseline per trial (order-matched)."""
     trials = [(run_i, sid, prompt) for run_i in range(runs) for sid, prompt in prompt_cases]
+    # Nested under a parent sweep bar: suppress the child UI but still advance parent.
+    child_bar = bool(show_baseline_progress) and trial_progress is None
+    on_batch = (
+        (lambda k: trial_progress.advance(k)) if trial_progress is not None else None
+    )
+    if trial_progress is not None:
+        trial_progress.set_description("Baselines")
     pregen = benchmark_io.pregenerate_baselines(
         [prompt for _, _, prompt in trials],
-        quiet=not show_baseline_progress,
+        quiet=not child_bar,
         description="Baselines",
+        on_batch_done=on_batch,
     )
     if len(pregen.texts) != len(trials):
         raise RuntimeError(
@@ -979,17 +1001,28 @@ def _score_protocol_trials_batched(
         return []
 
     recover_disable = (not show_progress) or (trial_progress is not None)
+    if trial_progress is not None:
+        trial_progress.set_description(f"{description} recover")
     t0 = time.perf_counter()
     with benchmark_io.progress_task(
         f"{description} recover",
         n,
         disable=recover_disable,
     ) as recover_bar:
+
+        def _on_recover_batch(k: int) -> None:
+            recover_bar.advance(k)
+            if trial_progress is not None:
+                trial_progress.advance(k)
+
         bits_list = wm.recover_channel_bits_batch(
-            texts, on_batch_done=lambda k: recover_bar.advance(k)
+            texts, on_batch_done=_on_recover_batch
         )
     recover_wall = time.perf_counter() - t0
     amortize = recover_wall / n
+
+    if trial_progress is not None:
+        trial_progress.set_description(f"{description} score")
 
     scored: list[
         tuple[
@@ -1016,8 +1049,6 @@ def _score_protocol_trials_batched(
         scored.append(
             _score_generated_trial(g, bits, recover_seconds=amortize)
         )
-        if trial_progress is not None:
-            trial_progress.advance(1)
     return scored
 
 
@@ -1305,10 +1336,13 @@ def run_benchmark_with_summary(
         prompt_cases,
         runs,
         show_baseline_progress=progress_on and trial_progress is None,
+        trial_progress=trial_progress,
     )
     amortized = pregen.amortized_seconds
     generated: list[_GeneratedTrial] = []
     setup_by_index: list[float] = []
+    if trial_progress is not None:
+        trial_progress.set_description("Benchmark generate")
     for (_, sid, prompt), baseline in zip(
         benchmark_io.iter_with_progress(
             trials,
@@ -1328,6 +1362,8 @@ def run_benchmark_with_summary(
                 baseline_gen_seconds=amortized,
             )
         )
+        if trial_progress is not None:
+            trial_progress.advance(1)
 
     scored = _score_protocol_trials_batched(
         generated,
@@ -1460,8 +1496,9 @@ def run_fpr_vs_code_length_sweep(
     Metrics keys: ``scheme_fpr_all``, ``scheme_fpr_xmatch``, ``prc_random_fpr``,
     plus ``*_ci_low`` / ``*_ci_high`` Wilson bounds where applicable.
 
-    Progress advances once per protocol trial across the whole sweep (not once
-    per code length). ``quiet`` only suppresses per-length result tables.
+    Progress advances once per LM phase (baseline, watermark generate, channel
+    recover) for every protocol trial across the whole sweep — not once per
+    code length. ``quiet`` only suppresses per-length result tables.
     """
     prng = rng if rng is not None else random.Random()
     lengths: list[int] = []
@@ -1478,16 +1515,18 @@ def run_fpr_vs_code_length_sweep(
 
     length_list = list(code_lengths)
     trials_per_length = int(runs) * len(prompt_cases)
-    total_trials = trials_per_length * len(length_list)
+    total_units = (
+        trials_per_length * len(length_list) * _SWEEP_PROGRESS_PHASES_PER_TRIAL
+    )
     progress_on = True if show_progress is None else bool(show_progress)
 
     with benchmark_io.progress_task(
         "FPR sweep",
-        total_trials,
-        disable=not progress_on or total_trials <= 0,
+        total_units,
+        disable=not progress_on or total_units <= 0,
     ) as sweep_progress:
         for length in length_list:
-            sweep_progress.set_description(f"FPR sweep n={int(length)}")
+            sweep_progress.set_description(f"FPR sweep n={int(length)} · PRC MC")
             r_rand, fp_mc = prc_random_detect_positive_rate(
                 int(length), int(prc_monte_carlo_trials), rng=prng, quiet=True
             )
@@ -1496,6 +1535,7 @@ def run_fpr_vs_code_length_sweep(
             prc_random_fpr_lo.append(pl)
             prc_random_fpr_hi.append(ph)
 
+            sweep_progress.set_description(f"FPR sweep n={int(length)}")
             ex, summary = run_benchmark_with_summary(
                 prompt_cases=prompt_cases,
                 runs=int(runs),
@@ -1549,8 +1589,9 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
 ) -> tuple[list[int], dict[str, list[float]], list[int]]:
     """Sweep ``wm_bit_redundancy`` at fixed logical ``code_length``.
 
-    Progress advances once per protocol trial across the whole sweep (not once
-    per redundancy). ``quiet`` only suppresses per-point result tables.
+    Progress advances once per LM phase (baseline, watermark generate, channel
+    recover) for every protocol trial across the whole sweep — not once per
+    redundancy. ``quiet`` only suppresses per-point result tables.
     """
     redundancies: list[int] = []
     tpr_all: list[float] = []
@@ -1563,13 +1604,15 @@ def run_tpr_vs_wm_bit_redundancy_sweep(
 
     redundancy_list = list(wm_bit_redundancy_values)
     trials_per_point = int(runs) * len(prompt_cases)
-    total_trials = trials_per_point * len(redundancy_list)
+    total_units = (
+        trials_per_point * len(redundancy_list) * _SWEEP_PROGRESS_PHASES_PER_TRIAL
+    )
     progress_on = True if show_progress is None else bool(show_progress)
 
     with benchmark_io.progress_task(
         "TPR sweep",
-        total_trials,
-        disable=not progress_on or total_trials <= 0,
+        total_units,
+        disable=not progress_on or total_units <= 0,
     ) as sweep_progress:
         for redundancy in redundancy_list:
             sweep_progress.set_description(f"TPR sweep R={int(redundancy)}")

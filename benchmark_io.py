@@ -336,12 +336,15 @@ def pregenerate_baselines(
     batch_size: int | None = None,
     quiet: bool = False,
     description: str = "Baselines",
+    on_batch_done: Callable[[int], None] | None = None,
 ) -> BaselinePregenResult:
     """
     Prefetch baseline texts for every prompt in ``prompts`` (order-preserving).
 
     Uses batched HF ``generate`` with VRAM-adaptive micro-batches (OOM backoff).
     Progress advances by the number of baselines completed per micro-batch.
+    ``on_batch_done(n)`` is always invoked when provided (e.g. parent sweep bars),
+    including when ``quiet=True`` suppresses the local progress UI.
     """
     prompt_list = [str(p) for p in prompts]
     n = len(prompt_list)
@@ -364,9 +367,19 @@ def pregenerate_baselines(
     else:
         eff_bs = max(1, min(n, int(batch_size)))
 
+    def _notify(k: int) -> None:
+        if on_batch_done is not None:
+            on_batch_done(int(k))
+
     if quiet:
         texts = randrecover.generate_baselines(
-            m, tok, prompt_list, n_tokens, device, batch_size=eff_bs
+            m,
+            tok,
+            prompt_list,
+            n_tokens,
+            device,
+            batch_size=eff_bs,
+            on_batch_done=_notify if on_batch_done is not None else None,
         )
     else:
         progress_console = make_progress_console()
@@ -386,6 +399,7 @@ def pregenerate_baselines(
 
             def _on_batch(k: int) -> None:
                 progress.advance(task_id, int(k))
+                _notify(k)
 
             texts = randrecover.generate_baselines(
                 m,
