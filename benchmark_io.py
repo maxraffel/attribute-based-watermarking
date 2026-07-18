@@ -573,6 +573,10 @@ def save_label_matrix(
     llm_model_id: str | None = None,
 ) -> Path:
     rates, ci_low, ci_high = rate_matrix_with_ci(matrix.numerators, matrix.denominators)
+    rates_x, ci_low_x, ci_high_x = rate_matrix_with_ci(
+        matrix.numerators_attributes_match,
+        matrix.denominators_attributes_match,
+    )
     return save_json(
         path,
         {
@@ -594,6 +598,15 @@ def save_label_matrix(
             "rates": matrix.rates if getattr(matrix, "rates", None) is not None else rates,
             "rates_ci_low": ci_low,
             "rates_ci_high": ci_high,
+            "numerators_attributes_match": matrix.numerators_attributes_match,
+            "denominators_attributes_match": matrix.denominators_attributes_match,
+            "rates_attributes_match": (
+                matrix.rates_attributes_match
+                if getattr(matrix, "rates_attributes_match", None) is not None
+                else rates_x
+            ),
+            "rates_attributes_match_ci_low": ci_low_x,
+            "rates_attributes_match_ci_high": ci_high_x,
         },
     )
 

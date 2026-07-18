@@ -280,12 +280,20 @@ class LabelConditionedDetectionMatrix:
     - rows: constrained key label used for ``detect``
     - cols: labels active in verify-time attribution (can be multi-label per trial)
     - cell value: positive-detect count / conditioning count.
+
+    ``numerators`` / ``denominators`` / ``rates`` pool **all** qualifying trials. The
+    ``*_attributes_match`` fields mirror the same update rules but **only** on trials
+    where encode-time ``attributes`` equals verify-time ``derive_attributes``
+    (full-vector match).
     """
 
     vocab: tuple[str, ...]
     numerators: dict[str, dict[str, int]]
     denominators: dict[str, dict[str, int]]
     rates: dict[str, dict[str, float]]
+    numerators_attributes_match: dict[str, dict[str, int]]
+    denominators_attributes_match: dict[str, dict[str, int]]
+    rates_attributes_match: dict[str, dict[str, float]]
     prompt_cases: tuple[tuple[str, str], ...]
     runs_per_prompt: int
     code_length: int
@@ -437,6 +445,10 @@ def run_benchmark_label_conditioned_matrix(
     For every column label ``c in A`` and every row label ``r in VOCABULARY``:
       - denominator[r,c] += 1
       - numerator[r,c] += 1 iff ``detect(issue([r]), wm_text)`` is True.
+
+    The returned matrix also includes ``*_attributes_match`` tallies over the same rules
+    but **only** for trials where encode-time ``attributes`` equals verify-time
+    ``derive_attributes`` (full-vector match).
     """
     for name in ("httpx", "httpcore", "huggingface_hub", "urllib3", "text_attributes"):
         logging.getLogger(name).setLevel(logging.WARNING)
@@ -464,6 +476,12 @@ def run_benchmark_label_conditioned_matrix(
         r: {c: 0 for c in vocab} for r in vocab
     }
     denominators: dict[str, dict[str, int]] = {
+        r: {c: 0 for c in vocab} for r in vocab
+    }
+    numerators_attributes_match: dict[str, dict[str, int]] = {
+        r: {c: 0 for c in vocab} for r in vocab
+    }
+    denominators_attributes_match: dict[str, dict[str, int]] = {
         r: {c: 0 for c in vocab} for r in vocab
     }
     sid_runs: dict[str, int] = {sid: 0 for sid, _ in prompt_cases}
@@ -519,7 +537,7 @@ def run_benchmark_label_conditioned_matrix(
     )
     for ((_, sid, _prompt), _baseline), (
         word_stats,
-        _attributes_match,
+        attributes_match,
         master_ok,
         open_ok,
         _cprf_label_ok,
@@ -560,6 +578,16 @@ def run_benchmark_label_conditioned_matrix(
             for col in attributed_cols:
                 numerators[row][col] += 1
 
+        if attributes_match:
+            for col in attributed_cols:
+                for row in vocab:
+                    denominators_attributes_match[row][col] += 1
+            for row in vocab:
+                if not got_by_row.get(row, False):
+                    continue
+                for col in attributed_cols:
+                    numerators_attributes_match[row][col] += 1
+
     all_ok = True
     for sid, _ in prompt_cases:
         n = sid_runs[sid]
@@ -574,17 +602,24 @@ def run_benchmark_label_conditioned_matrix(
         all_ok = all_ok and ok
 
     rates: dict[str, dict[str, float]] = {r: {} for r in vocab}
+    rates_attributes_match: dict[str, dict[str, float]] = {r: {} for r in vocab}
     for r in vocab:
         for c in vocab:
             d = denominators[r][c]
             n = numerators[r][c]
             rates[r][c] = (n / d) if d > 0 else -1.0
+            dx = denominators_attributes_match[r][c]
+            nx = numerators_attributes_match[r][c]
+            rates_attributes_match[r][c] = (nx / dx) if dx > 0 else -1.0
 
     matrix = LabelConditionedDetectionMatrix(
         vocab=vocab,
         numerators=numerators,
         denominators=denominators,
         rates=rates,
+        numerators_attributes_match=numerators_attributes_match,
+        denominators_attributes_match=denominators_attributes_match,
+        rates_attributes_match=rates_attributes_match,
         prompt_cases=tuple((sid, p) for sid, p in prompt_cases),
         runs_per_prompt=runs,
         code_length=code_length,

@@ -313,13 +313,29 @@ def plot_label_matrix(
     data: dict,
     *,
     output_png: Path | None = None,
+    xmatch: bool = False,
     with_ci: bool | None = None,
     show: bool = True,
 ) -> Path:
     vocab = list(data["vocab"])
-    out = output_png or Path(
+    base = Path(
         str(data.get("_source_path", "benchmark_label_conditioned_detection_matrix"))
-    ).with_suffix(".png")
+    )
+    suffix = "_xmatch" if xmatch else ""
+    out = output_png or base.with_name(base.stem + suffix).with_suffix(".png")
+    if xmatch:
+        return _matrix_heatmap(
+            data["numerators_attributes_match"],
+            data["denominators_attributes_match"],
+            row_labels=vocab,
+            col_labels=vocab,
+            title="Label-conditioned detection — x matched only (%)",
+            output_png=out,
+            show=show,
+            ci_low=data.get("rates_attributes_match_ci_low"),
+            ci_high=data.get("rates_attributes_match_ci_high"),
+            with_ci=with_ci,
+        )
     return _matrix_heatmap(
         data["numerators"],
         data["denominators"],
@@ -473,7 +489,9 @@ def plot_from_file(
     if resolved == "tpr":
         return plot_tpr_vs_redundancy(data, output_png=output_png, with_ci=with_ci, show=show)
     if resolved == "label-matrix":
-        return plot_label_matrix(data, output_png=output_png, with_ci=with_ci, show=show)
+        return plot_label_matrix(
+            data, output_png=output_png, xmatch=xmatch, with_ci=with_ci, show=show
+        )
     if resolved == "prompt-matrix":
         return plot_prompt_matrix(
             data, output_png=output_png, xmatch=xmatch, with_ci=with_ci, show=show
@@ -517,7 +535,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--xmatch",
         action="store_true",
-        help="For prompt-matrix, plot attributes-match subset.",
+        help="For label-matrix / prompt-matrix, plot attributes-match subset.",
     )
     p.add_argument(
         "--no-show",
