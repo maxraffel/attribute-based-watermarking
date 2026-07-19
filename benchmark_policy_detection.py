@@ -542,27 +542,36 @@ def run_benchmark_label_conditioned_matrix(
     generated: list[_GeneratedTrial] = []
     if trial_progress is not None:
         trial_progress.set_description("Benchmark matrix generate")
-    for (_, sid, prompt), baseline, n_bl_tok in zip(
-        benchmark_io.iter_with_progress(
-            trials,
-            description="Benchmark matrix generate",
-            disable=not progress_on or trial_progress is not None,
-        ),
-        pregen.texts,
-        pregen.token_counts,
-    ):
-        sk = wm.setup(modulus)
-        generated.append(
-            _generate_trial(
-                sk,
-                prompt,
-                baseline_text=baseline,
-                baseline_gen_seconds=amortized,
-                baseline_n_tokens=int(n_bl_tok),
-            )
-        )
+    sks = [wm.setup(modulus) for _ in trials]
+    prompts = [prompt for _, _, prompt in trials]
+
+    def _on_wm_batch(k: int) -> None:
         if trial_progress is not None:
-            trial_progress.advance(1)
+            trial_progress.advance(k)
+
+    if progress_on and trial_progress is None:
+        with benchmark_io.progress_task(
+            "Benchmark matrix generate",
+            len(trials),
+            disable=False,
+        ) as bar:
+            generated = _generate_trials_batched(
+                sks,
+                prompts,
+                baseline_texts=list(pregen.texts),
+                baseline_gen_seconds=amortized,
+                baseline_n_tokens=[int(t) for t in pregen.token_counts],
+                on_batch_done=lambda k: bar.advance(k),
+            )
+    else:
+        generated = _generate_trials_batched(
+            sks,
+            prompts,
+            baseline_texts=list(pregen.texts),
+            baseline_gen_seconds=amortized,
+            baseline_n_tokens=[int(t) for t in pregen.token_counts],
+            on_batch_done=_on_wm_batch if trial_progress is not None else None,
+        )
 
     scored = _score_protocol_trials_batched(
         generated,
@@ -759,27 +768,36 @@ def run_benchmark_prompt_conditioned_matrix(
     generated: list[_GeneratedTrial] = []
     if trial_progress is not None:
         trial_progress.set_description("Benchmark prompt matrix generate")
-    for (_, sid, prompt), baseline, n_bl_tok in zip(
-        benchmark_io.iter_with_progress(
-            trials,
-            description="Benchmark prompt matrix generate",
-            disable=not progress_on or trial_progress is not None,
-        ),
-        pregen.texts,
-        pregen.token_counts,
-    ):
-        sk = wm.setup(modulus)
-        generated.append(
-            _generate_trial(
-                sk,
-                prompt,
-                baseline_text=baseline,
-                baseline_gen_seconds=amortized,
-                baseline_n_tokens=int(n_bl_tok),
-            )
-        )
+    sks = [wm.setup(modulus) for _ in trials]
+    prompts = [prompt for _, _, prompt in trials]
+
+    def _on_wm_batch(k: int) -> None:
         if trial_progress is not None:
-            trial_progress.advance(1)
+            trial_progress.advance(k)
+
+    if progress_on and trial_progress is None:
+        with benchmark_io.progress_task(
+            "Benchmark prompt matrix generate",
+            len(trials),
+            disable=False,
+        ) as bar:
+            generated = _generate_trials_batched(
+                sks,
+                prompts,
+                baseline_texts=list(pregen.texts),
+                baseline_gen_seconds=amortized,
+                baseline_n_tokens=[int(t) for t in pregen.token_counts],
+                on_batch_done=lambda k: bar.advance(k),
+            )
+    else:
+        generated = _generate_trials_batched(
+            sks,
+            prompts,
+            baseline_texts=list(pregen.texts),
+            baseline_gen_seconds=amortized,
+            baseline_n_tokens=[int(t) for t in pregen.token_counts],
+            on_batch_done=_on_wm_batch if trial_progress is not None else None,
+        )
 
     scored = _score_protocol_trials_batched(
         generated,
@@ -974,6 +992,67 @@ def _generate_trial(
         secret=secret,
         tt=tt,
     )
+
+
+def _generate_trials_batched(
+    sks: Sequence[Any],
+    prompts: Sequence[str],
+    *,
+    baseline_texts: Sequence[str],
+    baseline_gen_seconds: float,
+    baseline_n_tokens: Sequence[int],
+    on_batch_done: Any | None = None,
+) -> list[_GeneratedTrial]:
+    """CPU encode per trial (fresh keys), then one batched LM watermark generate."""
+    from hashlib import sha256
+
+    prompt_list = [str(p) for p in prompts]
+    n = len(prompt_list)
+    if len(sks) != n or len(baseline_texts) != n or len(baseline_n_tokens) != n:
+        raise ValueError("sks/prompts/baselines/token_counts length mismatch")
+
+    channel_bits_list: list[list[int]] = []
+    attrs_list: list = []
+    secret_list: list[list[int]] = []
+    for sk, baseline in zip(sks, baseline_texts):
+        attributes = text_attributes.derive_attributes(
+            baseline, sk.modulus, log_scores=False
+        )
+        r = sk.eval(attributes)
+        prc.set_code_length(wm.SECURITY_PARAM)
+        bits = [
+            1 if b else 0
+            for b in prc.encode(prc.key_gen_from_seed(sha256(r).digest()))
+        ]
+        channel_bits_list.append(
+            wm.expand_channel_bits(bits, wm.WM_BIT_REDUNDANCY)
+        )
+        attrs_list.append(attributes)
+        secret_list.append(list(bits))
+
+    outs = wm.generate_from_channel_bits_batch(
+        prompt_list,
+        channel_bits_list,
+        on_batch_done=on_batch_done,
+    )
+    generated: list[_GeneratedTrial] = []
+    for i, out in enumerate(outs):
+        tt = TimingTotals()
+        tt.t_baseline_gen = float(baseline_gen_seconds)
+        tt.t_wm_gen = float(out["seconds_watermarked_gen"])
+        tt.n_baseline_tokens = int(baseline_n_tokens[i])
+        tt.n_wm_tokens = int(out["n_tokens_watermarked"])
+        generated.append(
+            _GeneratedTrial(
+                sk=sks[i],
+                wm_text=str(out["generated_text_wm"]),
+                encode_attributes=list(attrs_list[i]),
+                secret=list(secret_list[i]),
+                tt=tt,
+            )
+        )
+        del out
+    return generated
 
 
 def _score_generated_trial(
@@ -1528,29 +1607,40 @@ def run_benchmark_with_summary(
     setup_by_index: list[float] = []
     if trial_progress is not None:
         trial_progress.set_description("Benchmark generate")
-    for (_, sid, prompt), baseline, n_bl_tok in zip(
-        benchmark_io.iter_with_progress(
-            trials,
-            description="Benchmark generate",
-            disable=not progress_on or trial_progress is not None,
-        ),
-        pregen.texts,
-        pregen.token_counts,
-    ):
+    sks: list[Any] = []
+    for _ in trials:
         t_setup0 = time.perf_counter()
-        sk = wm.setup(modulus)
+        sks.append(wm.setup(modulus))
         setup_by_index.append(time.perf_counter() - t_setup0)
-        generated.append(
-            _generate_trial(
-                sk,
-                prompt,
-                baseline_text=baseline,
-                baseline_gen_seconds=amortized,
-                baseline_n_tokens=int(n_bl_tok),
-            )
-        )
+    prompts = [prompt for _, _, prompt in trials]
+
+    def _on_wm_batch(k: int) -> None:
         if trial_progress is not None:
-            trial_progress.advance(1)
+            trial_progress.advance(k)
+
+    if progress_on and trial_progress is None:
+        with benchmark_io.progress_task(
+            "Benchmark generate",
+            len(trials),
+            disable=False,
+        ) as bar:
+            generated = _generate_trials_batched(
+                sks,
+                prompts,
+                baseline_texts=list(pregen.texts),
+                baseline_gen_seconds=amortized,
+                baseline_n_tokens=[int(t) for t in pregen.token_counts],
+                on_batch_done=lambda k: bar.advance(k),
+            )
+    else:
+        generated = _generate_trials_batched(
+            sks,
+            prompts,
+            baseline_texts=list(pregen.texts),
+            baseline_gen_seconds=amortized,
+            baseline_n_tokens=[int(t) for t in pregen.token_counts],
+            on_batch_done=_on_wm_batch if trial_progress is not None else None,
+        )
 
     scored = _score_protocol_trials_batched(
         generated,

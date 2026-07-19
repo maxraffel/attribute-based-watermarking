@@ -111,65 +111,167 @@ def generate(
     baseline_text: str | None = None,
     baseline_n_tokens: int | None = None,
 ) -> dict:
+    return generate_batch(
+        sk,
+        [prompt],
+        baseline_texts=[baseline_text] if baseline_text is not None else None,
+        baseline_n_tokens=(
+            [baseline_n_tokens] if baseline_n_tokens is not None else None
+        ),
+        batch_size=1,
+    )[0]
+
+
+def generate_batch(
+    sk: cprf.MasterKey,
+    prompts: Sequence[str],
+    *,
+    baseline_texts: Sequence[str | None] | None = None,
+    baseline_n_tokens: Sequence[int | None] | None = None,
+    batch_size: int | None = None,
+    on_batch_done: Any | None = None,
+) -> list[dict]:
+    """Batched protocol generate (baselines optional; watermark LM path is batched)."""
+    prompt_list = [str(p) for p in prompts]
+    n = len(prompt_list)
+    if n == 0:
+        return []
+
     m, tok, device = model.load()
     n_channel = SECURITY_PARAM * WM_BIT_REDUNDANCY
-    # Match watermarked length: burn-in + channel tokens.
     n_baseline = BURN_IN_TOKENS + n_channel
 
-    if baseline_text is None:
+    if baseline_texts is None:
         t0 = time.perf_counter()
-        baseline, n_tokens_baseline = randrecover.generate_baseline(
-            m, tok, prompt, n_baseline, device
+        texts, token_counts = randrecover.generate_baselines(
+            m, tok, prompt_list, n_baseline, device, batch_size=batch_size
         )
-        seconds_baseline_gen = time.perf_counter() - t0
+        seconds_baseline_each = (time.perf_counter() - t0) / max(n, 1)
+        baselines = list(texts)
+        baseline_toks = [int(t) for t in token_counts]
+        baseline_secs = [seconds_baseline_each] * n
     else:
-        baseline = baseline_text
-        seconds_baseline_gen = 0.0
-        if baseline_n_tokens is not None:
-            n_tokens_baseline = int(baseline_n_tokens)
-        else:
-            # Fallback when a pregen count was not supplied.
-            n_tokens_baseline = int(n_baseline)
+        if len(baseline_texts) != n:
+            raise ValueError("baseline_texts length must match prompts")
+        baselines = []
+        baseline_toks = []
+        baseline_secs = []
+        for i, bt in enumerate(baseline_texts):
+            if bt is None:
+                t0 = time.perf_counter()
+                text, n_tok = randrecover.generate_baseline(
+                    m, tok, prompt_list[i], n_baseline, device
+                )
+                baselines.append(text)
+                baseline_toks.append(int(n_tok))
+                baseline_secs.append(time.perf_counter() - t0)
+            else:
+                baselines.append(str(bt))
+                baseline_secs.append(0.0)
+                if baseline_n_tokens is not None and baseline_n_tokens[i] is not None:
+                    baseline_toks.append(int(baseline_n_tokens[i]))
+                else:
+                    baseline_toks.append(int(n_baseline))
 
-    baseline_scores: dict[str, float] = {}
-    attributes = derive_attributes(
-        baseline, sk.modulus, log_scores=False, scores_out=baseline_scores
-    )
-    r = sk.eval(attributes)
-    prc.set_code_length(SECURITY_PARAM)
-    bits = [1 if b else 0 for b in prc.encode(prc.key_gen_from_seed(sha256(r).digest()))]
-    channel_bits = expand_channel_bits(bits, WM_BIT_REDUNDANCY)
+    channel_bits_list: list[list[int]] = []
+    attrs_list: list = []
+    scores_list: list[dict[str, float]] = []
+    secret_list: list[list[int]] = []
+    for baseline in baselines:
+        baseline_scores: dict[str, float] = {}
+        attributes = derive_attributes(
+            baseline, sk.modulus, log_scores=False, scores_out=baseline_scores
+        )
+        r = sk.eval(attributes)
+        prc.set_code_length(SECURITY_PARAM)
+        bits = [
+            1 if b else 0
+            for b in prc.encode(prc.key_gen_from_seed(sha256(r).digest()))
+        ]
+        channel_bits = expand_channel_bits(bits, WM_BIT_REDUNDANCY)
+        attrs_list.append(attributes)
+        scores_list.append(dict(baseline_scores))
+        secret_list.append(list(bits))
+        channel_bits_list.append(list(channel_bits))
+
     t2 = time.perf_counter()
-    out = randrecover.generate_with_watermark(
+    wm_outs = randrecover.generate_with_watermarks(
         m,
         tok,
-        prompt,
-        channel_bits,
+        prompt_list,
+        channel_bits_list,
         device,
         burn_in_tokens=BURN_IN_TOKENS,
+        batch_size=batch_size,
+        on_batch_done=on_batch_done,
     )
-    seconds_watermarked_gen = time.perf_counter() - t2
-    n_tokens_watermarked = len(out["burn_in_ids"]) + len(out["wm_suffix_ids"])
+    seconds_wm_total = time.perf_counter() - t2
+    seconds_wm_each = seconds_wm_total / max(n, 1)
 
-    # --- logging ---
-    out["attributes"] = attributes
-    out["baseline_text"] = baseline
-    out["label_scores_baseline"] = dict(baseline_scores)
-    out["seconds_baseline_gen"] = seconds_baseline_gen
-    out["seconds_watermarked_gen"] = seconds_watermarked_gen
-    out["n_tokens_baseline"] = int(n_tokens_baseline)
-    out["n_tokens_watermarked"] = int(n_tokens_watermarked)
-    out["tokens_per_sec_baseline"] = _tokens_per_sec(
-        n_tokens_baseline, seconds_baseline_gen
+    results: list[dict] = []
+    for i, out in enumerate(wm_outs):
+        n_tokens_watermarked = len(out["burn_in_ids"]) + len(out["wm_suffix_ids"])
+        out = dict(out)
+        out["attributes"] = attrs_list[i]
+        out["baseline_text"] = baselines[i]
+        out["label_scores_baseline"] = scores_list[i]
+        out["seconds_baseline_gen"] = float(baseline_secs[i])
+        out["seconds_watermarked_gen"] = float(seconds_wm_each)
+        out["n_tokens_baseline"] = int(baseline_toks[i])
+        out["n_tokens_watermarked"] = int(n_tokens_watermarked)
+        out["tokens_per_sec_baseline"] = _tokens_per_sec(
+            baseline_toks[i], baseline_secs[i]
+        )
+        out["tokens_per_sec_watermarked"] = _tokens_per_sec(
+            n_tokens_watermarked, seconds_wm_each
+        )
+        out["prc_secret_bits"] = list(secret_list[i])
+        out["wm_bit_redundancy"] = WM_BIT_REDUNDANCY
+        out["wm_channel_bits"] = list(channel_bits_list[i])
+        out["burn_in_tokens"] = BURN_IN_TOKENS
+        results.append(out)
+    return results
+
+
+def generate_from_channel_bits_batch(
+    prompts: Sequence[str],
+    channel_bitstreams: Sequence[Sequence[int]],
+    *,
+    batch_size: int | None = None,
+    on_batch_done: Any | None = None,
+) -> list[dict]:
+    """Batched LM watermark path only (no CPRF/PRC). Timing amortized per item."""
+    prompt_list = [str(p) for p in prompts]
+    bits_list = [list(bits) for bits in channel_bitstreams]
+    n = len(prompt_list)
+    if n == 0:
+        return []
+    if len(bits_list) != n:
+        raise ValueError("prompts and channel_bitstreams must have the same length")
+    m, tok, device = model.load()
+    t0 = time.perf_counter()
+    outs = randrecover.generate_with_watermarks(
+        m,
+        tok,
+        prompt_list,
+        bits_list,
+        device,
+        burn_in_tokens=BURN_IN_TOKENS,
+        batch_size=batch_size,
+        on_batch_done=on_batch_done,
     )
-    out["tokens_per_sec_watermarked"] = _tokens_per_sec(
-        n_tokens_watermarked, seconds_watermarked_gen
-    )
-    out["prc_secret_bits"] = list(bits)
-    out["wm_bit_redundancy"] = WM_BIT_REDUNDANCY
-    out["wm_channel_bits"] = list(channel_bits)
-    out["burn_in_tokens"] = BURN_IN_TOKENS
-    return out
+    elapsed = time.perf_counter() - t0
+    each = elapsed / max(n, 1)
+    results: list[dict] = []
+    for out in outs:
+        out = dict(out)
+        n_tok = len(out["burn_in_ids"]) + len(out["wm_suffix_ids"])
+        out["seconds_watermarked_gen"] = float(each)
+        out["n_tokens_watermarked"] = int(n_tok)
+        out["tokens_per_sec_watermarked"] = _tokens_per_sec(n_tok, each)
+        out["burn_in_tokens"] = BURN_IN_TOKENS
+        results.append(out)
+    return results
 
 
 def detect(
