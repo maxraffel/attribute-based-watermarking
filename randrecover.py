@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import hashlib
 import inspect
 import os
@@ -10,7 +9,6 @@ from typing import Any, Dict, List, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
-from transformers.cache_utils import DynamicCache
 from transformers.generation.logits_process import LogitsProcessorList
 
 
@@ -193,32 +191,6 @@ def suggest_baseline_batch_size(
     if bytes_per_seq <= 0:
         return min(8, n_prompts)
     return max(1, min(n_prompts, usable // bytes_per_seq))
-
-
-def suggest_watermark_batch_size(
-    n_prompts: int,
-    *,
-    max_new_tokens: int,
-    max_input_tokens: int,
-    reserved_bytes: int = 512 * 1024 * 1024,
-) -> int:
-    """Heuristic micro-batch size for dual-context watermark generate.
-
-    Dual KV (sample + partition) ≈ 2× baseline cost; overridable via
-    ``BENCHMARK_WATERMARK_BATCH_SIZE``.
-    """
-    if n_prompts <= 0:
-        return 1
-    env = os.environ.get("BENCHMARK_WATERMARK_BATCH_SIZE", "").strip()
-    if env:
-        return max(1, min(n_prompts, int(env)))
-    base = suggest_baseline_batch_size(
-        n_prompts,
-        max_new_tokens=max_new_tokens,
-        max_input_tokens=max_input_tokens,
-        reserved_bytes=reserved_bytes,
-    )
-    return max(1, min(n_prompts, base // 2))
 
 
 def _count_new_tokens(gen_ids: torch.Tensor, pad_id: int, *, batched: bool) -> int:
@@ -434,19 +406,6 @@ def _scores_to_next_token_probs(
     return F.softmax(next_scores, dim=-1).squeeze(0)
 
 
-def _scores_to_next_token_probs_batched(
-    logits_last: torch.Tensor,
-    input_ids_for_proc: torch.Tensor,
-    logits_processor: LogitsProcessorList,
-) -> torch.Tensor:
-    """``logits_last`` is ``[B, V]``; ``input_ids_for_proc`` is ``[B, T]``."""
-    next_logits = logits_last.to(
-        dtype=torch.float32, device=input_ids_for_proc.device
-    ).clone()
-    next_scores = logits_processor(input_ids_for_proc, next_logits)
-    return F.softmax(next_scores, dim=-1)
-
-
 def _choose_watermark_partition_half(secret_bit: int, p: float, q: float) -> Tuple[bool, bool]:
     """Return ``(choose_set_A, used_enforce_branch)``."""
     if random.random() < (2 * q):
@@ -501,178 +460,6 @@ def _append_generated_token(
             dim=-1,
         )
     return input_ids, step_input_ids
-
-
-def _append_generated_tokens_batched(
-    *,
-    input_ids: torch.Tensor,
-    next_token_ids: torch.Tensor,
-    model_kwargs: Dict[str, Any],
-    device: str | torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Append one new token per batch row. ``next_token_ids`` is ``[B]`` or ``[B, 1]``."""
-    if next_token_ids.ndim == 1:
-        next_token_ids = next_token_ids.unsqueeze(1)
-    input_ids = torch.cat([input_ids, next_token_ids], dim=-1)
-    step_input_ids = next_token_ids
-    if "attention_mask" in model_kwargs:
-        b = int(input_ids.shape[0])
-        model_kwargs["attention_mask"] = torch.cat(
-            [
-                model_kwargs["attention_mask"],
-                torch.ones(
-                    (b, 1),
-                    dtype=model_kwargs["attention_mask"].dtype,
-                    device=device,
-                ),
-            ],
-            dim=-1,
-        )
-    return input_ids, step_input_ids
-
-
-def _cache_seq_length(past_key_values: Any) -> int:
-    if past_key_values is None:
-        return 0
-    if isinstance(past_key_values, DynamicCache):
-        return int(past_key_values.get_seq_length())
-    return int(past_key_values[0][0].shape[2])
-
-
-def _cache_select(past_key_values: Any, indices: torch.Tensor) -> Any:
-    """Return a cache containing only the given batch indices."""
-    if past_key_values is None:
-        return None
-    idx = indices.to(dtype=torch.long)
-    if isinstance(past_key_values, DynamicCache):
-        out = copy.deepcopy(past_key_values)
-        out.batch_select_indices(idx)
-        return out
-    return tuple((k.index_select(0, idx), v.index_select(0, idx)) for k, v in past_key_values)
-
-
-def _cache_left_pad(past_key_values: Any, target_len: int) -> Any:
-    """Left-pad KV along the sequence axis to ``target_len`` (zeros)."""
-    if past_key_values is None:
-        return None
-    cur = _cache_seq_length(past_key_values)
-    if cur == target_len:
-        return past_key_values
-    if cur > target_len:
-        raise ValueError(f"cannot left-pad cache of length {cur} down to {target_len}")
-    pad = target_len - cur
-    if isinstance(past_key_values, DynamicCache):
-        out = copy.deepcopy(past_key_values)
-        for layer in out.layers:
-            keys = getattr(layer, "keys", None)
-            values = getattr(layer, "values", None)
-            if keys is None or values is None or int(keys.shape[2]) == 0:
-                continue
-            b, h, _s, d = keys.shape
-            z = torch.zeros(
-                (b, h, pad, d), dtype=keys.dtype, device=keys.device
-            )
-            layer.keys = torch.cat([z, keys], dim=2)
-            layer.values = torch.cat([z, values], dim=2)
-        return out
-    padded = []
-    for k, v in past_key_values:
-        b, h, _s, d = k.shape
-        z = torch.zeros((b, h, pad, d), dtype=k.dtype, device=k.device)
-        padded.append((torch.cat([z, k], dim=2), torch.cat([z, v], dim=2)))
-    return tuple(padded)
-
-
-def _cache_batch_cat(caches: Sequence[Any]) -> Any:
-    """Concatenate caches along the batch dimension (same seq length required)."""
-    cache_list = [c for c in caches if c is not None]
-    if not cache_list:
-        return None
-    if len(cache_list) == 1:
-        return cache_list[0]
-    lengths = {_cache_seq_length(c) for c in cache_list}
-    if len(lengths) != 1:
-        raise ValueError(f"cannot cat caches with mixed seq lengths {sorted(lengths)}")
-    if all(isinstance(c, DynamicCache) for c in cache_list):
-        out = copy.deepcopy(cache_list[0])
-        for layer_idx, layer in enumerate(out.layers):
-            keys = [c.layers[layer_idx].keys for c in cache_list]
-            vals = [c.layers[layer_idx].values for c in cache_list]
-            if keys[0] is None:
-                continue
-            layer.keys = torch.cat(keys, dim=0)
-            layer.values = torch.cat(vals, dim=0)
-        return out
-    return tuple(
-        (
-            torch.cat([c[i][0] for c in cache_list], dim=0),
-            torch.cat([c[i][1] for c in cache_list], dim=0),
-        )
-        for i in range(len(cache_list[0]))
-    )
-
-
-def _slice_decode_batch(
-    *,
-    input_ids: torch.Tensor,
-    step_input_ids: torch.Tensor,
-    model_kwargs: Dict[str, Any],
-    indices: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    idx = indices.to(dtype=torch.long)
-    new_kwargs: Dict[str, Any] = {"use_cache": True}
-    if model_kwargs.get("past_key_values") is not None:
-        new_kwargs["past_key_values"] = _cache_select(
-            model_kwargs["past_key_values"], idx
-        )
-    if model_kwargs.get("attention_mask") is not None:
-        new_kwargs["attention_mask"] = model_kwargs["attention_mask"].index_select(0, idx)
-    return (
-        input_ids.index_select(0, idx),
-        step_input_ids.index_select(0, idx),
-        new_kwargs,
-    )
-
-
-def _left_pad_rows(
-    rows: Sequence[torch.Tensor],
-    *,
-    pad_id: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
-    """Left-pad 1-D token rows to a common width. Returns ids, attn, pad_lens."""
-    lengths = [int(r.numel()) for r in rows]
-    max_len = max(lengths) if lengths else 1
-    id_rows: List[torch.Tensor] = []
-    attn_rows: List[torch.Tensor] = []
-    pad_lens: List[int] = []
-    for row, length in zip(rows, lengths):
-        pad = max_len - length
-        pad_lens.append(pad)
-        r = row.to(device=device, dtype=torch.long).view(-1)
-        if pad > 0:
-            id_rows.append(
-                torch.cat(
-                    [
-                        torch.full((pad,), pad_id, dtype=torch.long, device=device),
-                        r,
-                    ],
-                    dim=0,
-                )
-            )
-            attn_rows.append(
-                torch.cat(
-                    [
-                        torch.zeros(pad, dtype=torch.long, device=device),
-                        torch.ones(length, dtype=torch.long, device=device),
-                    ],
-                    dim=0,
-                )
-            )
-        else:
-            id_rows.append(r)
-            attn_rows.append(torch.ones(length, dtype=torch.long, device=device))
-    return torch.stack(id_rows, dim=0), torch.stack(attn_rows, dim=0), pad_lens
 
 
 def _tokenize_text_fragment(tokenizer: AutoTokenizer, text: str) -> List[int]:
@@ -920,664 +707,6 @@ def _warm_prompt_free_with_burn_in(
     return input_ids, step_input_ids, model_kwargs
 
 
-def _finalize_watermark_result(
-    *,
-    tokenizer: AutoTokenizer,
-    prompt: str,
-    secret_bitstream: Sequence[int],
-    burn_in_tokens: int,
-    prompt_len: int,
-    input_ids_wm: torch.Tensor,
-    burn_in_ids: List[int],
-    prefix_text: str,
-    retok_burn_ids: List[int],
-    retok_replacements: int,
-    bit_index_offset: int,
-    natural_partition_choices: int,
-    partition_mass_gaps: List[float],
-    partition_vocab_dim: int | None,
-    special_ids: set,
-) -> Dict[str, Any]:
-    n_bits = len(secret_bitstream)
-    wm_ids = input_ids_wm[0, prompt_len + len(burn_in_ids) :].tolist()
-    wm_token_texts = [
-        tokenizer.decode([tid], skip_special_tokens=True) for tid in wm_ids
-    ]
-    wm_token_char_lens = [len(piece) for piece in wm_token_texts]
-    wm_text = "".join(wm_token_texts)
-    generated_text_wm = prefix_text + wm_text
-    recovery_input_ids = tokenizer(generated_text_wm, return_tensors="pt")["input_ids"]
-    full_retok = _tokenize_text_fragment(tokenizer, generated_text_wm)
-    recovery_ids_aligned = full_retok[: int(burn_in_tokens)] == retok_burn_ids
-    gap_mean = (
-        sum(partition_mass_gaps) / len(partition_mass_gaps) if partition_mass_gaps else 0.0
-    )
-    suffix_ids = list(retok_burn_ids) + list(wm_ids)
-    return {
-        "prompt_text": prompt,
-        "generated_text_wm": generated_text_wm,
-        "burn_in_text": prefix_text,
-        "wm_text": wm_text,
-        "burn_in_tokens": int(burn_in_tokens),
-        "burn_in_char_len": int(len(prefix_text)),
-        "burn_in_ids": list(burn_in_ids),
-        "burn_in_retok_ids": list(retok_burn_ids),
-        "burn_in_bit_index_offset": int(bit_index_offset),
-        "wm_suffix_ids": list(wm_ids),
-        "wm_token_char_lens": list(wm_token_char_lens),
-        "input_ids_wm": recovery_input_ids,
-        "model_input_ids": input_ids_wm.detach().cpu(),
-        "prompt_len": int(prompt_len),
-        "model_suffix_ids": suffix_ids,
-        "secret_bitstream": list(secret_bitstream),
-        "natural_partition_choices": int(natural_partition_choices),
-        "retok_replacements": int(retok_replacements),
-        "recovery_ids_aligned": bool(recovery_ids_aligned),
-        "recovery_slots_committed": n_bits,
-        "partition_vocab_dim": partition_vocab_dim,
-        "partition_mass_gap_mean": gap_mean,
-        "partition_mass_gap_max": max(partition_mass_gaps) if partition_mass_gaps else 0.0,
-        "special_ids_in_suffix": sum(1 for t in suffix_ids if t in special_ids),
-    }
-
-
-def _warm_prompt_free_batch(
-    model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
-    *,
-    retok_burn_ids_list: Sequence[Sequence[int]],
-    n_bits: int,
-    device: str | torch.device,
-    generation_extra: Dict[str, Any] | None,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any], LogitsProcessorList]:
-    """Batched prompt-free warm-up matching ``_warm_prompt_free_with_burn_in``."""
-    dev = torch.device(device) if isinstance(device, str) else device
-    b = len(retok_burn_ids_list)
-    if b == 0:
-        raise ValueError("retok_burn_ids_list must be non-empty")
-    lengths = {len(ids) for ids in retok_burn_ids_list}
-    if len(lengths) != 1:
-        raise ValueError(f"mixed retok burn-in lengths {sorted(lengths)}")
-    burn_len = next(iter(lengths))
-    (
-        _seed_ids,
-        _seed_step,
-        _seed_kwargs,
-        logits_processor_part,
-    ) = _init_prompt_free_decode_state(
-        model,
-        tokenizer,
-        device,
-        decode_horizon=max(burn_len + n_bits, 1),
-        generation_extra=generation_extra,
-    )
-    bos = _seed_token_id(tokenizer)
-
-    if burn_len == 0:
-        seed = torch.tensor([[bos]] * b, dtype=torch.long, device=dev)
-        attn = torch.ones((b, 1), dtype=torch.long, device=dev)
-        return (
-            seed,
-            seed.clone(),
-            {"use_cache": True, "attention_mask": attn},
-            logits_processor_part,
-        )
-
-    if burn_len == 1:
-        step = torch.tensor([[bos]] * b, dtype=torch.long, device=dev)
-        attn = torch.ones((b, 1), dtype=torch.long, device=dev)
-        with torch.no_grad():
-            outputs = model(input_ids=step, attention_mask=attn, use_cache=True)
-        model_kwargs: Dict[str, Any] = {
-            "use_cache": True,
-            "attention_mask": attn,
-            "past_key_values": outputs.past_key_values,
-        }
-        last = torch.tensor(
-            [[int(ids[0])] for ids in retok_burn_ids_list],
-            dtype=torch.long,
-            device=dev,
-        )
-        input_ids, step_out = _append_generated_tokens_batched(
-            input_ids=step,
-            next_token_ids=last,
-            model_kwargs=model_kwargs,
-            device=dev,
-        )
-        return input_ids, step_out, model_kwargs, logits_processor_part
-
-    rows = [[bos] + list(ids[:-1]) for ids in retok_burn_ids_list]
-    input_ids = torch.tensor(rows, dtype=torch.long, device=dev)
-    attn = torch.ones_like(input_ids, dtype=torch.long, device=dev)
-    with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attn, use_cache=True)
-    model_kwargs = {
-        "use_cache": True,
-        "attention_mask": attn,
-        "past_key_values": outputs.past_key_values,
-    }
-    last = torch.tensor(
-        [[int(ids[-1])] for ids in retok_burn_ids_list],
-        dtype=torch.long,
-        device=dev,
-    )
-    input_ids, step = _append_generated_tokens_batched(
-        input_ids=input_ids,
-        next_token_ids=last,
-        model_kwargs=model_kwargs,
-        device=dev,
-    )
-    return input_ids, step, model_kwargs, logits_processor_part
-
-
-def _dual_forward_batched(
-    model: torch.nn.Module,
-    *,
-    step_sample: torch.Tensor,
-    kwargs_sample: Dict[str, Any],
-    step_part: torch.Tensor,
-    kwargs_part: Dict[str, Any],
-) -> Tuple[torch.Tensor, Dict[str, Any], torch.Tensor, Dict[str, Any]]:
-    """Fused sample+partition forward when KV lengths can be aligned; else two calls."""
-    b = int(step_sample.shape[0])
-    if int(step_part.shape[0]) != b:
-        raise ValueError("sample/partition batch sizes must match")
-
-    past_s = kwargs_sample.get("past_key_values")
-    past_p = kwargs_part.get("past_key_values")
-    attn_s = kwargs_sample.get("attention_mask")
-    attn_p = kwargs_part.get("attention_mask")
-
-    # Fall back when either side lacks a cache (shapes cannot be fused safely).
-    if past_s is None or past_p is None:
-        with torch.no_grad():
-            out_s = model(input_ids=step_sample, **kwargs_sample)
-            out_p = model(input_ids=step_part, **kwargs_part)
-        ks = dict(kwargs_sample)
-        kp = dict(kwargs_part)
-        ks["past_key_values"] = out_s.past_key_values
-        kp["past_key_values"] = out_p.past_key_values
-        return out_s.logits[:, -1, :], ks, out_p.logits[:, -1, :], kp
-
-    len_s = _cache_seq_length(past_s)
-    len_p = _cache_seq_length(past_p)
-    target = max(len_s, len_p)
-    if len_s < target:
-        past_s = _cache_left_pad(past_s, target)
-        if attn_s is not None:
-            pad = target - len_s
-            attn_s = torch.cat(
-                [
-                    torch.zeros((b, pad), dtype=attn_s.dtype, device=attn_s.device),
-                    attn_s,
-                ],
-                dim=-1,
-            )
-    if len_p < target:
-        past_p = _cache_left_pad(past_p, target)
-        if attn_p is not None:
-            pad = target - len_p
-            attn_p = torch.cat(
-                [
-                    torch.zeros((b, pad), dtype=attn_p.dtype, device=attn_p.device),
-                    attn_p,
-                ],
-                dim=-1,
-            )
-
-    if attn_s is not None and attn_p is not None and attn_s.shape[-1] != attn_p.shape[-1]:
-        width = max(int(attn_s.shape[-1]), int(attn_p.shape[-1]))
-        if attn_s.shape[-1] < width:
-            attn_s = torch.cat(
-                [
-                    torch.zeros(
-                        (b, width - attn_s.shape[-1]),
-                        dtype=attn_s.dtype,
-                        device=attn_s.device,
-                    ),
-                    attn_s,
-                ],
-                dim=-1,
-            )
-        if attn_p.shape[-1] < width:
-            attn_p = torch.cat(
-                [
-                    torch.zeros(
-                        (b, width - attn_p.shape[-1]),
-                        dtype=attn_p.dtype,
-                        device=attn_p.device,
-                    ),
-                    attn_p,
-                ],
-                dim=-1,
-            )
-
-    step = torch.cat([step_sample, step_part], dim=0)
-    fused_kwargs: Dict[str, Any] = {
-        "use_cache": True,
-        "past_key_values": _cache_batch_cat([past_s, past_p]),
-    }
-    if attn_s is not None and attn_p is not None:
-        fused_kwargs["attention_mask"] = torch.cat([attn_s, attn_p], dim=0)
-
-    with torch.no_grad():
-        outputs = model(input_ids=step, **fused_kwargs)
-    logits = outputs.logits[:, -1, :]
-    past_fused = outputs.past_key_values
-    idx_s = torch.arange(b, device=step.device)
-    idx_p = torch.arange(b, 2 * b, device=step.device)
-    ks = dict(kwargs_sample)
-    kp = dict(kwargs_part)
-    ks["past_key_values"] = _cache_select(past_fused, idx_s)
-    kp["past_key_values"] = _cache_select(past_fused, idx_p)
-    if attn_s is not None:
-        ks["attention_mask"] = attn_s
-    if attn_p is not None:
-        kp["attention_mask"] = attn_p
-    return logits[:b], ks, logits[b:], kp
-
-
-def _generate_with_watermarks_microbatch(
-    model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
-    prompts: Sequence[str],
-    secret_bitstreams: Sequence[Sequence[int]],
-    device: str | torch.device,
-    *,
-    burn_in_tokens: int,
-    generation_extra: Dict[str, Any] | None,
-) -> List[Dict[str, Any]]:
-    """One micro-batch of dual-context watermark generations (same channel length)."""
-    prompt_list = [str(p) for p in prompts]
-    bits_list = [[int(x) for x in bits] for bits in secret_bitstreams]
-    b = len(prompt_list)
-    if b == 0:
-        return []
-    if len(bits_list) != b:
-        raise ValueError("prompts and secret_bitstreams must have the same length")
-    n_bits = len(bits_list[0])
-    if any(len(bits) != n_bits for bits in bits_list):
-        raise ValueError("all secret_bitstreams in a micro-batch must share a length")
-    if burn_in_tokens < 0:
-        raise ValueError(f"burn_in_tokens must be >= 0, got {burn_in_tokens}")
-
-    dev = torch.device(device) if isinstance(device, str) else device
-    special_ids = set(getattr(tokenizer, "all_special_ids", []))
-    pad_id = _tokenizer_pad_token_id(tokenizer)
-
-    inputs = encode_prompts_for_generation(tokenizer, prompt_list, device)
-    input_ids = inputs["input_ids"].clone()
-    attn_mask = inputs["attention_mask"].clone()
-    # Shared left-padded prompt width; generated tokens append on the right.
-    prompt_width = int(input_ids.shape[1])
-    prompt_token_lens = [int(attn_mask[i].sum().item()) for i in range(b)]
-
-    decode_horizon = max(int(burn_in_tokens) + n_bits + 64, 1)
-    _, logits_processor_sample = _prepare_sampling_logits_processor_bundle(
-        model,
-        tokenizer,
-        inputs,
-        decode_horizon=decode_horizon,
-        generation_extra=generation_extra,
-    )
-
-    model_kwargs: Dict[str, Any] = {
-        "use_cache": True,
-        "attention_mask": attn_mask,
-    }
-    step_input_ids = input_ids
-    partition_vocab_dim: int | None = None
-    max_burn_raw = max(int(burn_in_tokens) * 4, int(burn_in_tokens) + 64)
-
-    active_global = list(range(b))
-    finished: Dict[int, Dict[str, Any]] = {}
-
-    if int(burn_in_tokens) == 0:
-        for gi in range(b):
-            ids_i, step_i, kw_i = _slice_decode_batch(
-                input_ids=input_ids,
-                step_input_ids=step_input_ids,
-                model_kwargs=model_kwargs,
-                indices=torch.tensor([gi], device=input_ids.device),
-            )
-            finished[gi] = {
-                "input_ids": ids_i,
-                "step_input_ids": step_i,
-                "model_kwargs": kw_i,
-            }
-        active_global = []
-    else:
-        while active_global:
-            newly_done: List[int] = []
-            for local_i, _gi in enumerate(active_global):
-                burn_ids = input_ids[local_i, prompt_width:].tolist()
-                prefix_raw_text = tokenizer.decode(burn_ids, skip_special_tokens=True)
-                retok_len = len(_tokenize_text_fragment(tokenizer, prefix_raw_text))
-                if retok_len >= int(burn_in_tokens):
-                    newly_done.append(local_i)
-                elif len(burn_ids) >= max_burn_raw:
-                    raise RuntimeError(
-                        f"burn-in retokenization stayed at {retok_len} tokens after "
-                        f"{len(burn_ids)} raw tokens (need {burn_in_tokens})"
-                    )
-            if newly_done:
-                done_set = set(newly_done)
-                for local_i in sorted(newly_done):
-                    gi = active_global[local_i]
-                    ids_i, step_i, kw_i = _slice_decode_batch(
-                        input_ids=input_ids,
-                        step_input_ids=step_input_ids,
-                        model_kwargs=model_kwargs,
-                        indices=torch.tensor([local_i], device=input_ids.device),
-                    )
-                    finished[gi] = {
-                        "input_ids": ids_i,
-                        "step_input_ids": step_i,
-                        "model_kwargs": kw_i,
-                    }
-                remain = [i for i in range(len(active_global)) if i not in done_set]
-                if not remain:
-                    active_global = []
-                    break
-                idx = torch.tensor(remain, dtype=torch.long, device=input_ids.device)
-                input_ids, step_input_ids, model_kwargs = _slice_decode_batch(
-                    input_ids=input_ids,
-                    step_input_ids=step_input_ids,
-                    model_kwargs=model_kwargs,
-                    indices=idx,
-                )
-                active_global = [active_global[i] for i in remain]
-                continue
-
-            with torch.no_grad():
-                outputs = model(input_ids=step_input_ids, **model_kwargs)
-            logits = outputs.logits[:, -1, :]
-            d_logits = int(logits.shape[-1])
-            if partition_vocab_dim is None:
-                partition_vocab_dim = d_logits
-            elif partition_vocab_dim != d_logits:
-                raise RuntimeError(
-                    f"logits vocab width changed mid-decode ({d_logits} vs {partition_vocab_dim})"
-                )
-            model_kwargs = dict(model_kwargs)
-            model_kwargs["past_key_values"] = outputs.past_key_values
-            probs = _scores_to_next_token_probs_batched(
-                logits, input_ids, logits_processor_sample
-            )
-            next_tokens = torch.multinomial(probs, num_samples=1)
-            input_ids, step_input_ids = _append_generated_tokens_batched(
-                input_ids=input_ids,
-                next_token_ids=next_tokens,
-                model_kwargs=model_kwargs,
-                device=dev,
-            )
-
-    prefix_texts: List[str] = [""] * b
-    retok_burn_ids_list: List[List[int]] = [[] for _ in range(b)]
-    retok_replacements_list: List[int] = [0] * b
-    bit_index_offsets: List[int] = [0] * b
-    burn_in_ids_list: List[List[int]] = [[] for _ in range(b)]
-
-    for gi in range(b):
-        st = finished[gi]
-        burn_in_ids = st["input_ids"][0, prompt_width:].tolist()
-        burn_in_ids_list[gi] = burn_in_ids
-        prefix_raw_text = tokenizer.decode(burn_in_ids, skip_special_tokens=True)
-        if int(burn_in_tokens) == 0:
-            prefix_texts[gi] = ""
-            retok_burn_ids_list[gi] = []
-            retok_replacements_list[gi] = 0
-        else:
-            prefix_texts[gi], retok_burn_ids_list[gi] = _fit_text_to_token_count(
-                tokenizer, prefix_raw_text, int(burn_in_tokens)
-            )
-            raw_retok = _tokenize_text_fragment(tokenizer, prefix_raw_text)
-            retok_replacements_list[gi] = abs(len(raw_retok) - int(burn_in_tokens)) + (
-                0
-                if raw_retok[: int(burn_in_tokens)] == retok_burn_ids_list[gi]
-                else 1
-            )
-        bit_index_offsets[gi] = len(retok_burn_ids_list[gi]) - int(burn_in_tokens)
-
-    (
-        input_ids_part,
-        step_input_ids_part,
-        model_kwargs_part,
-        logits_processor_part,
-    ) = _warm_prompt_free_batch(
-        model,
-        tokenizer,
-        retok_burn_ids_list=retok_burn_ids_list,
-        n_bits=n_bits,
-        device=device,
-        generation_extra=generation_extra,
-    )
-
-    sample_rows = [finished[i]["input_ids"][0].detach().cpu() for i in range(b)]
-    input_ids_wm, _attn_from_ids, pad_lens = _left_pad_rows(
-        sample_rows, pad_id=pad_id, device=dev
-    )
-    # Preserve original prompt left-pad zeros; only add alignment zeros on the left.
-    attn_list: List[torch.Tensor] = []
-    max_t = int(input_ids_wm.shape[1])
-    for i in range(b):
-        attn_i = finished[i]["model_kwargs"].get("attention_mask")
-        if attn_i is None:
-            attn_i = torch.ones_like(finished[i]["input_ids"], dtype=torch.long)
-        attn_i = attn_i[0].detach().to(device=dev, dtype=torch.long).view(-1)
-        pad = pad_lens[i]
-        if pad > 0:
-            attn_i = torch.cat(
-                [torch.zeros(pad, dtype=torch.long, device=dev), attn_i], dim=0
-            )
-        if int(attn_i.numel()) != max_t:
-            raise RuntimeError(
-                f"sample attn length {int(attn_i.numel())} != input width {max_t}"
-            )
-        attn_list.append(attn_i)
-    attn_sample = torch.stack(attn_list, dim=0)
-    del _attn_from_ids
-    step_rows = [
-        finished[i]["step_input_ids"].detach().to(device=dev).view(-1)[-1]
-        for i in range(b)
-    ]
-    step_input_ids_sample = torch.stack(step_rows, dim=0).view(b, 1)
-
-    past_list = [finished[i]["model_kwargs"].get("past_key_values") for i in range(b)]
-    if any(p is None for p in past_list) and any(p is not None for p in past_list):
-        raise RuntimeError("mixed null/non-null sample past_key_values in micro-batch")
-    model_kwargs_sample: Dict[str, Any] = {
-        "use_cache": True,
-        "attention_mask": attn_sample,
-    }
-    if all(p is not None for p in past_list):
-        target_past = max(_cache_seq_length(p) for p in past_list)
-        padded_pasts = [_cache_left_pad(p, target_past) for p in past_list]
-        model_kwargs_sample["past_key_values"] = _cache_batch_cat(padded_pasts)
-
-    natural_counts = [0] * b
-    mass_gaps: List[List[float]] = [[] for _ in range(b)]
-
-    for bit_idx in range(n_bits):
-        logits_s, model_kwargs_sample, logits_p, model_kwargs_part = _dual_forward_batched(
-            model,
-            step_sample=step_input_ids_sample,
-            kwargs_sample=model_kwargs_sample,
-            step_part=step_input_ids_part,
-            kwargs_part=model_kwargs_part,
-        )
-        d_logits = int(logits_s.shape[-1])
-        if partition_vocab_dim is None:
-            partition_vocab_dim = d_logits
-        elif partition_vocab_dim != d_logits:
-            raise RuntimeError(
-                f"logits vocab width changed mid-decode ({d_logits} vs {partition_vocab_dim})"
-            )
-        if int(logits_p.shape[-1]) != partition_vocab_dim:
-            raise RuntimeError(
-                f"partition logits vocab width {int(logits_p.shape[-1])} "
-                f"!= sample width {partition_vocab_dim}"
-            )
-
-        sample_probs = _scores_to_next_token_probs_batched(
-            logits_s, input_ids_wm, logits_processor_sample
-        )
-        partition_probs = _scores_to_next_token_probs_batched(
-            logits_p, input_ids_part, logits_processor_part
-        )
-
-        next_token_ids = torch.empty((b, 1), dtype=torch.long, device=dev)
-        for i in range(b):
-            partition_step = int(bit_idx) + int(bit_index_offsets[i])
-            mask_A = get_balanced_partition_from_probs(
-                partition_probs[i], partition_step
-            )
-            mass_a, mass_b = balanced_partition_masses(partition_probs[i], mask_A)
-            mass_gaps[i].append(abs(mass_a - mass_b))
-            secret_bit = int(bits_list[i][bit_idx])
-            p_mass = float(sample_probs[i][mask_A].sum().item())
-            q = min(p_mass, 1.0 - p_mass)
-            choose_A, used_enforce = _choose_watermark_partition_half(
-                secret_bit, p_mass, q
-            )
-            probs_wm = _mask_disallowed_half_probs(
-                sample_probs[i], mask_A, choose_set_A=choose_A
-            )
-            if not used_enforce:
-                natural_counts[i] += 1
-            if torch.isfinite(probs_wm).all() and float(probs_wm.sum().item()) > 0:
-                probs_wm = probs_wm.clamp(min=0)
-                probs_wm = probs_wm / probs_wm.sum()
-                next_token_ids[i, 0] = torch.multinomial(probs_wm, num_samples=1)
-            else:
-                next_token_ids[i, 0] = torch.multinomial(
-                    sample_probs[i], num_samples=1
-                )
-
-        input_ids_wm, step_input_ids_sample = _append_generated_tokens_batched(
-            input_ids=input_ids_wm,
-            next_token_ids=next_token_ids,
-            model_kwargs=model_kwargs_sample,
-            device=dev,
-        )
-        input_ids_part, step_input_ids_part = _append_generated_tokens_batched(
-            input_ids=input_ids_part,
-            next_token_ids=next_token_ids,
-            model_kwargs=model_kwargs_part,
-            device=dev,
-        )
-
-    results: List[Dict[str, Any]] = []
-    for gi in range(b):
-        # Strip Phase-2 alignment pad; row still has the original prompt left-pad.
-        row = input_ids_wm[gi : gi + 1, pad_lens[gi] :]
-        results.append(
-            _finalize_watermark_result(
-                tokenizer=tokenizer,
-                prompt=prompt_list[gi],
-                secret_bitstream=bits_list[gi],
-                burn_in_tokens=int(burn_in_tokens),
-                prompt_len=prompt_width,
-                input_ids_wm=row,
-                burn_in_ids=burn_in_ids_list[gi],
-                prefix_text=prefix_texts[gi],
-                retok_burn_ids=retok_burn_ids_list[gi],
-                retok_replacements=retok_replacements_list[gi],
-                bit_index_offset=bit_index_offsets[gi],
-                natural_partition_choices=natural_counts[gi],
-                partition_mass_gaps=mass_gaps[gi],
-                partition_vocab_dim=partition_vocab_dim,
-                special_ids=special_ids,
-            )
-        )
-        # Expose true (unpadded) prompt token count for logging compatibility.
-        results[-1]["prompt_len"] = int(prompt_token_lens[gi])
-    return results
-
-
-def generate_with_watermarks(
-    model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
-    prompts: Sequence[str],
-    secret_bitstreams: Sequence[Sequence[int]],
-    device: str = "cpu",
-    *,
-    burn_in_tokens: int = 100,
-    generation_extra: Dict[str, Any] | None = None,
-    batch_size: int | None = None,
-    on_batch_done: Any | None = None,
-) -> List[Dict[str, Any]]:
-    """Batched dual-context watermark generation with adaptive micro-batches.
-
-    Runs many independent prompt/bitstream pairs. Within each micro-batch, burn-in
-    uses an active-set decode (peel finished sequences), and the watermark phase
-    fuses sample+partition forwards along the batch dimension. On CUDA OOM the
-    micro-batch size is halved and retried.
-    """
-    prompt_list = [str(p) for p in prompts]
-    bits_list = [list(bits) for bits in secret_bitstreams]
-    n = len(prompt_list)
-    if n == 0:
-        return []
-    if len(bits_list) != n:
-        raise ValueError("prompts and secret_bitstreams must have the same length")
-    if burn_in_tokens < 0:
-        raise ValueError(f"burn_in_tokens must be >= 0, got {burn_in_tokens}")
-
-    by_len: Dict[int, List[int]] = {}
-    for i, bits in enumerate(bits_list):
-        by_len.setdefault(len(bits), []).append(i)
-
-    max_input = 1
-    for p in prompt_list[: min(8, n)]:
-        enc = encode_prompt_for_generation(tokenizer, p, "cpu")
-        max_input = max(max_input, int(enc["input_ids"].shape[-1]))
-    max_bits = max((len(bits) for bits in bits_list), default=1)
-    max_new = int(burn_in_tokens) + max_bits
-
-    if batch_size is None:
-        bs = suggest_watermark_batch_size(
-            n,
-            max_new_tokens=max_new,
-            max_input_tokens=max_input,
-        )
-    else:
-        bs = max(1, min(n, int(batch_size)))
-
-    out: List[Dict[str, Any] | None] = [None] * n
-    for _length, indices in by_len.items():
-        i = 0
-        while i < len(indices):
-            take = min(bs, len(indices) - i)
-            while True:
-                chunk_idx = indices[i : i + take]
-                try:
-                    chunk = _generate_with_watermarks_microbatch(
-                        model,
-                        tokenizer,
-                        [prompt_list[j] for j in chunk_idx],
-                        [bits_list[j] for j in chunk_idx],
-                        device,
-                        burn_in_tokens=burn_in_tokens,
-                        generation_extra=generation_extra,
-                    )
-                    break
-                except torch.cuda.OutOfMemoryError:
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    if take == 1:
-                        raise
-                    take = max(1, take // 2)
-                    bs = take
-            for local, j in enumerate(chunk_idx):
-                out[j] = chunk[local]
-            if on_batch_done is not None:
-                on_batch_done(take)
-            i += take
-
-    return [r if r is not None else {} for r in out]
-
-
 def generate_with_watermark(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
@@ -1607,19 +736,216 @@ def generate_with_watermark(
     - **Partition state** (prompt-free, BOS + retokenized burn-in + wm tokens):
       provides the distribution used to build balanced masks — the same context
       recovery uses.
-
-    Single-prompt wrapper around ``generate_with_watermarks``.
     """
-    return generate_with_watermarks(
+    if burn_in_tokens < 0:
+        raise ValueError(f"burn_in_tokens must be >= 0, got {burn_in_tokens}")
+
+    special_ids = set(getattr(tokenizer, "all_special_ids", []))
+    inputs = encode_prompt_for_generation(tokenizer, prompt, device)
+    input_ids_wm = inputs["input_ids"].clone()
+    prompt_len = int(inputs["input_ids"].shape[1])
+    attn_mask = inputs.get("attention_mask", None)
+
+    n_bits = len(secret_bitstream)
+    # Horizon: raw burn-in may exceed scheme length when retok shrinks.
+    decode_horizon = max(int(burn_in_tokens) + n_bits + 64, 1)
+    _, logits_processor_sample = _prepare_sampling_logits_processor_bundle(
         model,
         tokenizer,
-        [prompt],
-        [secret_bitstream],
-        device,
-        burn_in_tokens=burn_in_tokens,
+        inputs,
+        decode_horizon=decode_horizon,
         generation_extra=generation_extra,
-        batch_size=1,
-    )[0]
+    )
+    natural_partition_choices = 0
+    partition_mass_gaps: List[float] = []
+    partition_vocab_dim: int | None = None
+    model_kwargs_sample: Dict[str, Any] = {"use_cache": True}
+    if attn_mask is not None:
+        model_kwargs_sample["attention_mask"] = attn_mask
+    step_input_ids_sample = input_ids_wm
+
+    # --- Phase 1: free burn-in until retokenized prefix covers scheme length ---
+    max_burn_raw = max(int(burn_in_tokens) * 4, int(burn_in_tokens) + 64)
+    while True:
+        burn_in_ids = input_ids_wm[0, prompt_len:].tolist()
+        prefix_raw_text = tokenizer.decode(burn_in_ids, skip_special_tokens=True)
+        retok_len = len(_tokenize_text_fragment(tokenizer, prefix_raw_text))
+        if retok_len >= int(burn_in_tokens):
+            break
+        if len(burn_in_ids) >= max_burn_raw:
+            raise RuntimeError(
+                f"burn-in retokenization stayed at {retok_len} tokens after "
+                f"{len(burn_in_ids)} raw tokens (need {burn_in_tokens})"
+            )
+        (
+            input_ids_wm,
+            step_input_ids_sample,
+            _tid,
+            partition_vocab_dim,
+        ) = _sample_next_token_id(
+            model,
+            input_ids=input_ids_wm,
+            step_input_ids=step_input_ids_sample,
+            model_kwargs=model_kwargs_sample,
+            logits_processor=logits_processor_sample,
+            device=device,
+            partition_vocab_dim=partition_vocab_dim,
+        )
+
+    burn_in_ids = input_ids_wm[0, prompt_len:].tolist()
+    prefix_raw_text = tokenizer.decode(burn_in_ids, skip_special_tokens=True)
+    if int(burn_in_tokens) == 0:
+        prefix_text = ""
+        retok_burn_ids: List[int] = []
+        retok_replacements = 0
+    else:
+        prefix_text, retok_burn_ids = _fit_text_to_token_count(
+            tokenizer, prefix_raw_text, int(burn_in_tokens)
+        )
+        # Count how far raw retok drifted from the scheme cut.
+        raw_retok = _tokenize_text_fragment(tokenizer, prefix_raw_text)
+        retok_replacements = abs(len(raw_retok) - int(burn_in_tokens)) + (
+            0 if raw_retok[: int(burn_in_tokens)] == retok_burn_ids else 1
+        )
+
+    burn_in_char_len = len(prefix_text)
+    # Integrity recovery skips the first burn_in_tokens of the full retokenized
+    # transcript. If stabilize left a residual length delta, shift bit indices.
+    bit_index_offset = len(retok_burn_ids) - int(burn_in_tokens)
+
+    # Warm the prompt-free partition state on the *retokenized* burn-in (recovery).
+    (
+        input_ids_part,
+        step_input_ids_part,
+        model_kwargs_part,
+        logits_processor_part,
+    ) = _init_prompt_free_decode_state(
+        model,
+        tokenizer,
+        device,
+        decode_horizon=max(len(retok_burn_ids) + n_bits, 1),
+        generation_extra=generation_extra,
+    )
+    input_ids_part, step_input_ids_part, model_kwargs_part = _warm_prompt_free_with_burn_in(
+        model,
+        input_ids=input_ids_part,
+        step_input_ids=step_input_ids_part,
+        model_kwargs=model_kwargs_part,
+        burn_in_ids=retok_burn_ids,
+        device=device,
+    )
+
+    # --- Phase 2: watermarked tokens (dual forward) ---
+    for bit_idx in range(n_bits):
+        partition_step = int(bit_idx) + int(bit_index_offset)
+        with torch.no_grad():
+            outputs_sample = model(
+                input_ids=step_input_ids_sample, **model_kwargs_sample
+            )
+            logits_sample = outputs_sample.logits[0, -1, :]
+            d_logits = int(logits_sample.shape[-1])
+            if partition_vocab_dim is None:
+                partition_vocab_dim = d_logits
+            elif partition_vocab_dim != d_logits:
+                raise RuntimeError(
+                    f"logits vocab width changed mid-decode ({d_logits} vs {partition_vocab_dim})"
+                )
+            model_kwargs_sample["past_key_values"] = outputs_sample.past_key_values
+            sample_probs = _scores_to_next_token_probs(
+                logits_sample, input_ids_wm, logits_processor_sample
+            )
+
+            outputs_part = model(input_ids=step_input_ids_part, **model_kwargs_part)
+            logits_part = outputs_part.logits[0, -1, :]
+            if int(logits_part.shape[-1]) != partition_vocab_dim:
+                raise RuntimeError(
+                    f"partition logits vocab width {int(logits_part.shape[-1])} "
+                    f"!= sample width {partition_vocab_dim}"
+                )
+            model_kwargs_part["past_key_values"] = outputs_part.past_key_values
+            partition_probs = _scores_to_next_token_probs(
+                logits_part, input_ids_part, logits_processor_part
+            )
+
+            # Masks must match recovery: built from prompt-free probs only.
+            mask_A = get_balanced_partition_from_probs(partition_probs, partition_step)
+            mass_a, mass_b = balanced_partition_masses(partition_probs, mask_A)
+            partition_mass_gaps.append(abs(mass_a - mass_b))
+
+            # Soft watermark / sampling still uses prompt-conditioned masses.
+            secret_bit = int(secret_bitstream[bit_idx])
+            p = float(sample_probs[mask_A].sum().item())
+            q = min(p, 1.0 - p)
+            choose_A, used_enforce = _choose_watermark_partition_half(
+                secret_bit, p, q
+            )
+            probs_wm = _mask_disallowed_half_probs(
+                sample_probs, mask_A, choose_set_A=choose_A
+            )
+            if not used_enforce:
+                natural_partition_choices += 1
+            if torch.isfinite(probs_wm).all() and float(probs_wm.sum().item()) > 0:
+                probs_wm = probs_wm.clamp(min=0)
+                probs_wm = probs_wm / probs_wm.sum()
+                next_token_id_wm = torch.multinomial(probs_wm, num_samples=1)
+            else:
+                next_token_id_wm = torch.multinomial(sample_probs, num_samples=1)
+
+        input_ids_wm, step_input_ids_sample = _append_generated_token(
+            input_ids=input_ids_wm,
+            step_input_ids=step_input_ids_sample,
+            next_token_id=next_token_id_wm,
+            model_kwargs=model_kwargs_sample,
+            device=device,
+        )
+        input_ids_part, step_input_ids_part = _append_generated_token(
+            input_ids=input_ids_part,
+            step_input_ids=step_input_ids_part,
+            next_token_id=next_token_id_wm,
+            model_kwargs=model_kwargs_part,
+            device=device,
+        )
+
+    wm_ids = input_ids_wm[0, prompt_len + len(burn_in_ids) :].tolist()
+    wm_token_texts = [tokenizer.decode([tid], skip_special_tokens=True) for tid in wm_ids]
+    wm_token_char_lens = [len(piece) for piece in wm_token_texts]
+    wm_text = "".join(wm_token_texts)
+    # Publish stabilized burn-in (exact scheme token length) + wm payload text.
+    generated_text_wm = prefix_text + wm_text
+    recovery_input_ids = tokenizer(generated_text_wm, return_tensors="pt")["input_ids"]
+    full_retok = _tokenize_text_fragment(tokenizer, generated_text_wm)
+    recovery_ids_aligned = full_retok[: int(burn_in_tokens)] == retok_burn_ids
+    gap_mean = (
+        sum(partition_mass_gaps) / len(partition_mass_gaps) if partition_mass_gaps else 0.0
+    )
+    suffix_ids = list(retok_burn_ids) + list(wm_ids)
+
+    return {
+        "prompt_text": prompt,
+        "generated_text_wm": generated_text_wm,
+        "burn_in_text": prefix_text,
+        "wm_text": wm_text,
+        "burn_in_tokens": int(burn_in_tokens),
+        "burn_in_char_len": int(burn_in_char_len),
+        "burn_in_ids": list(burn_in_ids),
+        "burn_in_retok_ids": list(retok_burn_ids),
+        "burn_in_bit_index_offset": int(bit_index_offset),
+        "wm_suffix_ids": list(wm_ids),
+        "wm_token_char_lens": list(wm_token_char_lens),
+        "input_ids_wm": recovery_input_ids,
+        "model_input_ids": input_ids_wm.detach().cpu(),
+        "prompt_len": prompt_len,
+        "model_suffix_ids": suffix_ids,
+        "secret_bitstream": secret_bitstream,
+        "natural_partition_choices": natural_partition_choices,
+        "retok_replacements": int(retok_replacements),
+        "recovery_ids_aligned": bool(recovery_ids_aligned),
+        "recovery_slots_committed": n_bits,
+        "partition_vocab_dim": partition_vocab_dim,
+        "partition_mass_gap_mean": gap_mean,
+        "partition_mass_gap_max": max(partition_mass_gaps) if partition_mass_gaps else 0.0,
+        "special_ids_in_suffix": sum(1 for t in suffix_ids if t in special_ids),
+    }
 
 
 def recover_bitstream(
@@ -2043,9 +1369,7 @@ __all__ = [
     "encode_prompt_for_generation",
     "encode_prompts_for_generation",
     "suggest_baseline_batch_size",
-    "suggest_watermark_batch_size",
     "generate_with_watermark",
-    "generate_with_watermarks",
     "generate_baseline",
     "generate_baselines",
     "recover_bitstream",

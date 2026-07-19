@@ -332,49 +332,26 @@ def run_benchmark(
     # Amortize so sum of per-trial baseline times equals pregen wall time.
     amortized = pregen.seconds / max(len(trials), 1)
 
-    n = len(trials)
     generated: list[_GeneratedProtocol] = []
-    t0 = time.perf_counter()
-    with benchmark_io.progress_task(
-        "Watermark generate",
-        n,
-        disable=cfg.quiet or n <= 0,
-    ) as wm_bar:
-        outs = wm.generate_batch(
-            sk,
-            [prompt for _, _, prompt in trials],
-            baseline_texts=trial_baselines,
-            baseline_n_tokens=trial_baseline_tokens,
-            on_batch_done=lambda k: wm_bar.advance(k),
-        )
-    wm_wall = time.perf_counter() - t0
-    wm_amortized = wm_wall / max(n, 1)
-
-    for (prompt_index, repeat_index, prompt), baseline_text, n_bl_tok, out in zip(
-        trials,
+    for (prompt_index, repeat_index, prompt), baseline_text, n_bl_tok in zip(
+        benchmark_io.iter_with_progress(
+            trials,
+            description="Watermark generate",
+            disable=cfg.quiet,
+        ),
         trial_baselines,
         trial_baseline_tokens,
-        outs,
     ):
         generated.append(
-            _GeneratedProtocol(
+            _generate_protocol_once(
+                sk,
                 prompt_index=prompt_index,
                 repeat_index=repeat_index,
                 prompt=prompt,
-                wm_text=str(out["generated_text_wm"]),
-                baseline_text=str(baseline_text),
-                encode_attributes=list(out["attributes"]),
-                secret=list(out["prc_secret_bits"]),
-                natural_partition_choices=int(out.get("natural_partition_choices", 0)),
-                retok_replacements=int(out.get("retok_replacements", 0)),
-                recovery_ids_aligned=bool(out.get("recovery_ids_aligned", False)),
-                seconds_baseline_gen=float(amortized),
-                seconds_watermarked_gen=float(wm_amortized),
-                n_tokens_baseline=int(n_bl_tok),
-                n_tokens_watermarked=int(out["n_tokens_watermarked"]),
+                baseline_text=baseline_text,
+                baseline_n_tokens=int(n_bl_tok),
             )
         )
-        del out  # integrity: recovery must not see privileged generation metadata
 
     n = len(generated)
     t0 = time.perf_counter()
